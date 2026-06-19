@@ -21,6 +21,7 @@ from . import (
     flash,
     flash3,
     flash_mtia,
+    triton_gqa_decode,
     triton_splitk,
 )
 from .attn_bias import (
@@ -178,6 +179,7 @@ class _fMHA(torch.autograd.Function):
 
     @staticmethod
     @torch.autograd.function.once_differentiable
+    # pyrefly: ignore [bad-override]
     def backward(ctx, grad, grad_lse):
         # Re-create context
         query, key, value, out, lse = ctx.saved_tensors
@@ -958,6 +960,7 @@ ALL_FW_OPS: List[Type[AttentionFwOpBase]] = [
     flash.FwOp,
     flash_mtia.FwOp,
     flash3.FwOp,
+    triton_gqa_decode.FwOp,
     triton_splitk.FwOp,
 ]
 
