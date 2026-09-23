@@ -38,6 +38,7 @@ TODO(): Fix the flyDSL dualwave f16 cross-attn NaN
 from __future__ import annotations
 
 import functools
+import os
 from typing import Optional
 
 import torch
@@ -457,6 +458,50 @@ def _build_paged(
 _PAGED_PAGE_SIZE = 64
 _PAGED_BT_LDS_SIZE = 2048
 
+# Each KV split must own enough pages to be worth a workgroup + its combine pass.
+_PAGED_MIN_PAGES_PER_SPLIT = 4
+
+# Kill-switch for the automatic paged split-K selection below, mirroring
+# `MSLK_DISABLE_SPLITK` in csrc/gemm/cutlass/mx6mx6bf16.cu. Forces
+# `num_kv_splits=0` (auto) to resolve to 1 so the dense single-pass paged kernel
+# is used, for A/B measurement and for bisecting regressions.
+_DISABLE_PAGED_AUTO_SPLITK: bool = (
+    os.environ.get("MSLK_DISABLE_PAGED_SPLITK", "0") != "0"
+)
+
+
+def _auto_paged_kv_splits(
+    *,
+    num_batches: int,
+    num_heads: int,
+    seqlen_q: int,
+    head_dim: int,
+    max_kv_pages: int,
+    dtype_str: str,
+    device,
+) -> int:
+    """Pick ``num_kv_splits`` for the dense paged path from occupancy.
+
+    Decode shapes (``Sq`` of 1..16 against a long paged cache) produce only
+    ``B * H`` workgroups, which leaves most CUs idle: at B=1/H=32 that is 32 of
+    256 CUs on MI350X. The KV dimension is the only parallelism left, so reuse
+    the same occupancy heuristic the dense path already applies
+    (``_num_kv_splits_heuristic``) instead of silently running single-split.
+
+    Returns 1 when the shape is ineligible or already fills the device, so the
+    caller can treat the result as unconditional.
+    """
+    if _DISABLE_PAGED_AUTO_SPLITK:
+        return 1
+    if head_dim not in (64, 128) or dtype_str not in ("bf16", "f16"):
+        return 1
+    splits = _num_kv_splits_heuristic(
+        num_batches, num_heads, seqlen_q, head_dim, _dense_light_cu(device)
+    )
+    # Never split finer than the cache can feed: each split needs its own pages.
+    splits = min(splits, max(1, max_kv_pages // _PAGED_MIN_PAGES_PER_SPLIT))
+    return max(1, splits)
+
 
 def _flydsl_flash_attn_paged(
     q: torch.Tensor,
@@ -490,7 +535,8 @@ def _flydsl_flash_attn_paged(
     Supported config ONLY (anything else raises): linear/vectorized cache layout
     [NumBlocks, PageSize=64, NumKVHeads, HeadDim], vLLM lookup (block_table +
     seqlen_k), causal, D=64/128, dtype bf16/f16.
-    - Dense 4D Q ``[B, Sq, H, D]``: split-K (num_kv_splits>1) supported (seq_len>=384).
+    - Dense 4D Q ``[B, Sq, H, D]``: split-K supported at any Sq. ``num_kv_splits=0``
+      selects a count from occupancy; ``1`` disables; ``>1`` forces.
     - Varlen packed Q ``[total_q, H, D]`` (cu_seqlens_q given): paged K/V looked up
       per kv-tile via block_table; split-K not supported (matches dense varlen).
     """
@@ -584,22 +630,50 @@ def _flydsl_flash_attn_paged(
             f"flydsl_flash_attn_func: num_heads ({H}) must be divisible by num_kv_heads ({num_kv_heads})"
         )
 
-    # Split-K (paged, dense only): split the KV dimension across grid_z = B*num_kv_splits
-    # workgroups + a combine pass. Fills the GPU for low-occupancy shapes (small B / few
-    # heads), where single-split paged underutilizes the device.
-    splitk = num_kv_splits > 1
-    if splitk and (D not in (64, 128) or dtype_str not in ("bf16", "f16") or Sq < 384):
-        raise ValueError(
-            f"flydsl_flash_attn_func: paged split-K requires D=64/128, dtype bf16/f16, seq_len>=384; "
-            f"got D={D}, dtype={dtype_str}, seq_len={Sq}"
-        )
-
     # Per-batch KV lengths differ in general → bottom-right cross-length masking. Varlen
     # paged always uses cross masking (per-batch seqlen_q/seqlen_kv come from cu_seqlens).
     skv = (
         int(max_seqlen_kv) if max_seqlen_kv is not None else int(seqlen_k.max().item())
     )
     max_kv_pages = (skv + page_size - 1) // page_size
+
+    # Split-K (paged, dense only): split the KV dimension across grid_z = B*num_kv_splits
+    # workgroups + a combine pass. Fills the GPU for low-occupancy shapes (small B / few
+    # heads), where single-split paged underutilizes the device.
+    #
+    # `num_kv_splits == 0` means "choose for me" (same sentinel as
+    # `pa_decode_launch(split_k=0)` and `mx6mx6bf16(splits=0)`). Auto-selection is
+    # restricted to the dense native-paged kernel:
+    #   - varlen packed Q has no split-K variant (rejected below), and
+    #   - gappy paged and `return_lse` both require the generic light kernel, which
+    #     `_paged_light_ok` only selects when num_kv_splits <= 1.
+    # Anything else keeps the caller's explicit value, so `num_kv_splits=1` remains
+    # an exact opt-out.
+    if num_kv_splits == 0:
+        if varlen or kv_seqstart is not None or return_lse:
+            num_kv_splits = 1
+        else:
+            num_kv_splits = _auto_paged_kv_splits(
+                num_batches=B,
+                num_heads=H,
+                seqlen_q=Sq,
+                head_dim=D,
+                max_kv_pages=max_kv_pages,
+                dtype_str=dtype_str,
+                device=q.device,
+            )
+
+    splitk = num_kv_splits > 1
+    # NOTE: the dense (non-paged) path additionally requires seq_len >= 384. That floor
+    # does not apply here: the dualwave native-paged kernel splits along KV, not Q, so
+    # short-Q decode shapes are exactly the ones that need it. Verified on MI350X across
+    # B in {1,2,4}, Sq in {1,4,16}, D in {64,128}, ctx in {32k,128k}: max deviation from
+    # the single-split result was 2e-4, well inside bf16 epsilon (~7.8e-3).
+    if splitk and (D not in (64, 128) or dtype_str not in ("bf16", "f16")):
+        raise ValueError(
+            f"flydsl_flash_attn_func: paged split-K requires D=64/128, dtype bf16/f16; "
+            f"got D={D}, dtype={dtype_str}"
+        )
     max_pages_per_split = (max_kv_pages + int(num_kv_splits) - 1) // int(num_kv_splits)
     if max_pages_per_split > _PAGED_BT_LDS_SIZE:
         max_supported_kv = _PAGED_BT_LDS_SIZE * int(num_kv_splits) * page_size
@@ -800,8 +874,10 @@ def flydsl_flash_attn_func(
     block_table: Optional[torch.Tensor] = None,
     seqlen_k: Optional[torch.Tensor] = None,
     kv_cache_layout: str = "linear",
-    # Split-K (gfx950 only, seq_len >= 384, D=64/128, bf16/f16).
-    num_kv_splits: int = 1,
+    # Split-K (gfx950 only, D=64/128, bf16/f16). The dense path additionally
+    # requires seq_len >= 384. 0 = auto (paged dense only; see below), 1 = never
+    # split, >1 = force that many splits.
+    num_kv_splits: int = 0,
     # fp8 dense ABI: per-tensor descales for pre-quantized e4m3fn Q/K/V.
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
@@ -863,7 +939,13 @@ def flydsl_flash_attn_func(
         cross_seqlen: Whether seqlen_q and seqlen_kv differ. Required in varlen mode;
             dense mode infers it from ``q.shape[1] != k.shape[1]``.
         block_table / seqlen_k: vLLM-style 2D block table metadata.
-        num_kv_splits: Split-K factor (>1: gfx950 only, D=64/128, bf16/f16, seq>=384).
+        num_kv_splits: Split-K factor. ``0`` (default) means auto: the dense paged
+            path picks a split count from occupancy via ``_auto_paged_kv_splits``
+            and every other path resolves it to 1, so behaviour is unchanged
+            outside paged decode. ``1`` forces the single-pass kernel everywhere
+            (also reachable with ``MSLK_DISABLE_PAGED_SPLITK=1``). ``>1`` forces
+            that many splits (gfx950 only, D=64/128, bf16/f16; the dense
+            non-paged path additionally requires seq>=384).
         q_descale / k_descale / v_descale: fp32 shape-[1] descales required
             for dense fp8 e4m3fn inputs.
         out: Optional pre-allocated output tensor. For fp8, output is bf16;
@@ -970,6 +1052,13 @@ def flydsl_flash_attn_func(
         )
 
     varlen = cu_seqlens_q is not None
+
+    # `0` (auto) only selects a split count on the dense paged path, which has
+    # already returned above. Everything from here on is non-paged, where the
+    # existing per-shape `generic_splitk` selection is the auto mechanism, so
+    # collapse the sentinel to the historical default before anything reads it.
+    if num_kv_splits == 0:
+        num_kv_splits = 1
 
     if dtype_str == "fp8":
         if varlen:
