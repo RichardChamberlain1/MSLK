@@ -152,15 +152,17 @@ def pa_decode_paged_launch(
     split_k: int = 0,
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    """Paged-KV head-packed decode (single query token per sequence).
+    """Paged-KV head-packed decode (short query blocks).
 
-    The head-packed gfx950 kernel maps the MFMA M-axis to query *heads*, so a
-    decode shape fills the matrix core regardless of query length -- unlike the
-    dualwave prefill kernel, whose M-axis is query rows and which therefore runs
-    at 1/32 MFMA utilisation at Sq=1.
+    The head-packed gfx950 kernel maps the MFMA M-axis to (query-token, head)
+    pairs, so a decode shape fills the matrix core -- unlike the dualwave prefill
+    kernel, whose M-axis is query rows and which therefore runs at 1/32 MFMA
+    utilisation at Sq=1. Causal masking is applied per query token inside the
+    kernel (bottom-right alignment).
 
     Shapes:
-      q            [B, 1, G, H_q, D]
+      q            [B, Sq, G, H_q, D]  (Sq bounded by the M-tile budget; see
+                   MAX_M_TILES in pa_decode_gfx950)
       k/v_cache    [num_pages, page_size, H_kv, D]   (MSLK "linear" layout)
       block_table  [B, max_pages_per_seq] int32
       seqlen_k     [B] int32, or None for "all of max_seqlen_kv"

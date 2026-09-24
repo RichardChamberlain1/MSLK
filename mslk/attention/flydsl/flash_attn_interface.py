@@ -480,9 +480,23 @@ _DISABLE_PAGED_DECODE_HP: bool = (
     os.environ.get("MSLK_DISABLE_PAGED_DECODE_HP", "0") != "0"
 )
 
-# The head-packed decode kernel maps the MFMA M-axis to query heads, so it needs
-# `1 <= H // num_kv_heads <= MFMA_M`. Mirrors MFMA_M in decode/pa_decode_gfx950.py.
-_HP_MAX_GQA_RATIO = 16
+# The head-packed decode kernel maps the MFMA M-axis to (query-token, head) pairs,
+# so it needs `ratio` to divide MFMA_M and `ratio * Sq` to fit in
+# `MFMA_M * MAX_M_TILES` slots. Mirrors MFMA_M / MAX_M_TILES in
+# decode/pa_decode_gfx950.py.
+_HP_MFMA_M = 16
+_HP_MAX_M_TILES = 2
+
+
+def _hp_decode_ok(num_heads: int, num_kv_heads: int, seqlen_q: int) -> bool:
+    """Does (ratio, Sq) fit the head-packed M-axis tiling?"""
+    if num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
+        return False
+    ratio = num_heads // num_kv_heads
+    if not (1 <= ratio <= _HP_MFMA_M) or _HP_MFMA_M % ratio != 0:
+        return False
+    t_pack = _HP_MFMA_M // ratio  # query tokens per M-tile
+    return 1 <= seqlen_q <= t_pack * _HP_MAX_M_TILES
 
 
 def _auto_paged_kv_splits(
@@ -652,25 +666,27 @@ def _flydsl_flash_attn_paged(
     )
     max_kv_pages = (skv + page_size - 1) // page_size
 
-    # ── Paged decode fast path (Sq == 1) ──────────────────────────────────────
+    # ── Paged decode fast path (short query blocks) ───────────────────────────
     # The dualwave kernel below maps the MFMA M-axis to query *rows*, so at Sq=1
     # only 1 of 32 M-rows carries work: measured on MI350X it issues 64x the MFMA
     # instructions of an equivalent head-packed kernel for the same maths, and
     # spends ~50% of its stall cycles on the barriers needed to assemble a tile
-    # that is 31/32 padding. `decode/pa_decode_gfx950.py` packs query *heads* onto
-    # M instead, so the matrix core stays full at any query length.
+    # that is 31/32 padding. `decode/pa_decode_gfx950.py` packs (query-token,
+    # head) pairs onto M instead, so the matrix core stays full.
     #
-    # Everything excluded here keeps the dualwave path: varlen and gappy have no
-    # decode kernel, `return_lse` is not exposed by it, and the vectorized cache
-    # layout is a different memory format.
+    # `_hp_decode_ok` bounds that: M holds `ratio * Sq` pairs across at most
+    # `_HP_MAX_M_TILES` tiles, so at GQA ratio 8 this covers Sq <= 4. Longer
+    # query blocks keep the dualwave path until the M-tile budget is raised.
     #
-    # `causal` is deliberately not a condition: at Sq=1 the single query sits at
-    # absolute position seqlen_kv-1 under bottom-right alignment, so causal and
-    # full attention both cover [0, seqlen_kv) and the decode kernel is correct
-    # for either.
+    # Everything else excluded here also keeps the dualwave path: varlen and
+    # gappy have no decode kernel, `return_lse` is not exposed by it, and the
+    # vectorized cache layout is a different memory format.
+    #
+    # `causal` is deliberately not a condition: the decode kernel applies the
+    # bottom-right causal bound per query token itself (query i attends to
+    # [0, seqlen_kv - Sq + i + 1)), which degenerates to the full range at Sq=1.
     if (
         not _DISABLE_PAGED_DECODE_HP
-        and Sq == 1
         and not varlen
         and kv_seqstart is None
         and not return_lse
@@ -678,14 +694,14 @@ def _flydsl_flash_attn_paged(
         and D in (64, 128)
         and dtype_str in ("bf16", "f16")
         and page_size % _PAGED_DECODE_TILE_N == 0
-        and 1 <= H // num_kv_heads <= _HP_MAX_GQA_RATIO
+        and _hp_decode_ok(H, num_kv_heads, Sq)
         and _gpu_arch(q.device).startswith("gfx950")
     ):
         from .decode.pa_decode_dense import pa_decode_paged_launch
 
-        # Kernel Q layout is [B, 1, G, H_q, D]; the paged ABI has no G axis (G=1).
+        # Kernel Q layout is [B, Sq, G, H_q, D]; the paged ABI has no G axis (G=1).
         hp_out = pa_decode_paged_launch(
-            q.view(B, 1, 1, H, D),
+            q.view(B, Sq, 1, H, D),
             k,
             v,
             block_table,
@@ -695,7 +711,7 @@ def _flydsl_flash_attn_paged(
             max_seqlen_kv=skv,
             split_k=0 if num_kv_splits == 0 else num_kv_splits,
             output_dtype=q.dtype,
-        ).view(B, 1, H, D)
+        ).view(B, Sq, H, D)
         if out is not None:
             out.copy_(hp_out)
             return out

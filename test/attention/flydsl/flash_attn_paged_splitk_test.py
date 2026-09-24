@@ -207,12 +207,39 @@ def test_head_packed_selected_at_sq1(monkeypatch):
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("Sq", [2, 4, 16])
-def test_head_packed_declined_above_sq1(monkeypatch, Sq):
-    """MFMA_M holds ratio*Sq; beyond Sq=1 the dualwave path stays responsible."""
+@pytest.mark.parametrize("Sq", [2, 4])
+def test_head_packed_selected_for_short_query_blocks(monkeypatch, Sq):
+    """M holds ratio*Sq pairs over MAX_M_TILES tiles: at ratio 8 that is Sq <= 4."""
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(1, Sq, 32768, 64), 0)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("Sq", [5, 8, 16])
+def test_head_packed_declined_beyond_m_tile_budget(monkeypatch, Sq):
+    """Past the M-tile budget the dualwave path stays responsible."""
     calls = _count_hp_calls(monkeypatch)
     _run(*_paged_inputs(1, Sq, 32768, 64), 0)
     assert calls == []
+
+
+@pytest.mark.parametrize("Sq,D", [(2, 64), (4, 64), (4, 128)])
+def test_head_packed_matches_dualwave_multi_token(monkeypatch, Sq, D):
+    """Packed (qtok, head) rows must agree with the dualwave path.
+
+    This is the check on the per-query-token causal bound: the kernel applies
+    `min(t_end, t_full - Sq + qtok + 1)` itself, so a wrong bound shows up here
+    as a mismatch on the earlier query rows only.
+    """
+    from mslk.attention.flydsl import flash_attn_interface as fai
+
+    args = _paged_inputs(2, Sq, 32768, D)
+    monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
+    ref = _run(*args, 1)
+    monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", False)
+    got = _run(*args, 0)
+    assert got.shape == ref.shape == (2, Sq, H, D)
+    torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
 
 
 def test_head_packed_declined_for_wide_gqa_ratio(monkeypatch):
