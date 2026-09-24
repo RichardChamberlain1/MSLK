@@ -174,7 +174,39 @@ def test_return_lse_still_works_under_auto():
 
 
 def _count_hp_calls(monkeypatch):
-    """Patch the head-packed launcher to record invocations; returns the log."""
+    """Patch the head-packed launcher to record invocations; returns the log.
+
+    Also disables GQA head packing. Packing removes the same fan-out the
+    head-packed decode kernel was routed here to avoid, covers Sq up to 64
+    rather than the M-tile budget's 4-16, and therefore takes precedence by
+    default (see test_gqa_packing_takes_precedence). The decode kernel remains
+    the route for everything packing declines, and that is what these tests
+    pin -- so they select it explicitly rather than depending on which
+    mechanism happens to win.
+    """
+    from mslk.attention.flydsl import flash_attn_interface as fai
+    from mslk.attention.flydsl.decode import pa_decode_dense
+
+    monkeypatch.setattr(fai, "_PAGED_GQA_PACK", False)
+    calls = []
+    real = pa_decode_dense.pa_decode_paged_launch
+
+    def _spy(*a, **kw):
+        calls.append(kw)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(pa_decode_dense, "pa_decode_paged_launch", _spy)
+    return calls
+
+
+def test_gqa_packing_takes_precedence(monkeypatch):
+    """With both available, GQA packing owns the shape and the decode kernel idles.
+
+    Packing folds query heads into M inside the generic paged kernel, so it
+    fixes the same fan-out with a far wider reach. Measured over the 268-case
+    paged grid it is equal at Sq=1, within noise at Sq=4, and 2.8x better across
+    the Sq=7..16 family, so it must win wherever it applies.
+    """
     from mslk.attention.flydsl.decode import pa_decode_dense
 
     calls = []
@@ -185,7 +217,8 @@ def _count_hp_calls(monkeypatch):
         return real(*a, **kw)
 
     monkeypatch.setattr(pa_decode_dense, "pa_decode_paged_launch", _spy)
-    return calls
+    _run(*_paged_inputs(1, 1, 32768, 64), 0)
+    assert calls == []
 
 
 def calls_groups(calls):
