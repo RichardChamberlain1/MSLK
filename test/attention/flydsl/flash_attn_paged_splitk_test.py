@@ -174,18 +174,23 @@ def test_return_lse_still_works_under_auto():
 
 
 def _count_hp_calls(monkeypatch):
-    """Patch the head-packed launcher to count invocations; returns the counter."""
+    """Patch the head-packed launcher to record invocations; returns the log."""
     from mslk.attention.flydsl.decode import pa_decode_dense
 
     calls = []
     real = pa_decode_dense.pa_decode_paged_launch
 
     def _spy(*a, **kw):
-        calls.append(1)
+        calls.append(kw)
         return real(*a, **kw)
 
     monkeypatch.setattr(pa_decode_dense, "pa_decode_paged_launch", _spy)
     return calls
+
+
+def calls_groups(calls):
+    """Query-group count the routing layer asked for on the first call."""
+    return calls[0].get("query_groups", 1)
 
 
 def test_head_packed_matches_dualwave_at_sq1(monkeypatch):
@@ -223,16 +228,53 @@ def test_head_packed_selected_for_deep_tiling_at_d64(monkeypatch, Sq):
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("Sq", [13, 15, 16])
+@pytest.mark.parametrize("Sq", [13, 15])
 def test_head_packed_declined_when_d128_would_spill(monkeypatch, Sq):
     """D=128 spills past 6 M-tiles (measured 280B at 7, 916B at 8).
 
-    Spilling a bandwidth-bound decode kernel is self-defeating, so these must
-    fall through to the existing path even though the tiling itself would work.
+    Spilling a bandwidth-bound decode kernel is self-defeating, so these fall
+    through to the existing path. 13 and 15 are odd, so equal-span query
+    grouping cannot rescue them either -- see the Sq=16 case below.
     """
     calls = _count_hp_calls(monkeypatch)
     _run(*_paged_inputs(8, Sq, 32768, 128), 0)
     assert calls == []
+
+
+def test_head_packed_uses_query_groups_when_single_pass_would_spill(monkeypatch):
+    """D=128 / Sq=16 needs 8 tiles in one pass, which spills.
+
+    Two passes of 8 query tokens need 4 tiles each -- under the budget -- at the
+    cost of reading KV twice. Measured 1.9x faster than the path it replaces.
+    """
+    from mslk.attention.flydsl import flash_attn_interface as fai
+
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(8, 16, 32768, 128), 0)
+    assert len(calls) == 1
+    assert calls_groups(calls) == 2
+
+
+def test_query_grouping_kill_switch(monkeypatch):
+    """With grouping disabled, a shape that only fits via groups declines."""
+    from mslk.attention.flydsl import flash_attn_interface as fai
+
+    monkeypatch.setattr(fai, "_DISABLE_PAGED_QGROUPS", True)
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(8, 16, 32768, 128), 0)
+    assert calls == []
+
+
+def test_query_grouping_not_used_when_single_pass_fits(monkeypatch):
+    """Grouping is only for rescuing shapes the register budget would reject.
+
+    D=64 fits Sq=16 in one pass, and grouping there measured inside run-to-run
+    noise, so the extra KV pass must not be spent.
+    """
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(8, 16, 32768, 64), 0)
+    assert len(calls) == 1
+    assert calls_groups(calls) == 1
 
 
 def test_head_packed_declined_when_too_few_ctas(monkeypatch):

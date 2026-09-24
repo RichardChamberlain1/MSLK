@@ -802,6 +802,12 @@ def pa_decode_gfx950_launch(
     and ``block_table`` is ``[B, max_pages_per_seq]`` int32. ``kv_max`` must be
     supplied by the caller -- deriving it from ``seq_positions`` would be a
     device->host sync and is illegal under CUDA-graph capture.
+
+    **Q must be contiguous.** The single-split epilogue addresses the output with
+    Q's strides, so a non-contiguous Q (a slice, say) whose stride(0) differs from
+    the freshly allocated output's will write to the wrong place for every batch
+    element after the first. The split-K path is unaffected because it computes
+    partial-buffer offsets itself.
     """
     from mslk.flydsl.jit import run_compiled
 

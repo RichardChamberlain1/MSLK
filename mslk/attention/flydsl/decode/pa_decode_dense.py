@@ -139,6 +139,24 @@ def pa_decode_launch(
     )
 
 
+def query_group_seqlen(seqlen_kv: int, seqlen_q: int, groups: int, group: int) -> int:
+    """KV length to pass for one query group, preserving bottom-right causality.
+
+    In the full block, query token ``i`` attends to ``[0, L - Sq + i + 1)``.
+    Group ``g`` holds tokens ``g*S .. g*S+S-1`` where ``S = Sq/groups``, and is
+    launched as its own block of ``S`` tokens. Inside that launch, token ``j``
+    attends to ``[0, L_g - S + j + 1)``. Setting
+
+        L_g = L - (groups - 1 - g) * S
+
+    makes those identical, since ``L_g - S + j + 1 == L - Sq + (g*S + j) + 1``.
+    The last group therefore sees the full context and earlier groups a
+    correspondingly shorter prefix -- no masking change is needed in the kernel.
+    """
+    span = seqlen_q // groups
+    return seqlen_kv - (groups - 1 - group) * span
+
+
 def pa_decode_paged_launch(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -151,6 +169,7 @@ def pa_decode_paged_launch(
     max_seqlen_kv: int,
     split_k: int = 0,
     output_dtype: Optional[torch.dtype] = None,
+    query_groups: int = 1,
 ) -> torch.Tensor:
     """Paged-KV head-packed decode (short query blocks).
 
@@ -162,7 +181,7 @@ def pa_decode_paged_launch(
 
     Shapes:
       q            [B, Sq, G, H_q, D]  (Sq bounded by the M-tile budget; see
-                   MAX_M_TILES in pa_decode_gfx950)
+                   MAX_M_TILES_BY_HEAD_DIM in pa_decode_gfx950)
       k/v_cache    [num_pages, page_size, H_kv, D]   (MSLK "linear" layout)
       block_table  [B, max_pages_per_seq] int32
       seqlen_k     [B] int32, or None for "all of max_seqlen_kv"
@@ -170,24 +189,60 @@ def pa_decode_paged_launch(
     ``max_seqlen_kv`` is required: deriving it from ``seqlen_k`` would be a
     device->host sync and is illegal under CUDA-graph capture.
 
+    ``query_groups`` > 1 covers the query block in several shallower passes
+    instead of one deep one. Each M-tile adds loop-carried accumulator, so depth
+    costs occupancy (measured 9 waves/SIMD at one tile down to 2 at eight) and at
+    D=128 spills past 6 tiles. Splitting into G passes uses ``Sq/G`` tokens each
+    -- ``G`` times the KV traffic, but shallower tiles. Measured at D=128/Sq=16:
+    1.5x-2.0x for G=2. See `query_group_seqlen` for why this is exact.
+
     Raises ValueError for configurations the kernel cannot serve (GQA ratio > 16,
     D % 32, page_size % 32, non-gfx950) -- there is no generic paged fallback, so
     callers must gate before calling.
     """
     from .pa_decode_gfx950 import pa_decode_gfx950_launch
 
-    return pa_decode_gfx950_launch(
-        q,
-        k_cache,
-        v_cache,
-        seqlen_k,
-        softmax_scale,
-        split_k,
-        output_dtype,
-        block_table=block_table,
-        page_size=page_size,
-        kv_max=max_seqlen_kv,
-    )
+    Sq = q.shape[1]
+    if query_groups <= 1 or Sq % query_groups != 0:
+        # Unchanged path. Kept as an early return so grouping cannot perturb the
+        # shapes that do not use it.
+        return pa_decode_gfx950_launch(
+            q,
+            k_cache,
+            v_cache,
+            seqlen_k,
+            softmax_scale,
+            split_k,
+            output_dtype,
+            block_table=block_table,
+            page_size=page_size,
+            kv_max=max_seqlen_kv,
+        )
+
+    span = Sq // query_groups
+    parts = []
+    for g in range(query_groups):
+        kv_g = query_group_seqlen(max_seqlen_kv, Sq, query_groups, g)
+        # `.contiguous()` is load-bearing, not hygiene. The kernel's non-split
+        # epilogue addresses the output with Q's strides, so it requires the two
+        # to share a layout. A slice of the query block keeps the parent's
+        # stride(0) (Sq*...) while the freshly allocated output has span*...,
+        # and the mismatch silently corrupts every batch above the first.
+        parts.append(
+            pa_decode_gfx950_launch(
+                q[:, g * span : (g + 1) * span].contiguous(),
+                k_cache,
+                v_cache,
+                None if seqlen_k is None else seqlen_k - (Sq - (g + 1) * span),
+                softmax_scale,
+                split_k,
+                output_dtype,
+                block_table=block_table,
+                page_size=page_size,
+                kv_max=kv_g,
+            )
+        )
+    return torch.cat(parts, dim=1)
 
 
 # ── AOT interface ─────────────────────────────────────────────────────────────
