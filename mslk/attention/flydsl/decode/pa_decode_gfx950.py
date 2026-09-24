@@ -74,6 +74,8 @@ def compile_pa_decode_gfx950(
     output_dtype_str: str,
     split_k: int = 1,
     arch: str = "",
+    paged: bool = False,
+    page_size: int = 0,
 ) -> Any:  # pyre-ignore[3]
     if not arch:
         arch = get_rocm_arch()
@@ -81,10 +83,18 @@ def compile_pa_decode_gfx950(
     assert head_size % MFMA_N == 0
     assert kv_dtype_str in ("f16", "bf16")
     assert arch.startswith("gfx950"), f"pa_decode_gfx950 requires gfx950, got {arch}"
+    if paged:
+        # A TILE_N-aligned tile must never straddle a page, so the whole tile shares
+        # one block-table entry and the lookup stays scalar (see the tile loop).
+        assert page_size > 0 and page_size % TILE_N == 0, (
+            f"paged pa_decode_gfx950 requires page_size % {TILE_N} == 0, got {page_size}"
+        )
 
     _HEAD = head_size
     _SK = split_k
     _SPLIT = _SK > 1
+    _PAGED = bool(paged)
+    _PAGE_SIZE = int(page_size)
     _FX_KV = _FX_DTYPE[kv_dtype_str]
     _FX_OUT = _FX_DTYPE[output_dtype_str]
     _QK_GRP = _HEAD // MFMA_K_QK  # head-dim groups for QK (4 at D=128)
@@ -109,7 +119,10 @@ def compile_pa_decode_gfx950(
     alloc = SmemAllocator(
         None,
         arch=arch,
-        global_sym_name=f"pa_gfx950_h{_HEAD}_{kv_dtype_str}_sk{_SK}",
+        global_sym_name=(
+            f"pa_gfx950_h{_HEAD}_{kv_dtype_str}_sk{_SK}"
+            + (f"_pg{_PAGE_SIZE}" if _PAGED else "")
+        ),
     )
     alloc.ptr = _LDS_TOTAL
 
@@ -122,13 +135,18 @@ def compile_pa_decode_gfx950(
         k_ptr: fx.Tensor,
         v_ptr: fx.Tensor,
         seq_ptr: fx.Tensor,
+        bt_ptr: fx.Tensor,
         stride_qb: fx.Int32,
         stride_qg: fx.Int32,
         stride_qh: fx.Int32,
+        # Dense KV: (batch, token, group, kv_head) strides of [B, KV_MAX, G, H_kv, D].
+        # Paged KV: stride_kb is the *page* stride and stride_km the token-within-page
+        # stride of [num_pages, page_size, H_kv, D]; stride_kg is unused (pass 0).
         stride_kb: fx.Int32,
         stride_km: fx.Int32,
         stride_kg: fx.Int32,
         stride_kh: fx.Int32,
+        stride_btb: fx.Int32,
         num_hq: fx.Int32,
         num_g: fx.Int32,
         kv_max: fx.Int32,
@@ -168,11 +186,20 @@ def compile_pa_decode_gfx950(
         pm_rsrc = buffer_ops.create_buffer_resource(partial_max_ptr, max_size=True)
         ps_rsrc = buffer_ops.create_buffer_resource(partial_sum_ptr, max_size=True)
         seq_rsrc = buffer_ops.create_buffer_resource(seq_ptr, max_size=True)
+        if const_expr(_PAGED):
+            bt_rsrc = buffer_ops.create_buffer_resource(bt_ptr, max_size=False)
 
         seq_len = buffer_ops.buffer_load(seq_rsrc, b_idx, vec_width=1, dtype=T.i32)
         t_full = arith.select(seq_len > fx.Int32(0), seq_len, kv_max)
         if const_expr(_SPLIT):
             chunk = (t_full + split_total - fx.Int32(1)) // split_total
+            # Round the chunk up to TILE_N so every tile_start stays TILE_N-aligned.
+            # Paged addressing depends on it (a tile must not straddle a page); it is
+            # harmless for dense. Trailing splits may end up empty, which the reduce
+            # kernel already tolerates (it skips partitions with sum == 0).
+            chunk = (
+                (chunk + fx.Int32(TILE_N - 1)) // fx.Int32(TILE_N)
+            ) * fx.Int32(TILE_N)
             t_start = split_idx * chunk
             t_end_raw = (split_idx + fx.Int32(1)) * chunk
             t_end = arith.select(t_end_raw < t_full, t_end_raw, t_full)
@@ -199,7 +226,12 @@ def compile_pa_decode_gfx950(
                 buffer_ops.buffer_load(q_rsrc, q_off, vec_width=8, dtype=_FX_KV)
             )
 
-        kv_base = b_idx * stride_kb + g_idx * stride_kg + hkv_abs * stride_kh
+        # Dense: the (b, g) origin is a fixed offset. Paged: (b, token) is resolved per
+        # tile through the block table, so only the kv-head offset is loop-invariant.
+        if const_expr(_PAGED):
+            kv_base = hkv_abs * stride_kh
+        else:
+            kv_base = b_idx * stride_kb + g_idx * stride_kg + hkv_abs * stride_kh
 
         # Loop-carried state: per-head (reg e over 0..3) running max, running sum,
         # and PV accumulator (_DN d-passes x 4 regs).
@@ -213,6 +245,26 @@ def compile_pa_decode_gfx950(
             rsum = [fx.Float32(state[4 + i]) for i in range(4)]
             acc = [fx.Float32(state[8 + i]) for i in range(_N_ACC)]
             tile_start = fx.Int32(arith.index_cast(T.i32, _tile_i))
+
+            # ── Paged: one block-table read per tile ──
+            # tile_start is TILE_N-aligned and page_size % TILE_N == 0, so all TILE_N
+            # tokens of this tile live in one page. The lookup is therefore uniform
+            # across the warp (scalar) and hoisted here rather than per lane.
+            if const_expr(_PAGED):
+                _page = buffer_ops.buffer_load(
+                    bt_rsrc,
+                    b_idx * stride_btb + tile_start // fx.Int32(_PAGE_SIZE),
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+                # Origin of this tile inside its page.
+                tile_org = (
+                    kv_base
+                    + fx.Int32(_page) * stride_kb
+                    + (tile_start % fx.Int32(_PAGE_SIZE)) * stride_km
+                )
+            else:
+                tile_org = kv_base + tile_start * stride_km
 
             # ── Issue V HBM loads EARLY (into regs) so latency overlaps the
             # QK+softmax below; LDS transpose stores + barrier happen just before PV.
@@ -228,7 +280,7 @@ def compile_pa_decode_gfx950(
                 _v8s.append(
                     buffer_ops.buffer_load(
                         v_rsrc,
-                        kv_base + (tile_start + _tok) * stride_km + _col,
+                        tile_org + _tok * stride_km + _col,
                         vec_width=8,
                         dtype=_FX_KV,
                     )
@@ -247,10 +299,12 @@ def compile_pa_decode_gfx950(
             for st in range_constexpr(N_SUBTILE):
                 acc_qk = zero_v4
                 for g in range_constexpr(_QK_GRP):
-                    k_tok = tile_start + fx.Int32(st * MFMA_N) + tok_lane
+                    # Offset within the tile; tile_org already carries the page (paged)
+                    # or the (b, g, tile_start) origin (dense).
+                    k_tok_in_tile = fx.Int32(st * MFMA_N) + tok_lane
                     k_off = (
-                        kv_base
-                        + k_tok * stride_km
+                        tile_org
+                        + k_tok_in_tile * stride_km
                         + fx.Int32(g * MFMA_K_QK)
                         + grp * fx.Int32(8)
                     )
@@ -489,12 +543,16 @@ def compile_pa_decode_gfx950(
 
 
 @functools.lru_cache(maxsize=256)
-def _make_gfx950_jit_launcher(head_size, kv_dtype_str, out_dtype_str, split_k):
+def _make_gfx950_jit_launcher(
+    head_size, kv_dtype_str, out_dtype_str, split_k, paged=False, page_size=0
+):
     kernel, _alloc = compile_pa_decode_gfx950(
         head_size=head_size,
         kv_dtype_str=kv_dtype_str,
         output_dtype_str=out_dtype_str,
         split_k=split_k,
+        paged=paged,
+        page_size=page_size,
     )
 
     @flyc.jit
@@ -506,6 +564,7 @@ def _make_gfx950_jit_launcher(head_size, kv_dtype_str, out_dtype_str, split_k):
         k_ptr,
         v_ptr,
         seq_ptr,
+        bt_ptr,
         stride_qb,
         stride_qg,
         stride_qh,
@@ -513,6 +572,7 @@ def _make_gfx950_jit_launcher(head_size, kv_dtype_str, out_dtype_str, split_k):
         stride_km,
         stride_kg,
         stride_kh,
+        stride_btb,
         num_hq,
         num_g,
         kv_max,
@@ -538,6 +598,7 @@ def _make_gfx950_jit_launcher(head_size, kv_dtype_str, out_dtype_str, split_k):
             k_ptr,
             v_ptr,
             seq_ptr,
+            bt_ptr,
             stride_qb,
             stride_qg,
             stride_qh,
@@ -545,6 +606,7 @@ def _make_gfx950_jit_launcher(head_size, kv_dtype_str, out_dtype_str, split_k):
             stride_km,
             stride_kg,
             stride_kh,
+            stride_btb,
             num_hq,
             num_g,
             kv_max,
@@ -558,16 +620,40 @@ def _make_gfx950_jit_launcher(head_size, kv_dtype_str, out_dtype_str, split_k):
 
 
 def pa_decode_gfx950_launch(
-    Q, K, V, seq_positions, softmax_scale, split_k=0, output_dtype=None
+    Q,
+    K,
+    V,
+    seq_positions,
+    softmax_scale,
+    split_k=0,
+    output_dtype=None,
+    block_table=None,
+    page_size=0,
+    kv_max=None,
 ):
     """Head-packed MFMA decode. One CTA per KV head packs its GQA group onto
-    the MFMA M-axis. Falls back to the generic kernel for ratio>16 or non-gfx950."""
+    the MFMA M-axis. Falls back to the generic kernel for ratio>16 or non-gfx950.
+
+    Dense mode (``block_table is None``): K/V are ``[B, KV_MAX, G, H_kv, D]``.
+
+    Paged mode: K/V are ``[num_pages, page_size, H_kv, D]`` (MSLK "linear" layout)
+    and ``block_table`` is ``[B, max_pages_per_seq]`` int32. ``kv_max`` must be
+    supplied by the caller -- deriving it from ``seq_positions`` would be a
+    device->host sync and is illegal under CUDA-graph capture.
+    """
     from mslk.flydsl.jit import run_compiled
 
     from .pa_decode_dense import auto_split_k_hp
 
+    paged = block_table is not None
     B, _, G, H_q, D = Q.shape
-    _, KV_MAX, _, H_kv, _ = K.shape
+    if paged:
+        H_kv = K.shape[2]
+        if kv_max is None:
+            raise ValueError("pa_decode_gfx950_launch: paged mode requires kv_max")
+        KV_MAX = int(kv_max)
+    else:
+        _, KV_MAX, _, H_kv, _ = K.shape
     ratio = H_q // H_kv if H_kv > 0 else 0
     ok = (
         H_kv > 0
@@ -576,8 +662,15 @@ def pa_decode_gfx950_launch(
         and get_rocm_arch().startswith("gfx950")
         and K.dtype in (torch.float16, torch.bfloat16)
         and D % MFMA_K_QK == 0
+        and (not paged or page_size % TILE_N == 0)
     )
     if not ok:
+        if paged:
+            # No generic paged fallback exists; the caller must keep its own path.
+            raise ValueError(
+                f"pa_decode_gfx950_launch: unsupported paged config "
+                f"(ratio={ratio}, D={D}, dtype={K.dtype}, page_size={page_size})"
+            )
         from .pa_decode_generic import pa_decode_generic_launch
 
         return pa_decode_generic_launch(
@@ -597,15 +690,28 @@ def pa_decode_gfx950_launch(
         split_k = auto_split_k_hp(B, G, H_q, H_kv, KV_MAX)
     out = torch.empty((B, 1, G, H_q, D), dtype=output_dtype, device=Q.device)
     sq = Q.stride()
-    sk2 = K.stride()
     dev = Q.device
+    ks = K.stride()
+    if paged:
+        # (page, token-in-page, unused, kv_head) — see the kernel signature comment.
+        k_strides = (ks[0], ks[1], 0, ks[2])
+        bt = block_table if block_table.dtype == torch.int32 else block_table.to(
+            torch.int32
+        )
+        bt_stride = bt.stride(0)
+    else:
+        k_strides = (ks[0], ks[1], ks[2], ks[3])
+        bt = torch.empty(0, dtype=torch.int32, device=dev)
+        bt_stride = 0
     n_cta_base = B * G * H_kv
     # Thread the live stream into .launch so the kernel is captured under CUDA graphs
     # (a default-stream launch would capture empty).
     stream = torch.cuda.current_stream()
     if split_k == 1:
         dummy = torch.empty(0, dtype=torch.float32, device=dev)
-        launcher = _make_gfx950_jit_launcher(D, kv_str, out_str, 1)
+        launcher = _make_gfx950_jit_launcher(
+            D, kv_str, out_str, 1, paged, page_size if paged else 0
+        )
         run_compiled(
             launcher,
             out,
@@ -615,13 +721,15 @@ def pa_decode_gfx950_launch(
             K,
             V,
             seq_positions,
+            bt,
             sq[0],
             sq[2],
             sq[3],
-            sk2[0],
-            sk2[1],
-            sk2[2],
-            sk2[3],
+            k_strides[0],
+            k_strides[1],
+            k_strides[2],
+            k_strides[3],
+            bt_stride,
             H_q,
             G,
             KV_MAX,
@@ -636,7 +744,9 @@ def pa_decode_gfx950_launch(
         po = torch.empty((B, G, split_k, H_q, D), dtype=torch.float32, device=dev)
         pm = torch.empty((B, G, split_k, H_q), dtype=torch.float32, device=dev)
         ps = torch.empty((B, G, split_k, H_q), dtype=torch.float32, device=dev)
-        launcher = _make_gfx950_jit_launcher(D, kv_str, "f32", split_k)
+        launcher = _make_gfx950_jit_launcher(
+            D, kv_str, "f32", split_k, paged, page_size if paged else 0
+        )
         run_compiled(
             launcher,
             po,
@@ -646,13 +756,15 @@ def pa_decode_gfx950_launch(
             K,
             V,
             seq_positions,
+            bt,
             sq[0],
             sq[2],
             sq[3],
-            sk2[0],
-            sk2[1],
-            sk2[2],
-            sk2[3],
+            k_strides[0],
+            k_strides[1],
+            k_strides[2],
+            k_strides[3],
+            bt_stride,
             H_q,
             G,
             KV_MAX,

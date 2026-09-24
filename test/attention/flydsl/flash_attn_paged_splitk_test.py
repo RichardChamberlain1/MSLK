@@ -164,3 +164,90 @@ def test_return_lse_still_works_under_auto():
     )
     assert out.shape == args[0].shape
     assert lse.shape == (1, H, 1)
+
+
+# ── Head-packed paged decode fast path (Sq == 1) ──────────────────────────────
+# The dualwave paged kernel maps the MFMA M-axis to query rows, so at Sq=1 only
+# 1 of 32 rows is real work. `decode/pa_decode_gfx950.py` packs query heads onto
+# M instead; `_flydsl_flash_attn_paged` routes Sq=1 to it. These tests pin the
+# routing conditions and the equivalence of the two kernels.
+
+
+def _count_hp_calls(monkeypatch):
+    """Patch the head-packed launcher to count invocations; returns the counter."""
+    from mslk.attention.flydsl.decode import pa_decode_dense
+
+    calls = []
+    real = pa_decode_dense.pa_decode_paged_launch
+
+    def _spy(*a, **kw):
+        calls.append(1)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(pa_decode_dense, "pa_decode_paged_launch", _spy)
+    return calls
+
+
+def test_head_packed_matches_dualwave_at_sq1(monkeypatch):
+    """The two kernels must agree; the head-packed one is the faster path."""
+    from mslk.attention.flydsl import flash_attn_interface as fai
+
+    args = _paged_inputs(2, 1, 32768, 64)
+    monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
+    ref = _run(*args, 1)
+    monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", False)
+    got = _run(*args, 0)
+    assert got.shape == ref.shape
+    torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
+
+
+def test_head_packed_selected_at_sq1(monkeypatch):
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(1, 1, 32768, 64), 0)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("Sq", [2, 4, 16])
+def test_head_packed_declined_above_sq1(monkeypatch, Sq):
+    """MFMA_M holds ratio*Sq; beyond Sq=1 the dualwave path stays responsible."""
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(1, Sq, 32768, 64), 0)
+    assert calls == []
+
+
+def test_head_packed_declined_for_wide_gqa_ratio(monkeypatch):
+    """ratio = H // HKV must be <= MFMA_M (16); here it is 32."""
+    calls = _count_hp_calls(monkeypatch)
+    ctx, D, pages = 32768, 64, 32768 // PAGE
+    torch.manual_seed(0)
+    q = torch.randn(1, 1, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(pages, PAGE, 1, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    bt = torch.arange(pages, device="cuda", dtype=torch.int32).view(1, pages)
+    sk = torch.full((1,), ctx, device="cuda", dtype=torch.int32)
+    flydsl_flash_attn_func(
+        q, k, v, causal=True, num_kv_heads=1, block_table=bt, seqlen_k=sk,
+        kv_cache_layout="linear", num_kv_splits=0,
+    )
+    assert calls == []
+
+
+def test_head_packed_kill_switch(monkeypatch):
+    from mslk.attention.flydsl import flash_attn_interface as fai
+
+    calls = _count_hp_calls(monkeypatch)
+    monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
+    _run(*_paged_inputs(1, 1, 32768, 64), 0)
+    assert calls == []
+
+
+def test_head_packed_exceeds_dualwave_page_table_cap():
+    """The dualwave path caps at 2048 pages/split (131072 tokens at page 64).
+
+    The decode kernel reads the block table straight from memory, so it has no
+    such window -- this context would raise on the old path.
+    """
+    ctx = 262144
+    out = _run(*_paged_inputs(1, 1, ctx, 64), 0)
+    assert out.shape == (1, 1, H, 64)
+    assert torch.isfinite(out).all()

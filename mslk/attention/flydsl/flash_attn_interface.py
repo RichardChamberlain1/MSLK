@@ -458,6 +458,10 @@ def _build_paged(
 _PAGED_PAGE_SIZE = 64
 _PAGED_BT_LDS_SIZE = 2048
 
+# Streaming tile of the head-packed decode kernel (TILE_N in decode/pa_decode_gfx950.py).
+# A page must be a whole number of tiles so a tile never straddles two pages.
+_PAGED_DECODE_TILE_N = 32
+
 # Each KV split must own enough pages to be worth a workgroup + its combine pass.
 _PAGED_MIN_PAGES_PER_SPLIT = 4
 
@@ -468,6 +472,17 @@ _PAGED_MIN_PAGES_PER_SPLIT = 4
 _DISABLE_PAGED_AUTO_SPLITK: bool = (
     os.environ.get("MSLK_DISABLE_PAGED_SPLITK", "0") != "0"
 )
+
+# Kill-switch for routing paged Sq=1 decode to the head-packed decode kernel
+# (`decode/pa_decode_gfx950.py`). Set to fall back to the dualwave paged path,
+# for A/B measurement and for bisecting regressions.
+_DISABLE_PAGED_DECODE_HP: bool = (
+    os.environ.get("MSLK_DISABLE_PAGED_DECODE_HP", "0") != "0"
+)
+
+# The head-packed decode kernel maps the MFMA M-axis to query heads, so it needs
+# `1 <= H // num_kv_heads <= MFMA_M`. Mirrors MFMA_M in decode/pa_decode_gfx950.py.
+_HP_MAX_GQA_RATIO = 16
 
 
 def _auto_paged_kv_splits(
@@ -636,6 +651,55 @@ def _flydsl_flash_attn_paged(
         int(max_seqlen_kv) if max_seqlen_kv is not None else int(seqlen_k.max().item())
     )
     max_kv_pages = (skv + page_size - 1) // page_size
+
+    # ── Paged decode fast path (Sq == 1) ──────────────────────────────────────
+    # The dualwave kernel below maps the MFMA M-axis to query *rows*, so at Sq=1
+    # only 1 of 32 M-rows carries work: measured on MI350X it issues 64x the MFMA
+    # instructions of an equivalent head-packed kernel for the same maths, and
+    # spends ~50% of its stall cycles on the barriers needed to assemble a tile
+    # that is 31/32 padding. `decode/pa_decode_gfx950.py` packs query *heads* onto
+    # M instead, so the matrix core stays full at any query length.
+    #
+    # Everything excluded here keeps the dualwave path: varlen and gappy have no
+    # decode kernel, `return_lse` is not exposed by it, and the vectorized cache
+    # layout is a different memory format.
+    #
+    # `causal` is deliberately not a condition: at Sq=1 the single query sits at
+    # absolute position seqlen_kv-1 under bottom-right alignment, so causal and
+    # full attention both cover [0, seqlen_kv) and the decode kernel is correct
+    # for either.
+    if (
+        not _DISABLE_PAGED_DECODE_HP
+        and Sq == 1
+        and not varlen
+        and kv_seqstart is None
+        and not return_lse
+        and not vectorized
+        and D in (64, 128)
+        and dtype_str in ("bf16", "f16")
+        and page_size % _PAGED_DECODE_TILE_N == 0
+        and 1 <= H // num_kv_heads <= _HP_MAX_GQA_RATIO
+        and _gpu_arch(q.device).startswith("gfx950")
+    ):
+        from .decode.pa_decode_dense import pa_decode_paged_launch
+
+        # Kernel Q layout is [B, 1, G, H_q, D]; the paged ABI has no G axis (G=1).
+        hp_out = pa_decode_paged_launch(
+            q.view(B, 1, 1, H, D),
+            k,
+            v,
+            block_table,
+            seqlen_k,
+            float(sm_scale) if sm_scale is not None else float(D**-0.5),
+            page_size=page_size,
+            max_seqlen_kv=skv,
+            split_k=0 if num_kv_splits == 0 else num_kv_splits,
+            output_dtype=q.dtype,
+        ).view(B, 1, H, D)
+        if out is not None:
+            out.copy_(hp_out)
+            return out
+        return hp_out
 
     # Split-K (paged, dense only): split the KV dimension across grid_z = B*num_kv_splits
     # workgroups + a combine pass. Fills the GPU for low-occupancy shapes (small B / few
