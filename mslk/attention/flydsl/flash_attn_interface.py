@@ -115,6 +115,16 @@ def _dense_generic_tile(
 # Generic split-K uses BLOCK_M=64, so the "mtile" (Q rows per workgroup) is 64.
 _GENERIC_SPLITK_BLOCK_M = 64
 
+# Waves per CTA, from the launch geometry of each paged kernel (confirmed against
+# Workgroup_Size_X in rocprofv3 kernel traces). Used to turn a workgroup count
+# into a wave count when judging whether the device is full.
+_LIGHT_WAVES_PER_CTA = 2  # flash_attn_generic, 128 threads
+_DUALWAVE_WAVES_PER_CTA = 8  # flash_attn_dualwave_swp_gfx950, 512 threads
+
+# Resident waves per CU to aim for. Matches the target in auto_split_k_hp
+# (decode/pa_decode_dense.py) so the two split heuristics agree.
+_TARGET_WAVES_PER_CU = 8
+
 
 def _generic_splitk_list(i: int) -> int:
     # Mirror CK generate_splits_list: 1,2,4,8,16,32,64,96,128,... .
@@ -132,12 +142,22 @@ def _num_kv_splits_heuristic(
     head_dim: int,
     num_cu: int,
     max_splits: int = 8,
+    waves_per_cta: int = 0,
 ) -> int:
     """Port of CK get_num_kv_splits_heuristic for the generic BLOCK_M=64 kernel.
 
     Returns the number of KV splits (1 = no split-K). CK varies the mtile by
     head-dim, but the generic kernel always uses BLOCK_M=64, so the occupancy
     estimate uses mtile=64 (or 16 for tiny q, matching CK's smallq branch).
+
+    ``waves_per_cta`` makes the "is the device full?" test count **waves** rather
+    than workgroups. Counting workgroups silently assumes every kernel has the
+    same CTA width, which is false here: the light kernel is 128 threads (2
+    waves), dualwave is 512 (8). At B=8/H=32 the workgroup test sees
+    ``256 >= 0.9*256`` and declines to split, but those are 2-wave CTAs --
+    measured ``SQ_WAVES = 512`` on 256 CUs, i.e. 2 waves/CU, the most starved
+    band in the benchmark grid. Left at 0 the original workgroup-based test is
+    used, so existing callers are unaffected.
     """
 
     def ceildiv(a: int, b: int) -> int:
@@ -158,7 +178,10 @@ def _num_kv_splits_heuristic(
     if seqlen_q <= 16:
         mtile = 16
     blocks = num_batches * num_heads * ceildiv(seqlen_q, mtile)
-    if blocks >= 0.9 * num_cu:
+    if waves_per_cta > 0:
+        if blocks * waves_per_cta >= _TARGET_WAVES_PER_CU * num_cu:
+            return 1
+    elif blocks >= 0.9 * num_cu:
         return 1
 
     max_splits = min(max_splits, num_cu)
@@ -481,22 +504,67 @@ _DISABLE_PAGED_DECODE_HP: bool = (
 )
 
 # The head-packed decode kernel maps the MFMA M-axis to (query-token, head) pairs,
-# so it needs `ratio` to divide MFMA_M and `ratio * Sq` to fit in
-# `MFMA_M * MAX_M_TILES` slots. Mirrors MFMA_M / MAX_M_TILES in
-# decode/pa_decode_gfx950.py.
+# so it needs `ratio` to divide MFMA_M and `ratio * Sq` to fit the M-tile budget.
+# Mirrors MFMA_M / MAX_M_TILES_BY_HEAD_DIM in decode/pa_decode_gfx950.py.
 _HP_MFMA_M = 16
-_HP_MAX_M_TILES = 2
+
+# One CTA is one wave here, so CTA count is the wave count. Below this the kernel
+# cannot hide memory latency: more M-tiles cost occupancy (9 waves/SIMD at 1 tile
+# down to 2 at 8), and with too few CTAs there is nothing else resident to cover
+# the stall. Measured at D=64/Sq=16: 1.0 CTA/CU ran 0.74x the path it replaced,
+# while every shape at >= 4.0 CTA/CU won (1.27x-3.23x).
+_HP_MIN_CTAS_PER_CU = 2
+
+# Tile count at which the occupancy cost becomes worth guarding. Measured
+# waves/SIMD at D=64: 9 at one tile, 6 at two, then 4 and below. Shallow tiling
+# keeps enough waves resident to hide latency on its own, and Sq<=4 was measured
+# winning at batch 1 (1.45x vs B200), so the floor must not reject it.
+_HP_FLOOR_MIN_TILES = 3
 
 
-def _hp_decode_ok(num_heads: int, num_kv_heads: int, seqlen_q: int) -> bool:
-    """Does (ratio, Sq) fit the head-packed M-axis tiling?"""
+def _hp_decode_ok(
+    num_heads: int,
+    num_kv_heads: int,
+    seqlen_q: int,
+    head_dim: int,
+    num_batches: int,
+    max_kv_pages: int,
+    device,
+) -> bool:
+    """Should this shape use the head-packed decode kernel?
+
+    Two independent gates, both derived -- no tuned table:
+
+    1. **Register budget.** `ratio * Sq` pairs must fit in `MFMA_M` slots across
+       at most `max_m_tiles(head_dim)` tiles, the measured point before the
+       compiler spills.
+    2. **Parallelism floor.** The resulting CTA count must reach
+       `_HP_MIN_CTAS_PER_CU * CUs`. More tiles buy fewer KV passes but cost
+       occupancy, and that trade only pays when enough CTAs are resident.
+    """
+    from .decode.pa_decode_dense import auto_split_k_hp
+    from .decode.pa_decode_gfx950 import max_m_tiles
+
     if num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
         return False
     ratio = num_heads // num_kv_heads
     if not (1 <= ratio <= _HP_MFMA_M) or _HP_MFMA_M % ratio != 0:
         return False
     t_pack = _HP_MFMA_M // ratio  # query tokens per M-tile
-    return 1 <= seqlen_q <= t_pack * _HP_MAX_M_TILES
+    if not (1 <= seqlen_q <= t_pack * max_m_tiles(head_dim)):
+        return False
+
+    # Only deep tiling trades enough occupancy away to need the floor; shallow
+    # tiling still leaves 6+ waves/SIMD resident.
+    tiles = -(-seqlen_q // t_pack)
+    if tiles < _HP_FLOOR_MIN_TILES:
+        return True
+    num_cu = _dense_light_cu(device)
+    split_k = auto_split_k_hp(
+        num_batches, 1, num_heads, num_kv_heads, max_kv_pages * _PAGED_PAGE_SIZE
+    )
+    ctas = num_batches * num_kv_heads * split_k
+    return ctas >= _HP_MIN_CTAS_PER_CU * num_cu
 
 
 def _auto_paged_kv_splits(
@@ -524,8 +592,16 @@ def _auto_paged_kv_splits(
         return 1
     if head_dim not in (64, 128) or dtype_str not in ("bf16", "f16"):
         return 1
+    # Judge occupancy in waves: at splits<=1 the paged path runs the light kernel
+    # (_paged_light_ok), whose CTAs are 2 waves, so a workgroup count understates
+    # how empty the device is by 4x against the 8 waves/CU target.
     splits = _num_kv_splits_heuristic(
-        num_batches, num_heads, seqlen_q, head_dim, _dense_light_cu(device)
+        num_batches,
+        num_heads,
+        seqlen_q,
+        head_dim,
+        _dense_light_cu(device),
+        waves_per_cta=_LIGHT_WAVES_PER_CTA,
     )
     # Never split finer than the cache can feed: each split needs its own pages.
     splits = min(splits, max(1, max_kv_pages // _PAGED_MIN_PAGES_PER_SPLIT))
@@ -694,8 +770,10 @@ def _flydsl_flash_attn_paged(
         and D in (64, 128)
         and dtype_str in ("bf16", "f16")
         and page_size % _PAGED_DECODE_TILE_N == 0
-        and _hp_decode_ok(H, num_kv_heads, Sq)
         and _gpu_arch(q.device).startswith("gfx950")
+        and _hp_decode_ok(
+            H, num_kv_heads, Sq, D, B, max_kv_pages, q.device
+        )
     ):
         from .decode.pa_decode_dense import pa_decode_paged_launch
 

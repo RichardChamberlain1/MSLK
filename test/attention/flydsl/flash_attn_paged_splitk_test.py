@@ -215,12 +215,45 @@ def test_head_packed_selected_for_short_query_blocks(monkeypatch, Sq):
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("Sq", [5, 8, 16])
-def test_head_packed_declined_beyond_m_tile_budget(monkeypatch, Sq):
-    """Past the M-tile budget the dualwave path stays responsible."""
+@pytest.mark.parametrize("Sq", [8, 13, 16])
+def test_head_packed_selected_for_deep_tiling_at_d64(monkeypatch, Sq):
+    """D=64 is measured clean to 8 M-tiles, so Sq up to 16 is in range."""
     calls = _count_hp_calls(monkeypatch)
-    _run(*_paged_inputs(1, Sq, 32768, 64), 0)
+    _run(*_paged_inputs(8, Sq, 32768, 64), 0)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("Sq", [13, 15, 16])
+def test_head_packed_declined_when_d128_would_spill(monkeypatch, Sq):
+    """D=128 spills past 6 M-tiles (measured 280B at 7, 916B at 8).
+
+    Spilling a bandwidth-bound decode kernel is self-defeating, so these must
+    fall through to the existing path even though the tiling itself would work.
+    """
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(8, Sq, 32768, 128), 0)
     assert calls == []
+
+
+def test_head_packed_declined_when_too_few_ctas(monkeypatch):
+    """Deep tiling costs occupancy, so it needs enough CTAs to stay resident.
+
+    One CTA per CU measured 0.74x the path it replaced; the floor rejects it.
+    """
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(1, 16, 32000, 64), 0)  # 8 tiles, batch 1 -> ~1 CTA/CU
+    assert calls == []
+
+
+def test_head_packed_floor_does_not_reject_shallow_tiling(monkeypatch):
+    """The CTA floor applies to deep tiling only.
+
+    Sq=4 is two tiles and still holds 6 waves/SIMD; it was measured winning at
+    batch 1, so the floor must not take it away.
+    """
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(1, 4, 32000, 64), 0)
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("Sq,D", [(2, 64), (4, 64), (4, 128)])

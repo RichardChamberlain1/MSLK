@@ -63,10 +63,25 @@ N_SUBTILE = TILE_N // MFMA_N  # 2 QK sub-tiles per tile
 BLOCK = WARP_SIZE  # one warp per CTA
 
 # Query blocks longer than MFMA_M//ratio need several M-tiles, looped inside the
-# KV loop so one K/V stream feeds them all. Each tile costs 4+4+(D/16)*4 f32 of
-# loop-carried accumulator, so the count is capped rather than unbounded: 2 tiles
-# is 48 VGPRs at D=64 and 80 at D=128. Raising this needs a register-budget check.
-MAX_M_TILES = 2
+# KV loop so one K/V stream feeds them all. Each tile adds loop-carried
+# accumulator, so the count is bounded by where the compiler starts spilling.
+#
+# Measured on gfx950 (rocprofv3 --kernel-trace, VGPR_Count + Scratch_Size):
+#
+#   tiles     1    2    3    4    5    6      7      8
+#   D=64     52   76  104  132  140  168    188    212      all clean
+#   D=128    88  120  148  184  220  256   256*   256*      * spills (280B, 916B)
+#
+# So D=64 is clean to 8 tiles and D=128 to 6. Spilling a bandwidth-bound decode
+# kernel is self-defeating, and it showed up directly: every D=128 8-tile shape
+# benchmarked was slower than the path it replaced (0.48x-0.94x).
+MAX_M_TILES_BY_HEAD_DIM = {64: 8, 128: 6}
+MAX_M_TILES = max(MAX_M_TILES_BY_HEAD_DIM.values())
+
+
+def max_m_tiles(head_dim: int) -> int:
+    """Largest M-tile count that does not spill at this head dim."""
+    return MAX_M_TILES_BY_HEAD_DIM.get(head_dim, 2)
 
 _FX_DTYPE = {"f32": fx.Float32, "f16": fx.Float16, "bf16": fx.BFloat16}
 LOG2E: float = 1.4426950408889634
@@ -810,7 +825,7 @@ def pa_decode_gfx950_launch(
         and H_q % H_kv == 0
         and 1 <= ratio <= MFMA_M
         and MFMA_M % ratio == 0
-        and 1 <= Sq <= t_pack * MAX_M_TILES
+        and 1 <= Sq <= t_pack * max_m_tiles(D)
         # Sq>1 folds (qtok, head) in the split-K partials, which only matches the
         # [B, Sq, G, H_q, D] output layout when G == 1. It also applies a
         # bottom-right causal bound per query token, which is the paged caller's
