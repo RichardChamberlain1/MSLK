@@ -647,6 +647,7 @@ def _auto_paged_kv_splits(
     splits = min(splits, max(1, max_kv_pages // _PAGED_MIN_PAGES_PER_SPLIT))
     return max(1, splits)
 
+
 # Paged split-K sizing. `_num_kv_splits_heuristic` (CK's) stops as soon as the
 # workgroup count covers the CUs once, because it assumes a workgroup that has
 # started is a workgroup making progress. That does not hold for the paged light

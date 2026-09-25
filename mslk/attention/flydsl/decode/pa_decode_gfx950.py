@@ -83,6 +83,7 @@ def max_m_tiles(head_dim: int) -> int:
     """Largest M-tile count that does not spill at this head dim."""
     return MAX_M_TILES_BY_HEAD_DIM.get(head_dim, 2)
 
+
 _FX_DTYPE = {"f32": fx.Float32, "f16": fx.Float16, "bf16": fx.BFloat16}
 LOG2E: float = 1.4426950408889634
 
