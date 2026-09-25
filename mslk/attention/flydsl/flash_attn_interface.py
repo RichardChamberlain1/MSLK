@@ -976,49 +976,6 @@ def _flydsl_flash_attn_paged(
             )
         B, Sq, H, D = q.shape
 
-    # ── Head-packed decode eligibility (decided before anything rewrites q) ──
-    # Both this and the GQA packing below remove the GQA fan-out, so only one may
-    # run. This one is preferred wherever it applies because it is the only paged
-    # route that honours a *per-request* seqlen_k: the light/dualwave launch below
-    # passes the kernel a scalar `seq_len_kv` (the batch max) and no per-request
-    # tensor, so every request is masked to max_seqlen_kv. When max_seqlen_kv
-    # exceeds a request's own seqlen_k that request attends to stale cache, with
-    # error growing in the gap (measured 1.3e-2 at a 2048-token gap, against a
-    # 7.8e-3 bf16 epsilon). That defect predates this branch -- upstream main
-    # shows the same values -- but routing away from this path would re-expose it.
-    #
-    # Decided here rather than at the launch site because the packing rebinds H
-    # and Sq, and this gate must see the caller's real GQA ratio and query length.
-    _hp_groups = 0
-    if (
-        not _DISABLE_PAGED_DECODE_HP
-        and not varlen
-        and kv_seqstart is None
-        and not return_lse
-        and kv_cache_layout == "linear"
-        and k.dim() == 4
-        and D in (64, 128)
-        and dtype_str in ("bf16", "f16")
-        and num_kv_heads is not None
-        and int(k.shape[1]) % _PAGED_DECODE_TILE_N == 0
-        and _gpu_arch(q.device).startswith("gfx950")
-    ):
-        _hp_page = int(k.shape[1])
-        _hp_skv = (
-            int(max_seqlen_kv)
-            if max_seqlen_kv is not None
-            else int(seqlen_k.max().item())
-        )
-        _hp_groups = _hp_decode_ok(
-            H,
-            num_kv_heads,
-            Sq,
-            D,
-            B,
-            (_hp_skv + _hp_page - 1) // _hp_page,
-            q.device,
-        )
-
     # ── GQA head packing ────────────────────────────────────────────────────
     # The grid is one workgroup per (request, QUERY head), so the group_size
     # query heads sharing a KV head each stream that head's entire KV range
@@ -1038,9 +995,23 @@ def _flydsl_flash_attn_paged(
     _gqa_heads = H
     _gqa_varlen = varlen
     _gqa_user_out = None
+    # Constraint on the caller: `max_seqlen_kv` must equal the per-request
+    # `seqlen_k`. This path reaches the light/dualwave paged launch, which hands
+    # the kernel a scalar `seq_len_kv` -- the batch maximum -- and never the
+    # per-request tensor, so a request shorter than that maximum attends to
+    # stale cache. Error grows with the gap and passes bf16 epsilon well before
+    # the gap reaches a page; see the xfail guard
+    # `test_per_request_seqlen_k_is_honoured`.
+    #
+    # The head-packed decode route below forwards `seqlen_k` as `seq_positions`
+    # and is correct for ragged batches, but is materially slower on the shapes
+    # packing takes (268-case grid geomean 1.23x -> 1.83x vs B200), so packing
+    # keeps precedence. The defect is upstream, not introduced by this routing.
+    # Fixing it properly wants the launch to forward the tensor; short of that,
+    # a `seqlen_k_uniform` opt-in would let ragged callers take the slower,
+    # correct route without a device-to-host sync (illegal under graph capture).
     if (
         _PAGED_GQA_PACK
-        and _hp_groups == 0  # head-packed route takes it; see above
         and not return_lse
         and kv_seqstart is None
         and 1 <= Sq <= 64
@@ -1240,6 +1211,26 @@ def _flydsl_flash_attn_paged(
     # `causal` is deliberately not a condition: the decode kernel applies the
     # bottom-right causal bound per query token itself (query i attends to
     # [0, seqlen_kv - Sq + i + 1)), which degenerates to the full range at Sq=1.
+    _hp_groups = 0
+    if (
+        not _DISABLE_PAGED_DECODE_HP
+        # The GQA head-packing above removes the same fan-out this kernel was
+        # routed here to avoid, and covers Sq up to 64 rather than the M-tile
+        # budget's 4-16. When it fires it has already reshaped q, so this path
+        # must not also run. It stays as the route for shapes that packing
+        # declines (FLYDSL_PAGED_GQA_PACK=0, Sq>64, non-causal multi-token, MHA).
+        and not _gqa_packed
+        and not varlen
+        and kv_seqstart is None
+        and not return_lse
+        and not vectorized
+        and D in (64, 128)
+        and dtype_str in ("bf16", "f16")
+        and page_size % _PAGED_DECODE_TILE_N == 0
+        and _gpu_arch(q.device).startswith("gfx950")
+    ):
+        # 0 declines; otherwise the number of query groups to cover Sq with.
+        _hp_groups = _hp_decode_ok(H, num_kv_heads, Sq, D, B, max_kv_pages, q.device)
     if _hp_groups:
         from .decode.pa_decode_dense import pa_decode_paged_launch
 
