@@ -51,6 +51,7 @@ from .flash_attn_utils import (
     DualwaveQLoader,
     DualwaveSoftmaxHelper,
     DualwaveSplitKCombineContext,
+    scf_if_dispatch,
     DualwaveSplitKCombineHelper,
     DualwaveStoreHelper,
 )
@@ -774,7 +775,9 @@ def build_flash_attn_dualwave_swp_module(
     # Combine kernel computes weighted split-K O, with one wave row covering four cols per lane.
     COMBINE_BLOCK = 256
     COMBINE_LANES_PER_ROW = traits.HEAD_DIM // 4
-    COMBINE_ROWS_PER_BLOCK = COMBINE_BLOCK // COMBINE_LANES_PER_ROW
+    # One row per wave; the spare lanes divide the split dimension (see
+    # DualwaveSplitKCombineContext.init_thread_mapping).
+    COMBINE_ROWS_PER_BLOCK = max(1, COMBINE_BLOCK // 64)
 
     @flyc.kernel(known_block_size=[COMBINE_BLOCK, 1, 1])
     def flash_attn_splitk_combine_kernel(
@@ -795,13 +798,18 @@ def build_flash_attn_dualwave_swp_module(
         ctx.init_descriptors()
 
         combine = DualwaveSplitKCombineHelper(ctx)
-        m_s, l_s = combine.load_ml_rows()
-        m_max = combine.reduce_m_max(m_s)
-        acc, den = combine.accumulate_splits(m_s, l_s, m_max)
+        m_max = combine.reduce_m_max()
+        acc, den = combine.accumulate_splits(m_max)
+        m_max, den, acc = combine.merge_split_groups(m_max, den, acc)
         o_pack = combine.pack_output(acc, den)
-        combine.store_output(o_pack)
-        if const_expr(traits.RETURN_LSE):
-            combine.store_lse(m_max, den)
+
+        # Every split group holds the merged result; one of them stores it.
+        def _store():
+            combine.store_output(o_pack)
+            if const_expr(traits.RETURN_LSE):
+                combine.store_lse(m_max, den)
+
+        scf_if_dispatch(ctx.sgrp == fx.Index(0), _store)
 
     @flyc.jit
     def launch_flash_attn_dualwave_swp(
