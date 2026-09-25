@@ -199,14 +199,8 @@ def _count_hp_calls(monkeypatch):
     return calls
 
 
-def test_gqa_packing_takes_precedence(monkeypatch):
-    """With both available, GQA packing owns the shape and the decode kernel idles.
-
-    Packing folds query heads into M inside the generic paged kernel, so it
-    fixes the same fan-out with a far wider reach. Measured over the 268-case
-    paged grid it is equal at Sq=1, within noise at Sq=4, and 2.8x better across
-    the Sq=7..16 family, so it must win wherever it applies.
-    """
+def _spy_hp(monkeypatch):
+    """Record head-packed launches without disabling GQA packing."""
     from mslk.attention.flydsl.decode import pa_decode_dense
 
     calls = []
@@ -217,8 +211,59 @@ def test_gqa_packing_takes_precedence(monkeypatch):
         return real(*a, **kw)
 
     monkeypatch.setattr(pa_decode_dense, "pa_decode_paged_launch", _spy)
+    return calls
+
+
+def test_head_packed_takes_precedence_over_gqa_packing(monkeypatch):
+    """Both remove the GQA fan-out, so only one may run -- this one wins.
+
+    It is the only paged route that honours a per-request ``seqlen_k``. The
+    light/dualwave launch hands the kernel a scalar ``seq_len_kv`` (the batch
+    max) and no per-request tensor, so a request shorter than the batch max
+    attends to stale cache. Preferring this path is what keeps that correct;
+    see test_per_request_seqlen_k_is_honoured.
+    """
+    calls = _spy_hp(monkeypatch)
     _run(*_paged_inputs(1, 1, 32768, 64), 0)
+    assert len(calls) == 1
+
+
+def test_gqa_packing_owns_what_head_packing_declines(monkeypatch):
+    """Past the M-tile budget the head-packed route declines and packing runs.
+
+    Sq=13 at D=128 needs 7 tiles, one past the measured no-spill limit of 6, and
+    13 is odd so two-pass query grouping cannot divide it either. Sq=16 would
+    *not* work as a case here: grouping rescues it as two 4-tile passes.
+    """
+    calls = _spy_hp(monkeypatch)
+    _run(*_paged_inputs(8, 13, 32768, 128), 0)
     assert calls == []
+
+
+def test_per_request_seqlen_k_is_honoured():
+    """A request shorter than ``max_seqlen_kv`` must not attend to stale cache.
+
+    Regression guard for the routing above. With `seqlen_k` below
+    `max_seqlen_kv` the generic paged path masks every request to the batch
+    max; the error grows with the gap and passes bf16 epsilon well before the
+    gap reaches a page. Upstream main shows the same, so this pins the routing
+    that avoids it rather than a fix to that kernel.
+    """
+    ctx, short = 32768, 30001
+    q, k, v, block_table, _ = _paged_inputs(4, 4, ctx, 64)
+    seqlen_k = torch.full((4,), short, device="cuda", dtype=torch.int32)
+    exact = flydsl_flash_attn_func(
+        q, k, v, causal=True, num_kv_heads=HKV, block_table=block_table,
+        seqlen_k=seqlen_k, kv_cache_layout="linear", num_kv_splits=0,
+        max_seqlen_kv=short,
+    )
+    padded = flydsl_flash_attn_func(
+        q, k, v, causal=True, num_kv_heads=HKV, block_table=block_table,
+        seqlen_k=seqlen_k, kv_cache_layout="linear", num_kv_splits=0,
+        max_seqlen_kv=ctx,
+    )
+    # Same request lengths, so the declared batch max must not change the answer.
+    torch.testing.assert_close(padded, exact, atol=2e-2, rtol=2e-2)
 
 
 def calls_groups(calls):
