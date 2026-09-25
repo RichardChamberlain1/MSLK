@@ -20,7 +20,8 @@ Two entry points exist and they are **not** interchangeable:
     The hand-written assembly kernel (``pa_bf16_noquant_gqa8_1tg_4w``). The name
     says it: one thread group, four waves, and **no KV splitting**. It is built
     for concurrency, and at ``requests=1`` it leaves the GPU idle -- measured
-    182 us vs 35 us for ``forward_decode`` on ctx=32000/d=128, a 5.1x gap. It
+    182 us vs 35 us for ``forward_decode`` on a long-context decode shape, a
+    5.1x gap. It
     also refuses ``head_dim=64`` (segfault) and ``q_len>4`` (NaN), neither of
     which constrains ``forward_decode``.
 

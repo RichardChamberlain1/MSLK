@@ -193,8 +193,8 @@ def pa_decode_paged_launch(
     instead of one deep one. Each M-tile adds loop-carried accumulator, so depth
     costs occupancy (measured 9 waves/SIMD at one tile down to 2 at eight) and at
     D=128 spills past 6 tiles. Splitting into G passes uses ``Sq/G`` tokens each
-    -- ``G`` times the KV traffic, but shallower tiles. Measured at D=128/Sq=16:
-    1.5x-2.0x for G=2. See `query_group_seqlen` for why this is exact.
+    -- ``G`` times the KV traffic, but shallower tiles. Measured 1.5x-2.0x for
+    G=2 where a single pass would spill. See `query_group_seqlen` for why this is exact.
 
     Raises ValueError for configurations the kernel cannot serve (GQA ratio > 16,
     D % 32, page_size % 32, non-gfx950) -- there is no generic paged fallback, so

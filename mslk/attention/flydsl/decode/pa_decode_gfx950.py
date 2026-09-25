@@ -73,8 +73,8 @@ BLOCK = WARP_SIZE  # one warp per CTA
 #   D=128    88  120  148  184  220  256   256*   256*      * spills (280B, 916B)
 #
 # So D=64 is clean to 8 tiles and D=128 to 6. Spilling a bandwidth-bound decode
-# kernel is self-defeating, and it showed up directly: every D=128 8-tile shape
-# benchmarked was slower than the path it replaced (0.48x-0.94x).
+# kernel is self-defeating, and it showed up directly: every spilling shape
+# measured was slower than the path it replaced (0.48x-0.94x).
 MAX_M_TILES_BY_HEAD_DIM = {64: 8, 128: 6}
 MAX_M_TILES = max(MAX_M_TILES_BY_HEAD_DIM.values())
 
