@@ -128,7 +128,21 @@ def _compile_reduce(
             c_mp = arith.constant(_MAX_PARTS, type=T.i32)
             active = lane < c_mp
 
-            pm_off = pm_base + lane * s_pm_part
+            # Clamp the address the same way the slow path does. The load is
+            # issued by all WARP_SIZE lanes and only masked afterwards, so with
+            # _MAX_PARTS < WARP_SIZE the inactive lanes address up to
+            # (WARP_SIZE - _MAX_PARTS) * s_pm_part past the end of pm/ps. Those
+            # resources are max_size=True, so nothing bounds-checks them and the
+            # read walks raw memory -- it faults only when the overrun happens to
+            # clear the allocator's slab, which is why it showed up on some
+            # shapes and not others. Re-reading the last valid partition costs
+            # nothing; `active` still discards the value.
+            lane_ld = arith.select(
+                arith.unwrap(active),
+                arith.unwrap(lane),
+                arith.constant(_MAX_PARTS - 1, type=T.i32),
+            )
+            pm_off = pm_base + fx.Int32(lane_ld) * s_pm_part
             p_max_r = buffer_ops.buffer_load(pm_rsrc, pm_off, vec_width=1, dtype=T.f32)
             p_sum_r = buffer_ops.buffer_load(ps_rsrc, pm_off, vec_width=1, dtype=T.f32)
             part_max = arith.select(active, p_max_r, c_neginf)
