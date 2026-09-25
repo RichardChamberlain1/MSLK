@@ -48,6 +48,7 @@ from .flash_attn_utils import (
     GenericSoftmaxHelper,
     GenericStoreHelper,
     scf_if_dispatch,
+    wait_lds_copies,
 )
 
 
@@ -79,6 +80,7 @@ def build_flash_attn_func_module_primary(
     has_dropout=False,
     gappy_kv=False,
     num_kv_splits=1,
+    q_pack_qlen=0,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
@@ -260,6 +262,7 @@ def build_flash_attn_func_module_primary(
         has_dropout=has_dropout,
         gappy_kv=gappy_kv,
         num_kv_splits=num_kv_splits,
+        q_pack_qlen=q_pack_qlen,
     )
     _flash_attn_generic_cache_tag = traits.cache_tag
 
@@ -427,7 +430,7 @@ def build_flash_attn_func_module_primary(
                     else:
                         kv_gmem_to_lds.coop_load_k(pre_k_start, pre_k_slot)
                 if const_expr(traits.ENABLE_DMA):
-                    rocdl.s_waitcnt(0)
+                    wait_lds_copies(0)
                 else:
                     rocdl.sched_group_barrier(rocdl.mask_vmem_rd, 1, 0)
                 gpu.barrier()
@@ -445,7 +448,7 @@ def build_flash_attn_func_module_primary(
                         _k_buf_id = _cur_buf_id
                     else:
                         _k_buf_id = fx.Index(1) - _cur_buf_id
-                    rocdl.s_waitcnt(0)
+                    wait_lds_copies(0)
                     gpu.barrier()
                     _next_k_buf_id = fx.Index(1) - _k_buf_id
                     if const_expr(kv_sub + 1 < traits.N_SUBTILES):
@@ -603,12 +606,12 @@ def build_flash_attn_func_module_primary(
                     gpu.barrier()
                 elif const_expr(traits.ENABLE_DMA):
                     v_base = kv_gmem_to_lds.v_buf_base(0)
-                    rocdl.s_waitcnt(0)
+                    wait_lds_copies(0)
                     gpu.barrier()
                 elif const_expr(traits.KV_VECTORIZED and traits.V_NOMAJOR_DMA):
                     v_slot = 0
                     v_base = kv_gmem_to_lds.v_buf_base(v_slot)
-                    rocdl.s_waitcnt(0)
+                    wait_lds_copies(0)
                     gpu.barrier()
                 else:
                     v_slot = 0
@@ -673,7 +676,11 @@ def build_flash_attn_func_module_primary(
     # Split-K combine: merge per-split partials into final O + LSE. The generic O
     # register/pack layout matches the dualwave path, so the shared combine kernel
     # reads the workspace verbatim (one wave row covers four O columns per lane).
-    COMBINE_BLOCK = 256
+    # Threads per combine block. The grid is ceil(rows / (COMBINE_BLOCK/lanes)),
+    # and a block is the unit of CU assignment -- at 256 threads a low-concurrency
+    # decode (32 output rows, D=64) lands on 2 CUs and the combine costs more than
+    # the attention kernel itself. Smaller blocks spread the same waves wider.
+    COMBINE_BLOCK = int(os.getenv("FLYDSL_COMBINE_BLOCK", "64"))
     COMBINE_LANES_PER_ROW = traits.HEAD_DIM // 4
     COMBINE_ROWS_PER_BLOCK = COMBINE_BLOCK // COMBINE_LANES_PER_ROW
 
