@@ -81,6 +81,8 @@ def build_flash_attn_func_module_primary(
     gappy_kv=False,
     num_kv_splits=1,
     q_pack_qlen=0,
+    q_pack_group=0,
+    kv_lens=False,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
@@ -263,6 +265,8 @@ def build_flash_attn_func_module_primary(
         gappy_kv=gappy_kv,
         num_kv_splits=num_kv_splits,
         q_pack_qlen=q_pack_qlen,
+        q_pack_group=q_pack_group,
+        kv_lens=kv_lens,
     )
     _flash_attn_generic_cache_tag = traits.cache_tag
 
@@ -680,9 +684,11 @@ def build_flash_attn_func_module_primary(
     # and a block is the unit of CU assignment -- at 256 threads a low-concurrency
     # decode (32 output rows, D=64) lands on 2 CUs and the combine costs more than
     # the attention kernel itself. Smaller blocks spread the same waves wider.
-    COMBINE_BLOCK = int(os.getenv("FLYDSL_COMBINE_BLOCK", "64"))
+    COMBINE_BLOCK = int(os.getenv("FLYDSL_COMBINE_BLOCK", "256"))
     COMBINE_LANES_PER_ROW = traits.HEAD_DIM // 4
-    COMBINE_ROWS_PER_BLOCK = COMBINE_BLOCK // COMBINE_LANES_PER_ROW
+    # A row owns a whole wave: HEAD_DIM/4 lanes carry the head dim and the
+    # remaining 64/(HEAD_DIM/4) lanes divide the split dimension between them.
+    COMBINE_ROWS_PER_BLOCK = max(1, COMBINE_BLOCK // 64)
 
     @flyc.kernel(known_block_size=[COMBINE_BLOCK, 1, 1])
     def flash_attn_generic_combine_kernel(
@@ -718,17 +724,21 @@ def build_flash_attn_func_module_primary(
         c_ctx.init_descriptors()
 
         combine = DualwaveSplitKCombineHelper(c_ctx)
-        m_s, l_s = combine.load_ml_rows()
-        m_max = combine.reduce_m_max(m_s)
-        acc, den = combine.accumulate_splits(m_s, l_s, m_max)
+        # Each split group reduces its own share against its own max, then the
+        # groups are merged across the wave.
+        m_max = combine.reduce_m_max()
+        acc, den = combine.accumulate_splits(m_max)
+        m_max, den, acc = combine.merge_split_groups(m_max, den, acc)
         o_pack = combine.pack_output(acc, den)
+        # Every group ends up with the merged result; one of them stores it.
+        _owns_store = c_ctx.row_in_bounds & (c_ctx.sgrp == fx.Index(0))
 
         def _store_in_bounds():
             combine.store_output(o_pack)
             if const_expr(traits.RETURN_LSE):
                 combine.store_lse(m_max, den)
 
-        scf_if_dispatch(c_ctx.row_in_bounds, _store_in_bounds)
+        scf_if_dispatch(_owns_store, _store_in_bounds)
 
     @flyc.jit
     def launch_flash_attn_generic(

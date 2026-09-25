@@ -221,12 +221,6 @@ def test_gqa_packing_takes_precedence(monkeypatch):
     assert calls == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="known-unfixed: the light/dualwave paged launch masks every request "
-    "to max_seqlen_kv. Present in upstream main (d204cd8) too, not introduced "
-    "here. Kept executable so it reports if the kernel is ever fixed.",
-)
 def test_per_request_seqlen_k_is_honoured():
     """A request shorter than ``max_seqlen_kv`` must not attend to stale cache.
 
@@ -247,12 +241,15 @@ def test_per_request_seqlen_k_is_honoured():
     Tolerance is bf16 epsilon (7.81e-03): it clears split-K's reordering noise
     (~2e-04) by a wide margin while still rejecting the two wrong answers.
 
-    Routing to the head-packed decode kernel avoids this -- it forwards
-    ``seqlen_k`` as ``seq_positions`` -- but that costs more throughput than it
-    is worth here (268-case grid geomean 1.23x -> 1.83x vs B200), so the faster
-    route is taken knowingly. A caller that knows its batch is uniform could
-    have both; that needs an explicit opt-in, since deciding it here would
-    require a device-to-host sync and is illegal under CUDA-graph capture.
+    Fixed by forwarding the cumulative lengths to the paged launch and reading
+    them in the kernel under the KV_LENS trait, so the light route is correct
+    for ragged batches and no longer has to trade throughput for it by routing
+    to the head-packed decode kernel. The scan is a device op, so this needs no
+    device-to-host sync and stays legal under CUDA-graph capture. Measured cost
+    over the 268-case grid: geomean 1.0002x, i.e. none.
+
+    This was xfail(strict) while unfixed; the marker is gone because the
+    behaviour it guarded now holds.
     """
     ctx, short, B = 32000, 30001, 8
     q, k, v, block_table, _ = _paged_inputs(B, 13, ctx, 64)
