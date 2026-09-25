@@ -1063,15 +1063,18 @@ def _flydsl_flash_attn_paged(
         # more than Triton spends on its entire reduce. CUTLASS's Blackwell gen
         # kernel does the same thing, folding the GQA group into the M mode and
         # pointing M's stride at Q's head stride (sm100_fmha_gen_kernel, 214-221).
-        # Longer query blocks still need the copy: a row encodes (group, token)
-        # there and is not affine in a single stride.
+        # Longer query blocks work too: a row encodes (group, token), which is
+        # two terms rather than one stride, but both divisors are compile-time
+        # constants -- see _qo_row_offset. The outer gate already requires
+        # `causal` whenever Sq > 1, so Q_PACK_QLEN is set and the row decode is
+        # well defined.
         #
         # Varlen is fine here too: the outer guard already requires uniform
         # q_seqlens, so at q_len == 1 the packed [total_q, H_q, D] buffer has the
         # same bytes in the same order as the dense one. The kernel derives the
         # batch offset from batch_idx under Q_PACK_GROUP rather than from
         # cu_seqlens, which counts packed rows and would be short by NUM_HEADS_Q.
-        _gqa_stride_packed = Sq == 1 and _PAGED_GQA_STRIDE
+        _gqa_stride_packed = _PAGED_GQA_STRIDE
         # [.., q_len, Hkv, group, D] -> [.., group, q_len, Hkv, D]; the flat M
         # index is h * q_len + t, matching Q_PACK_QLEN's row % q_len.
         if not _gqa_stride_packed:

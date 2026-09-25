@@ -38,6 +38,8 @@ from .flash_attn_utils import (
     _make_flash_attn_generic_traits,
     _waitcnt_vm_n,
     wait_lds_copies,
+    combine_lanes_per_row,
+    combine_rows_per_block,
     DualwaveSplitKCombineContext,
     DualwaveSplitKCombineHelper,
     GenericFlashAttnContext,
@@ -685,10 +687,10 @@ def build_flash_attn_func_module_primary(
     # decode (32 output rows, D=64) lands on 2 CUs and the combine costs more than
     # the attention kernel itself. Smaller blocks spread the same waves wider.
     COMBINE_BLOCK = int(os.getenv("FLYDSL_COMBINE_BLOCK", "256"))
-    COMBINE_LANES_PER_ROW = traits.HEAD_DIM // 4
+    COMBINE_LANES_PER_ROW = combine_lanes_per_row(traits.HEAD_DIM)
     # A row owns a whole wave: HEAD_DIM/4 lanes carry the head dim and the
     # remaining 64/(HEAD_DIM/4) lanes divide the split dimension between them.
-    COMBINE_ROWS_PER_BLOCK = max(1, COMBINE_BLOCK // 64)
+    COMBINE_ROWS_PER_BLOCK = combine_rows_per_block(traits.HEAD_DIM, COMBINE_BLOCK)
 
     @flyc.kernel(known_block_size=[COMBINE_BLOCK, 1, 1])
     def flash_attn_generic_combine_kernel(

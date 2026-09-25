@@ -923,6 +923,51 @@ def _q_pack_col(traits, ks, lane_div_32):
     return ks * traits.K_STEP_QK + lane_div_32 * traits.MFMA_LANE_K
 
 
+def _is_pow2(n):
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def combine_chunk(head_dim):
+    """Head-dim values each lane owns in the split-K combine.
+
+    Four normally; eight when that yields at most 16 lanes per row, so a 64-lane
+    wave still holds four split groups. Groups are what make the combine cheap
+    -- its cost is the per-lane walk over splits -- and at HEAD_DIM 128 the
+    4-wide slice needs 32 lanes and leaves only two, which is why that head dim
+    saw the combine blow up an octave earlier than HEAD_DIM 64 (30.9 us at 192
+    splits against 6.7 us).
+
+    Always a multiple of four: the loads and stores move four values at a time.
+    """
+    if head_dim % 8 == 0 and head_dim // 8 <= 16 and _is_pow2(head_dim // 8):
+        return 8
+    return 4
+
+
+def combine_lanes_per_row(head_dim):
+    """Lanes covering one row's head dim."""
+    return head_dim // combine_chunk(head_dim)
+
+
+def combine_split_groups(head_dim):
+    """Split groups sharing a row's wave, or 1 when the head dim cannot.
+
+    Grouping needs the lanes-per-row to be a power of two dividing the wave, so
+    that groups are contiguous lane ranges and the merge is an XOR butterfly.
+    Head dims like 96 give 24 lanes and get the ungrouped layout instead --
+    correct, just without the split-dimension parallelism.
+    """
+    lanes = combine_lanes_per_row(head_dim)
+    return 64 // lanes if (_is_pow2(lanes) and lanes <= 64) else 1
+
+
+def combine_rows_per_block(head_dim, block_threads):
+    """Output rows a combine block covers."""
+    if combine_split_groups(head_dim) > 1:
+        return max(1, block_threads // 64)  # a row owns a whole wave
+    return max(1, block_threads // combine_lanes_per_row(head_dim))
+
+
 def _q_pack_group(traits):
     """``Q_PACK_GROUP`` if this traits type has it, else 0 (not stride-packed).
 
@@ -945,20 +990,32 @@ def _qo_head_stride(traits):
     return traits.HEAD_DIM
 
 
-def _qo_row_stride(traits, stride_token_q):
-    """Element distance between two M rows in the caller's Q/O buffer.
+def _qo_row_offset(traits, token_idx, stride_token_q):
+    """Element offset of M row ``token_idx`` in the caller's Q/O buffer.
 
-    Packed-by-stride an M row is one group member, which sits HEAD_DIM away.
-    Unpacked it is a whole query token, i.e. every head.
+    Unpacked, a row is a whole query token: one stride.
 
-    The per-batch span is unchanged either way: rows * stride_token_q is
-    Q_PACK_GROUP * NUM_HEADS_Q * HEAD_DIM, which is exactly the query heads one
-    batch item holds. Only the split of that span between the row and head axes
-    differs, so nothing outside these two strides needs to know.
+    Packed-by-stride it is a (group member, token) pair laid out head-major as
+    ``row = g * Q_PACK_QLEN + t``, and the two move along different axes of the
+    caller's [.., q_len, H_q, D] buffer -- g by HEAD_DIM, t by every query head.
+    That is not affine in the row index, so it takes two terms; both divisors
+    are compile-time constants, and Q_PACK_QLEN is a power of two on the shapes
+    that reach here, so the divide and modulo fold into shifts.
+
+    The per-batch span is unchanged either way: rows * stride_token_q ==
+    Q_PACK_QLEN * NUM_HEADS_Q * Q_PACK_GROUP * HEAD_DIM, exactly the query heads
+    one batch item holds. Only how that span splits across the row and head axes
+    differs, so nothing outside these offsets needs to know.
     """
-    if _q_pack_group(traits) > 0:
-        return traits.HEAD_DIM
-    return stride_token_q
+    group = _q_pack_group(traits)
+    if group <= 0:
+        return token_idx * stride_token_q
+    qlen = max(getattr(traits, "Q_PACK_QLEN", 0), 1)
+    if qlen == 1:  # degenerate: the row *is* the group member
+        return token_idx * fx.Index(traits.HEAD_DIM)
+    return (token_idx // fx.Index(qlen)) * fx.Index(traits.HEAD_DIM) + (
+        token_idx % fx.Index(qlen)
+    ) * fx.Index(group * stride_token_q)
 
 
 def _q_pack_global_idx(traits, q_row_in_block, ks, lane_div_32, stride_q_n_v):
@@ -2646,7 +2703,7 @@ class GenericFlashAttnContext:
     def global_idx_q(self, token_idx, col):
         traits = self.traits
         return (
-            token_idx * _qo_row_stride(traits, traits.STRIDE_TOKEN_Q)
+            _qo_row_offset(traits, token_idx, traits.STRIDE_TOKEN_Q)
             + self.q_head_idx * _qo_head_stride(traits)
             + col
         )
@@ -6351,7 +6408,9 @@ class DualwaveSplitKCombineContext:
         self.elem_dtype = dtype_to_elem_type(self.traits.DTYPE_STR)
         self.fm_fast = fx.arith.FastMathFlags.fast
         self.c_zero_f = fx.Float32(0.0)
-        self.c_zero_v4f32 = Vec.filled(4, 0.0, fx.Float32)
+        self.c_zero_v4f32 = Vec.filled(
+            combine_chunk(self.traits.HEAD_DIM), 0.0, fx.Float32
+        )
 
     def init_runtime_indices(self):
         self.seq_len_v = fx.Index(self.seq_len)
@@ -6374,9 +6433,19 @@ class DualwaveSplitKCombineContext:
         self.tid = fx.Index(gpu.thread_idx.x)
         self.blk = fx.Index(gpu.block_idx.x)
         self.lane = self.tid % fx.Index(64)
-        self.sgrp = self.lane // fx.Index(combine_lanes_per_row)
-        self.row = self.blk * combine_rows_per_block + self.tid // fx.Index(64)
-        self.col = (self.lane % fx.Index(combine_lanes_per_row)) * 4
+        if combine_split_groups(traits.HEAD_DIM) > 1:
+            self.sgrp = self.lane // fx.Index(combine_lanes_per_row)
+            self.row = self.blk * combine_rows_per_block + self.tid // fx.Index(64)
+        else:
+            # No split parallelism available for this head dim; every lane walks
+            # all splits, as before, and rows pack by lanes_per_row.
+            self.sgrp = fx.Index(0)
+            self.row = self.blk * combine_rows_per_block + self.tid // fx.Index(
+                combine_lanes_per_row
+            )
+        self.col = (self.tid % fx.Index(combine_lanes_per_row)) * fx.Index(
+            combine_chunk(traits.HEAD_DIM)
+        )
         heads_per_batch = self.seq_len_v * traits.NUM_HEADS_Q
         self.batch_idx = self.row // heads_per_batch
         rem = self.row % heads_per_batch
@@ -6544,11 +6613,11 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         o2_raw = buffer_ops.buffer_load(
             self.opart_rsrc_all,
             as_mlir_value(fx.Int32(self.opart_index(self.split_z(fx.Index(safe_i))))),
-            vec_width=2,
+            vec_width=self.chunk() // 2,
             dtype=T.i32,
         )
         return (
-            Vec(ir.Value(o2_raw), (2,), fx.Int32)
+            Vec(ir.Value(o2_raw), (self.chunk() // 2,), fx.Int32)
             .bitcast(self.elem_dtype)
             .to(fx.Float32)
         )
@@ -6564,15 +6633,20 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         w = rocdl.exp2(T.f32, as_mlir_value(_fsub(m_i, m_max, self.fm_fast)))
         wl = live.select(fx.Float32(_fmul(w, l_i, self.fm_fast)), self.c_zero_f)
         den = _fadd(den, wl, self.fm_fast)
-        zero4 = Vec.from_elements([self.c_zero_f], fx.Float32).broadcast_to(4)
-        o4 = Vec(live.select(o4, zero4), (4,), fx.Float32)
-        w4 = Vec.from_elements([fx.Float32(wl)], fx.Float32).broadcast_to(4)
+        n = self.chunk()
+        zero4 = Vec.from_elements([self.c_zero_f], fx.Float32).broadcast_to(n)
+        o4 = Vec(live.select(o4, zero4), (n,), fx.Float32)
+        w4 = Vec.from_elements([fx.Float32(wl)], fx.Float32).broadcast_to(n)
         acc = _fadd(acc, _fmul(w4, o4, self.fm_fast), self.fm_fast)
         return acc, den
 
+    def chunk(self):
+        """Head-dim values this lane owns."""
+        return combine_chunk(self.traits.HEAD_DIM)
+
     def split_groups(self):
-        """Number of split groups sharing one row's wave."""
-        return 64 // (self.traits.HEAD_DIM // 4)
+        """Number of split groups sharing one row's wave (1 = ungrouped)."""
+        return combine_split_groups(self.traits.HEAD_DIM)
 
     def local_split_indices(self):
         """This lane's share of the split dimension, as (base, count).
@@ -6603,7 +6677,12 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         a log-sum-exp combine rather than a plain sum. After the last step every
         lane in the group holds the full result; only group 0 stores.
         """
-        stride = self.traits.HEAD_DIM // 4
+        # Partners are the lanes holding the same head-dim slice in the next
+        # split group, i.e. lanes_per_row apart -- not HEAD_DIM // 4, which only
+        # coincides with it while the lane slice is 4 values wide.
+        if self.split_groups() <= 1:
+            return m_max, den, acc
+        stride = combine_lanes_per_row(self.traits.HEAD_DIM)
         while stride < 64:
             m_p = self._shuffle_f32(m_max, stride)
             m_new = _fmax(m_max, m_p, self.fm_fast)
@@ -6618,12 +6697,16 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
             acc_p = Vec.from_elements(
                 [
                     fx.Float32(self._shuffle_f32(acc[j], stride))
-                    for j in range_constexpr(4)
+                    for j in range_constexpr(self.chunk())
                 ],
                 fx.Float32,
             )
-            w4 = Vec.from_elements([fx.Float32(w)], fx.Float32).broadcast_to(4)
-            wp4 = Vec.from_elements([fx.Float32(w_p)], fx.Float32).broadcast_to(4)
+            w4 = Vec.from_elements([fx.Float32(w)], fx.Float32).broadcast_to(
+                self.chunk()
+            )
+            wp4 = Vec.from_elements([fx.Float32(w_p)], fx.Float32).broadcast_to(
+                self.chunk()
+            )
             acc = _fadd(
                 _fmul(acc, w4, self.fm_fast),
                 _fmul(acc_p, wp4, self.fm_fast),
@@ -6656,36 +6739,39 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
     def pack_output(self, acc, den):
         inv_rcp = rocdl.rcp(T.f32, den)
         inv = (fx.Float32(den) > self.c_zero_f).select(inv_rcp, self.c_zero_f)
-        inv4 = Vec.from_elements([fx.Float32(inv)], fx.Float32).broadcast_to(4)
-        out4 = Vec(_fmul(acc, inv4, self.fm_fast), (4,), fx.Float32)
+        n = self.chunk()
+        inv4 = Vec.from_elements([fx.Float32(inv)], fx.Float32).broadcast_to(n)
+        out4 = Vec(_fmul(acc, inv4, self.fm_fast), (n,), fx.Float32)
         if const_expr(self.traits.DTYPE_STR == "bf16"):
-            lo = rocdl.cvt_pk_bf16_f32(out4[0], out4[1])
-            hi = rocdl.cvt_pk_bf16_f32(out4[2], out4[3])
+            words = [
+                fx.Int32(rocdl.cvt_pk_bf16_f32(out4[2 * i], out4[2 * i + 1]))
+                for i in range_constexpr(n // 2)
+            ]
         else:
-            o_f16 = []
-            for i in range_constexpr(4):
-                o_f16.append(fx.Float32(out4[i]).to(self.elem_dtype))
+            o_f16 = [
+                fx.Float32(out4[i]).to(self.elem_dtype) for i in range_constexpr(n)
+            ]
             pack = Vec.from_elements(o_f16, self.elem_dtype).bitcast(fx.Int32)
-            lo, hi = as_mlir_value(pack[0]), as_mlir_value(pack[1])
-        return Vec.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32)
+            words = [fx.Int32(as_mlir_value(pack[i])) for i in range_constexpr(n // 2)]
+        return Vec.from_elements(words, fx.Int32)
 
     def store_output(self, o_pack):
         o_global = (
-            self.seq_idx
-            * (
-                fx.Index(self.traits.HEAD_DIM)
-                if _q_pack_group(self.traits) > 0
-                else self.stride_q_n_v
-            )
+            _qo_row_offset(self.traits, self.seq_idx, self.stride_q_n_v)
             + self.q_head_idx * fx.Index(_qo_head_stride(self.traits))
             + self.col
         )
-        buffer_ops.buffer_store(
-            o_pack.ir_value(),
-            self.o_rsrc,
-            as_mlir_value(fx.Int32(o_global * fx.Index(2))),
-            offset_is_bytes=True,
-        )
+        # Mirror the load: 2 i32 (4 values, 8 bytes) at a time.
+        for w in range_constexpr(self.chunk() // 4):
+            pair = Vec.from_elements(
+                [fx.Int32(o_pack[2 * w]), fx.Int32(o_pack[2 * w + 1])], fx.Int32
+            )
+            buffer_ops.buffer_store(
+                pair.ir_value(),
+                self.o_rsrc,
+                as_mlir_value(fx.Int32((o_global + fx.Index(4 * w)) * fx.Index(2))),
+                offset_is_bytes=True,
+            )
 
     def store_lse(self, m_max, den):
         """Single-writer-per-row fp32 LSE store for the split-K combine pass."""

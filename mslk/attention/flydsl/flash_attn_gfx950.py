@@ -50,6 +50,8 @@ from .flash_attn_utils import (
     DualwavePageIdLoader,
     DualwaveQLoader,
     DualwaveSoftmaxHelper,
+    combine_lanes_per_row,
+    combine_rows_per_block,
     DualwaveSplitKCombineContext,
     scf_if_dispatch,
     DualwaveSplitKCombineHelper,
@@ -774,10 +776,10 @@ def build_flash_attn_dualwave_swp_module(
 
     # Combine kernel computes weighted split-K O, with one wave row covering four cols per lane.
     COMBINE_BLOCK = 256
-    COMBINE_LANES_PER_ROW = traits.HEAD_DIM // 4
+    COMBINE_LANES_PER_ROW = combine_lanes_per_row(traits.HEAD_DIM)
     # One row per wave; the spare lanes divide the split dimension (see
     # DualwaveSplitKCombineContext.init_thread_mapping).
-    COMBINE_ROWS_PER_BLOCK = max(1, COMBINE_BLOCK // 64)
+    COMBINE_ROWS_PER_BLOCK = combine_rows_per_block(traits.HEAD_DIM, COMBINE_BLOCK)
 
     @flyc.kernel(known_block_size=[COMBINE_BLOCK, 1, 1])
     def flash_attn_splitk_combine_kernel(
