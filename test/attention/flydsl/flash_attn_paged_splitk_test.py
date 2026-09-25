@@ -15,7 +15,6 @@ already full or where the kernel cannot support it.
 
 import pytest
 import torch
-
 from mslk.attention.flydsl.flash_attn_interface import (
     _auto_paged_kv_splits,
     flydsl_flash_attn_func,
@@ -419,8 +418,15 @@ def test_head_packed_declined_for_wide_gqa_ratio(monkeypatch):
     bt = torch.arange(pages, device="cuda", dtype=torch.int32).view(1, pages)
     sk = torch.full((1,), ctx, device="cuda", dtype=torch.int32)
     flydsl_flash_attn_func(
-        q, k, v, causal=True, num_kv_heads=1, block_table=bt, seqlen_k=sk,
-        kv_cache_layout="linear", num_kv_splits=0,
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=1,
+        block_table=bt,
+        seqlen_k=sk,
+        kv_cache_layout="linear",
+        num_kv_splits=0,
     )
     assert calls == []
 

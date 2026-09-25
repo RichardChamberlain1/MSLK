@@ -238,9 +238,9 @@ def compile_pa_decode_gfx950(
             # Paged addressing depends on it (a tile must not straddle a page); it is
             # harmless for dense. Trailing splits may end up empty, which the reduce
             # kernel already tolerates (it skips partitions with sum == 0).
-            chunk = (
-                (chunk + fx.Int32(TILE_N - 1)) // fx.Int32(TILE_N)
-            ) * fx.Int32(TILE_N)
+            chunk = ((chunk + fx.Int32(TILE_N - 1)) // fx.Int32(TILE_N)) * fx.Int32(
+                TILE_N
+            )
             t_start = split_idx * chunk
             t_end_raw = (split_idx + fx.Int32(1)) * chunk
             t_end = arith.select(t_end_raw < t_full, t_end_raw, t_full)
@@ -262,7 +262,9 @@ def compile_pa_decode_gfx950(
         # discarded in the epilogue.
         q_head = tok_lane % fx.Int32(_RATIO)
         q_tok_local = tok_lane // fx.Int32(_RATIO)
-        q_base_bh = b_idx * stride_qb + g_idx * stride_qg + (hq_base + q_head) * stride_qh
+        q_base_bh = (
+            b_idx * stride_qb + g_idx * stride_qg + (hq_base + q_head) * stride_qh
+        )
         q_frags = []  # q_frags[m_tile][g]
         for t in range_constexpr(_M_TILES):
             q_tok = q_tok_local + fx.Int32(t * _T_PACK)
@@ -877,8 +879,10 @@ def pa_decode_gfx950_launch(
     if paged:
         # (page, token-in-page, unused, kv_head) — see the kernel signature comment.
         k_strides = (ks[0], ks[1], 0, ks[2])
-        bt = block_table if block_table.dtype == torch.int32 else block_table.to(
-            torch.int32
+        bt = (
+            block_table
+            if block_table.dtype == torch.int32
+            else block_table.to(torch.int32)
         )
         bt_stride = bt.stride(0)
     else:

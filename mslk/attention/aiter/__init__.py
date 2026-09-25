@@ -7,9 +7,9 @@
 from .paged import (
     build_kv_caches,
     DecodeWorkspace,
-    make_decode_workspace,
     is_available,
     KV_VEC,
+    make_decode_workspace,
     not_supported_reasons,
     PAGE_SIZE,
     paged_attention_forward,
