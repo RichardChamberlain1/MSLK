@@ -13,9 +13,10 @@ splitting must not change the result, and it must not fire where the device is
 already full or where the kernel cannot support it.
 """
 
+import math
+
 import pytest
 import torch
-
 from mslk.attention.flydsl.flash_attn_interface import (
     _auto_paged_kv_splits,
     flydsl_flash_attn_func,
@@ -203,9 +204,9 @@ def test_gqa_packing_takes_precedence(monkeypatch):
     """With both available, GQA packing owns the shape and the decode kernel idles.
 
     Packing folds query heads into M inside the generic paged kernel, so it
-    fixes the same fan-out with a far wider reach. Measured over the 268-case
-    paged grid it is equal at Sq=1, within noise at Sq=4, and 2.8x better across
-    the Sq=7..16 family, so it must win wherever it applies.
+    fixes the same fan-out with a far wider reach. Measured across the paged
+    decode shapes it is equal at a single query token, within noise at four, and
+    2.8x better for longer query blocks, so it must win wherever it applies.
     """
     from mslk.attention.flydsl.decode import pa_decode_dense
 
@@ -274,6 +275,151 @@ def test_per_request_seqlen_k_is_honoured():
     torch.testing.assert_close(
         _attend(ctx).float(), _attend(short).float(), atol=7.81e-3, rtol=7.81e-3
     )
+
+
+# ── Paged sliding window ──────────────────────────────────────────────────────
+# The window mask lives in the generic kernel's N32 path, which the paged light
+# route already builds. Every other paged route masks by its own rules and has
+# no window term, so it must decline a windowed shape rather than drop the
+# window silently.
+
+
+def _windowed_reference(q, k, v, ctx, window, num_kv_heads):
+    """Bottom-right causal attention restricted to the last ``window`` keys.
+
+    ``window`` is the kernel's ``window_left``: it keeps ``kv > q_pos - window``,
+    so exactly ``window`` keys including the query's own position.
+    """
+    B, Sq, H, D = q.shape
+    flat_k = k.reshape(-1, num_kv_heads, D).float()[:ctx]
+    flat_v = v.reshape(-1, num_kv_heads, D).float()[:ctx]
+    col = torch.arange(ctx, device=q.device)
+    out = torch.zeros(Sq, H, D, device=q.device)
+    for h in range(H):
+        kv = h // (H // num_kv_heads)
+        for t in range(Sq):
+            q_abs = ctx - Sq + t
+            scores = (q.float()[0, t, h] @ flat_k[:, kv].T) / math.sqrt(D)
+            keep = (col <= q_abs) & (col > q_abs - window)
+            out[t, h] = (
+                torch.softmax(scores.masked_fill(~keep, float("-inf")), -1)
+                @ flat_v[:, kv]
+            )
+    return out
+
+
+@pytest.mark.parametrize("num_kv_splits", [1, 4, 0])
+def test_paged_window_matches_reference(num_kv_splits):
+    """A windowed paged call must match an explicitly windowed reference.
+
+    Parametrised over split counts because split-K partitions the KV range: the
+    window bound has to hold inside each partition, not just end to end.
+    """
+    ctx, window, B, Sq, D = 2048, 256, 1, 4, 64
+    q, k, v, block_table, seqlen_k = _paged_inputs(B, Sq, ctx, D)
+    got = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=num_kv_splits,
+        max_seqlen_kv=ctx,
+        window_left=window,
+    )
+    ref = _windowed_reference(q, k, v, ctx, window, HKV)
+    torch.testing.assert_close(got[0].float(), ref, atol=2e-2, rtol=2e-2)
+
+
+def test_paged_window_declines_gqa_packing(monkeypatch):
+    """Packing rewrites Sq, so the window's per-row bound would stop meaning
+    query position. A windowed shape must therefore decline it and still reach
+    the light kernel, carrying the window with it."""
+    from mslk.attention.flydsl import flash_attn_interface as fai
+
+    seen = []
+    real = fai._build_paged_light
+    monkeypatch.setattr(
+        fai, "_build_paged_light", lambda **kw: (seen.append(kw), real(**kw))[1]
+    )
+    args = _paged_inputs(1, 4, 2048, 64)
+
+    _run(*args, num_kv_splits=1)
+    assert seen[-1]["window_left"] == -1
+    assert seen[-1]["q_pack_qlen"] == 4, "unwindowed shapes should still pack"
+
+    flydsl_flash_attn_func(
+        args[0],
+        args[1],
+        args[2],
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=args[3],
+        seqlen_k=args[4],
+        kv_cache_layout="linear",
+        num_kv_splits=1,
+        max_seqlen_kv=2048,
+        window_left=255,
+    )
+    assert seen[-1]["window_left"] == 255, "window must reach the light builder"
+    assert seen[-1]["q_pack_qlen"] == 0, "packing must decline a windowed shape"
+
+
+@pytest.mark.parametrize(
+    "Sq,causal", [(1, True), (4, True), (512, False)], ids=["sq1", "sq4", "sq512"]
+)
+def test_paged_window_is_never_silently_dropped(Sq, causal):
+    """The window must change the answer on every route a shape can take.
+
+    This is the sharp form of the routing guard: a route with no window term
+    returns a full-context answer rather than failing, so identical output is
+    the bug. ``Sq=512`` non-causal is the case that previously reached the
+    native kernel and produced bit-identical results with and without a window.
+    """
+    ctx = 2048
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, Sq, ctx, 64)
+
+    def attend(window_left):
+        return flydsl_flash_attn_func(
+            q,
+            k,
+            v,
+            causal=causal,
+            num_kv_heads=HKV,
+            block_table=block_table,
+            seqlen_k=seqlen_k,
+            kv_cache_layout="linear",
+            num_kv_splits=1,
+            max_seqlen_kv=ctx,
+            window_left=window_left,
+        )
+
+    assert not torch.equal(attend(-1), attend(255))
+
+
+def test_paged_window_still_rejected_for_gappy_kv():
+    """Gappy paged indexes KV differently, so the flat-column window bound does
+    not line up. It must fail loudly rather than answer incorrectly."""
+    ctx, B = 2048, 1
+    q, k, v, block_table, seqlen_k = _paged_inputs(B, 4, ctx, 64)
+    with pytest.raises(NotImplementedError, match="gappy"):
+        flydsl_flash_attn_func(
+            q,
+            k,
+            v,
+            causal=True,
+            num_kv_heads=HKV,
+            block_table=block_table,
+            seqlen_k=seqlen_k,
+            kv_seqstart=torch.zeros(B + 1, device="cuda", dtype=torch.int32),
+            kv_cache_layout="linear",
+            num_kv_splits=1,
+            max_seqlen_kv=ctx,
+            window_left=255,
+        )
 
 
 def calls_groups(calls):
@@ -416,8 +562,15 @@ def test_head_packed_declined_for_wide_gqa_ratio(monkeypatch):
     bt = torch.arange(pages, device="cuda", dtype=torch.int32).view(1, pages)
     sk = torch.full((1,), ctx, device="cuda", dtype=torch.int32)
     flydsl_flash_attn_func(
-        q, k, v, causal=True, num_kv_heads=1, block_table=bt, seqlen_k=sk,
-        kv_cache_layout="linear", num_kv_splits=0,
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=1,
+        block_table=bt,
+        seqlen_k=sk,
+        kv_cache_layout="linear",
+        num_kv_splits=0,
     )
     assert calls == []
 

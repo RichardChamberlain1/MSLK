@@ -37,7 +37,6 @@ from ._common import tensor_cache_sig as _fmha_tensor_cache_sig
 from .flash_attn_utils import (
     _make_flash_attn_generic_traits,
     _waitcnt_vm_n,
-    wait_lds_copies,
     combine_lanes_per_row,
     combine_rows_per_block,
     DualwaveSplitKCombineContext,
@@ -51,6 +50,7 @@ from .flash_attn_utils import (
     GenericSoftmaxHelper,
     GenericStoreHelper,
     scf_if_dispatch,
+    wait_lds_copies,
 )
 
 
@@ -96,9 +96,9 @@ def build_flash_attn_func_module_primary(
 
     if num_kv_heads is None:
         num_kv_heads = num_heads
-    assert (
-        num_heads % num_kv_heads == 0
-    ), f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+    assert num_heads % num_kv_heads == 0, (
+        f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+    )
 
     if dtype_str == "fp8":
         raise ValueError(
@@ -214,9 +214,9 @@ def build_flash_attn_func_module_primary(
         )
     )
 
-    assert (
-        _validate_rows_per_wave == 32
-    ), f"BLOCK_M/NUM_WAVES must be 32, got {_validate_rows_per_wave}"
+    assert _validate_rows_per_wave == 32, (
+        f"BLOCK_M/NUM_WAVES must be 32, got {_validate_rows_per_wave}"
+    )
     assert _validate_block_m % _validate_num_waves == 0
     assert head_dim % 32 == 0, f"head_dim ({head_dim}) must be divisible by 32"
     assert head_dim >= 64, f"head_dim ({head_dim}) must be >= 64"

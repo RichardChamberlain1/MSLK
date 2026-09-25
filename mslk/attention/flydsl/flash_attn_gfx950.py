@@ -43,6 +43,8 @@ from .flash_attn_utils import (
     _v_pair_to_vec32,
     _v_vec32_to_pair,
     _waitcnt_vm_n,
+    combine_lanes_per_row,
+    combine_rows_per_block,
     DualwaveGemmHelper,
     DualwaveKernelContext,
     DualwaveKvGmemToLdsLoader,
@@ -50,12 +52,10 @@ from .flash_attn_utils import (
     DualwavePageIdLoader,
     DualwaveQLoader,
     DualwaveSoftmaxHelper,
-    combine_lanes_per_row,
-    combine_rows_per_block,
     DualwaveSplitKCombineContext,
-    scf_if_dispatch,
     DualwaveSplitKCombineHelper,
     DualwaveStoreHelper,
+    scf_if_dispatch,
 )
 
 

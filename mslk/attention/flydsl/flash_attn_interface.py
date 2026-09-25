@@ -156,9 +156,9 @@ def _num_kv_splits_heuristic(
     same CTA width, which is false here: the light kernel is 128 threads (2
     waves), dualwave is 512 (8). At B=8/H=32 the workgroup test sees
     ``256 >= 0.9*256`` and declines to split, but those are 2-wave CTAs --
-    measured ``SQ_WAVES = 512`` on 256 CUs, i.e. 2 waves/CU, the most starved
-    band in the benchmark grid. Left at 0 the original workgroup-based test is
-    used, so existing callers are unaffected.
+    measured ``SQ_WAVES = 512`` on 256 CUs, i.e. 2 waves/CU -- the most starved
+    case measured. Left at 0 the original workgroup-based test is used, so
+    existing callers are unaffected.
     """
 
     def ceildiv(a: int, b: int) -> int:
@@ -512,20 +512,21 @@ _HP_MFMA_M = 16
 # One CTA is one wave here, so CTA count is the wave count. Below this the kernel
 # cannot hide memory latency: more M-tiles cost occupancy (9 waves/SIMD at 1 tile
 # down to 2 at 8), and with too few CTAs there is nothing else resident to cover
-# the stall. Measured at D=64/Sq=16: 1.0 CTA/CU ran 0.74x the path it replaced,
-# while every shape at >= 4.0 CTA/CU won (1.27x-3.23x).
+# the stall. Measured on a deeply-tiled block: 1.0 CTA/CU ran 0.74x the path it
+# replaced, while every shape at >= 4.0 CTA/CU won (1.27x-3.23x).
 _HP_MIN_CTAS_PER_CU = 2
 
 # Tile count at which the occupancy cost becomes worth guarding. Measured
-# waves/SIMD at D=64: 9 at one tile, 6 at two, then 4 and below. Shallow tiling
-# keeps enough waves resident to hide latency on its own, and Sq<=4 was measured
-# winning at batch 1 (1.45x vs B200), so the floor must not reject it.
+# waves/SIMD at the smaller head dim: 9 at one tile, 6 at two, then 4 and below.
+# Shallow tiling keeps enough waves resident to hide latency on its own, and
+# short query blocks were measured winning even at a single request (1.45x), so
+# the floor must not reject them.
 _HP_FLOOR_MIN_TILES = 3
 
-# Query groups to use when one pass would exceed the register budget. Measured at
-# D=128/Sq=16: G=2 is 1.92x-1.97x over single-pass, G=4 is slower than G=2 in 9
-# of 10 shapes (the extra launches cost more than the occupancy they buy), so
-# there is no reason to go beyond 2.
+# Query groups to use when one pass would exceed the register budget. Measured
+# where a single pass would spill: G=2 is 1.92x-1.97x over single-pass, G=4 is
+# slower than G=2 in 9 of 10 shapes (the extra launches cost more than the
+# occupancy they buy), so there is no reason to go beyond 2.
 _HP_QUERY_GROUPS = 2
 
 # Kill-switch for query grouping, mirroring MSLK_DISABLE_PAGED_DECODE_HP. With
@@ -555,10 +556,10 @@ def _hp_decode_ok(
        compiler spills.
     2. **Query grouping.** A block too deep for that budget can instead be run as
        `_HP_QUERY_GROUPS` shallower passes (see `query_group_seqlen`). Costs one
-       extra KV pass per group but avoids the spill, measured 1.5x-2.0x at
-       D=128/Sq=16. Only used to rescue a shape the budget would reject: where
-       single-pass already fits, it was inside run-to-run noise (1.03x-1.28x at
-       D=64) and is not worth the extra traffic.
+       extra KV pass per group but avoids the spill, measured 1.5x-2.0x where a
+       single pass would spill. Only used to rescue a shape the budget would
+       reject: where single-pass already fits, it was inside run-to-run noise
+       (1.03x-1.28x) and is not worth the extra traffic.
     3. **Parallelism floor.** The resulting CTA count must reach
        `_HP_MIN_CTAS_PER_CU * CUs`. More tiles buy fewer KV passes but cost
        occupancy, and that trade only pays when enough CTAs are resident.
@@ -656,9 +657,10 @@ def _auto_paged_kv_splits(
 # idle-stalled. Size by chain length instead, then bound the workgroup count so
 # the fp32 workspace and combine pass stay cheap.
 _PAGED_BLOCK_N_OUT = 64  # generic paged builds with path_tag="N32"
-# Target KV tiles per workgroup. Measured on MI350X (gfx950, bf16, ctx 32k-128k,
-# D=64/128): the optimum sits at 16 tiles across r=1..64 and q_len=1..16, and the
-# curve is flat between 8 and 32 before combine overhead takes over past ~64.
+# Target KV tiles per workgroup. Measured on MI350X (gfx950, bf16) across the
+# supported head dims: the optimum sits at 16 tiles over a wide range of request
+# counts and query lengths, and the curve is flat between 8 and 32 before combine
+# overhead takes over past ~64.
 _PAGED_TARGET_CHAIN = int(os.getenv("FLYDSL_PAGED_TARGET_CHAIN", "8"))
 _PAGED_MAX_SPLITS = int(os.getenv("FLYDSL_PAGED_MAX_SPLITS", "64"))
 # A base grid this small cannot fill the device even at MAX_SPLITS, so it is
@@ -728,8 +730,8 @@ def _paged_mtp_two_pass(
 
     The grid is one workgroup per (request, QUERY head), so every query head in
     a GQA group re-streams its KV head's whole range: measured 7.3 TB/s of
-    issued loads for 0.9 TB/s of distinct DRAM traffic at q_len=4, against
-    5.2 TB/s when the same kernel runs MHA and has no fan-out to pay.
+    issued loads for 0.9 TB/s of distinct DRAM traffic on a short query block,
+    against 5.2 TB/s when the same kernel runs MHA and has no fan-out to pay.
 
     Packing the group's query heads into M fixes that, but only at q_len==1 --
     with several query tokens the packed (head, token) rows need a mask no
@@ -742,9 +744,10 @@ def _paged_mtp_two_pass(
               request. Tiny, and done in torch.
       merge   standard log-sum-exp combine of the two partials.
 
-    Worth 4.3x at r=16/ctx=128k/q_len=4 (4.54 -> 1.06 ms, 0.92 -> 3.96 TB/s)
-    and 2.6x at q_len=16. Callers gate on ``_PAGED_MTP_MIN_KV_MB``; below that
-    the tail pass dominates and this is a slowdown.
+    Worth 4.3x on a short query block against a long context (0.92 -> 3.96
+    TB/s) and 2.6x as the block lengthens. Callers gate on
+    ``_PAGED_MTP_MIN_KV_MB``; below that the tail pass dominates and this is a
+    slowdown.
     """
     group = heads // num_kv_heads
     rows = q_len * group
@@ -932,6 +935,9 @@ def _flydsl_flash_attn_paged(
     dualwave_swp_setprio: bool,
     dualwave_swp_enable_stagger: bool,
     stream,
+    # Sliding window, forwarded to the generic (light) paged kernel. Keyword
+    # with a default so the positional call sites above stay valid.
+    window_left: int = -1,
 ) -> torch.Tensor:
     """Native paged-KV attention on the gfx950 dualwave kernel.
 
@@ -1024,6 +1030,15 @@ def _flydsl_flash_attn_paged(
     # laid out head-major, row = h * q_len + t, and the kernel is built with
     # Q_PACK_QLEN = q_len so its causal bound uses t = row % q_len rather than
     # the row index. Without that trait this is only expressible at q_len == 1.
+    #
+    # A sliding window is only expressible on the generic (light) paged kernel,
+    # whose N32 mask path carries WINDOW_LEFT. Every other paged route -- MTP
+    # two-pass, GQA head packing, the head-packed decode kernel, dualwave --
+    # either masks by its own rules or rewrites the KV range, and would drop the
+    # window *silently* rather than failing. Each of those gates gets
+    # `not _paged_window`; `_paged_light_ok` is forced True below.
+    _paged_window = window_left >= 0
+
     _gqa_packed = False
     _gqa_group = 0
     _gqa_qlen = 0
@@ -1041,6 +1056,9 @@ def _flydsl_flash_attn_paged(
     _gqa_stride_packed = False
     if (
         _PAGED_GQA_PACK
+        # Packing folds heads onto M and rewrites Sq, so the per-row causal
+        # bound the window is measured against no longer means query position.
+        and not _paged_window
         and not return_lse
         and kv_seqstart is None
         and 1 <= Sq <= 64
@@ -1143,8 +1161,12 @@ def _flydsl_flash_attn_paged(
     # but q_len>1 needs the KV range split to keep the mask expressible. See
     # _paged_mtp_two_pass. Gated on distinct-KV size: below the threshold the
     # tail pass costs more than the bandwidth it saves.
+    #
+    # Windowed shapes are excluded: the two passes split the KV range, so the
+    # window bound would have to be re-expressed per pass.
     if (
         _PAGED_MTP_PACK
+        and not _paged_window
         and 1 < Sq <= 64
         and _varlen_uniform_q
         and not return_lse
@@ -1197,13 +1219,21 @@ def _flydsl_flash_attn_paged(
     _arch = _gpu_arch(q.device)
     _gappy = kv_seqstart is not None
     _splitk_dtype_ok = D in (64, 128) and dtype_str in ("bf16", "f16")
-    _paged_light_ok = _gappy or (
-        _splitk_dtype_ok
-        and (
-            dtype_str == "f16"
-            or causal
-            or not _arch.startswith("gfx950")
-            or Sq <= _VARLEN_LIGHT_MAX_SEQ
+    _paged_light_ok = (
+        _gappy
+        # A window has no expression outside the light kernel, so it decides the
+        # route rather than being one input among several. Without this a
+        # non-causal Sq>256 bf16 shape on gfx950 would fall through to dualwave
+        # and drop the window without saying so.
+        or _paged_window
+        or (
+            _splitk_dtype_ok
+            and (
+                dtype_str == "f16"
+                or causal
+                or not _arch.startswith("gfx950")
+                or Sq <= _VARLEN_LIGHT_MAX_SEQ
+            )
         )
     )
 
@@ -1269,6 +1299,9 @@ def _flydsl_flash_attn_paged(
     _hp_groups = 0
     if (
         not _DISABLE_PAGED_DECODE_HP
+        # pa_decode_gfx950 applies its own bottom-right causal bound and has no
+        # window term, so it would silently ignore one.
+        and not _paged_window
         # The GQA head-packing above removes the same fan-out this kernel was
         # routed here to avoid, and covers Sq up to 64 rather than the M-tile
         # budget's 4-16. When it fires it has already reshaped q, so this path
@@ -1396,6 +1429,7 @@ def _flydsl_flash_attn_paged(
                 gappy_kv=_gappy,
                 return_lse=return_lse,
                 sm_scale=sm_scale,
+                window_left=window_left,
                 num_kv_splits=int(num_kv_splits),
                 q_pack_qlen=_gqa_qlen if (_gqa_packed and causal) else 0,
                 q_pack_group=_gqa_group if _gqa_stride_packed else 0,
@@ -1502,6 +1536,7 @@ def _build_paged_light(
     q_pack_group: int = 0,
     kv_lens: bool = False,
     block_m: int = 0,
+    window_left: int = -1,
 ):
     """Build a lightweight paged-varlen launcher for short attention.
 
@@ -1524,6 +1559,9 @@ def _build_paged_light(
         block_m=block_m or _PAGED_LIGHT_BLOCK_M,
         flat_work_group_size=(block_m or _PAGED_LIGHT_BLOCK_M) * 2,
         path_tag="N32",
+        # N32 is the only path carrying the window mask, and it is already what
+        # this builder selects -- so the window costs no path change here.
+        window_left=window_left,
         waves_per_eu=waves_per_eu,
         daz=daz,
         gappy_kv=gappy_kv,
@@ -1685,11 +1723,27 @@ def flydsl_flash_attn_func(
     # LSE; the dualwave native-paged path does not. The precise check lives in
     # _flydsl_flash_attn_paged where the light-vs-dualwave decision is made.
     if window_left >= 0:
-        # Window lives in apply_kv_mask (dense + generic varlen); fp8/paged lack it.
-        if dtype_str == "fp8" or paged_kv:
+        # Window lives in apply_kv_mask, which is the generic kernel's N32 mask
+        # path. Dense/varlen and paged both reach it -- paged light already
+        # builds with path_tag="N32" -- so the window is expressible there. fp8
+        # has no mask path at all.
+        #
+        # The *native* paged kernels (dualwave, pa_decode_gfx950) do their own
+        # masking and have no window, so they must not take a windowed shape:
+        # they would silently drop the window and return a full-context answer.
+        # `_paged_window` in the paged helper forces the light route and declines
+        # fast paths for exactly that reason.
+        if dtype_str == "fp8":
             raise NotImplementedError(
                 "flydsl_flash_attn_func: sliding-window (window_left>=0) is not "
-                "supported for fp8 or paged KV"
+                "supported for fp8"
+            )
+        if paged_kv and kv_seqstart is not None:
+            # Gappy paged builds a different KV index space; the window bound is
+            # expressed in flat KV columns and would not line up.
+            raise NotImplementedError(
+                "flydsl_flash_attn_func: sliding-window (window_left>=0) is not "
+                "supported for gappy paged KV (kv_seqstart)"
             )
     if sm_scale is not None:
         # fp8 and native paged hardcode 1/sqrt(head_dim); gappy paged uses the
@@ -1740,6 +1794,7 @@ def flydsl_flash_attn_func(
             dualwave_swp_setprio=dualwave_swp_setprio,
             dualwave_swp_enable_stagger=dualwave_swp_enable_stagger,
             stream=stream,
+            window_left=window_left,
         )
 
     varlen = cu_seqlens_q is not None

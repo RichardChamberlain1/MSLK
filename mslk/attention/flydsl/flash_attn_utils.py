@@ -1632,9 +1632,9 @@ def _make_flash_attn_generic_traits(
         total_v8 = vec_v_ngroups * head_dim
         assert total_v8 % block_size == 0
         nv8_per_thread = total_v8 // block_size
-        assert (
-            not enable_prefetch_3buf
-        ), "KV_VECTORIZED no-major V unsupported with 3-buffer prefetch"
+        assert not enable_prefetch_3buf, (
+            "KV_VECTORIZED no-major V unsupported with 3-buffer prefetch"
+        )
         v_nomajor_dma = os.getenv("FLYDSL_FLASH_ATTN_FUNC_VEC_V_DMA", "1") == "1"
     else:
         total_v8 = 0
