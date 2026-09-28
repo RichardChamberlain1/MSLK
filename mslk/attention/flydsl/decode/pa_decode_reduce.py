@@ -134,9 +134,8 @@ def _compile_reduce(
             # (WARP_SIZE - _MAX_PARTS) * s_pm_part past the end of pm/ps. Those
             # resources are max_size=True, so nothing bounds-checks them and the
             # read walks raw memory -- it faults only when the overrun happens to
-            # clear the allocator's slab, which is why it showed up on some
-            # shapes and not others. Re-reading the last valid partition costs
-            # nothing; `active` still discards the value.
+            # clear the allocator's slab. Re-reading the last valid partition
+            # costs nothing; `active` still discards the value.
             lane_ld = arith.select(
                 arith.unwrap(active),
                 arith.unwrap(lane),
@@ -194,8 +193,6 @@ def _compile_reduce(
             ls_lds = SmemPtr(smem, _PAD_PARTS * 4, T.f32, shape=(_PAD_PARTS,)).get()
 
             # `p` is lane-dependent, so it cannot be a const_expr/arith.constant.
-            # (This path was previously unreachable -- every _SPLIT_KS entry was
-            # <= WARP_SIZE, so _FAST was always taken -- and it did not compile.)
             #
             # The LDS arrays are padded to a whole number of waves, so every lane
             # has a slot to write and no branch is needed; the load index is clamped

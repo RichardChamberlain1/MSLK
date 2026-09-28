@@ -1293,12 +1293,10 @@ class FlashAttnGenericTraits:
     Q_PACK_GROUP: int
     VARLEN: bool
     # Per-request KV length from the CuSeqKv cumulative deltas while Q/O keep the
-    # dense [B, Sq, H, D] addressing. Dense paged callers pass a `seqlen_k`
-    # tensor but the launch only forwarded the batch maximum, so every request
-    # was masked to that maximum and a short one attended to stale cache
-    # (measured 1.4e-2 at a 2048-token gap, against a 7.8e-3 bf16 epsilon).
-    # VARLEN already reads the deltas; this reuses that without moving the
-    # caller onto the packed varlen Q layout.
+    # dense [B, Sq, H, D] addressing. Without it a request is masked to the batch
+    # maximum and a short one attends to stale cache. VARLEN already reads the
+    # deltas; this reuses that without moving the caller onto the packed varlen
+    # Q layout.
     KV_LENS: bool
     CROSS_SEQLEN: bool
     # Gappy KV: per-seq KV base comes from an absolute KvSeqStart[b] (non-paged) or

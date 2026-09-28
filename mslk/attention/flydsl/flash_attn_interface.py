@@ -1048,11 +1048,7 @@ def _flydsl_flash_attn_paged(
     _gqa_user_out = None
     # Per-request `seqlen_k` is honoured here: the paged launch forwards the
     # cumulative lengths and the kernel reads them under the KV_LENS trait, so a
-    # request shorter than `max_seqlen_kv` no longer attends to stale cache.
-    # That used to be a constraint on the caller (`max_seqlen_kv` had to equal
-    # every request's `seqlen_k`, with error passing bf16 epsilon well before
-    # the gap reached a page) and it is what the head-packed decode route was
-    # preferred for; packing can keep precedence now that both are correct.
+    # request shorter than `max_seqlen_kv` does not attend to stale cache.
     _gqa_stride_packed = False
     if (
         _PAGED_GQA_PACK
@@ -1076,11 +1072,9 @@ def _flydsl_flash_attn_paged(
         # [B, 1, H_q, D] buffer already stores the group contiguously: row g sits
         # at g * D and KV head h at h * group * D. That is exactly what the
         # kernel addresses once it is told the head stride (Q_PACK_GROUP), so the
-        # permute + copy is unnecessary -- and it was not cheap. At r=1 the pack
-        # and unpack were two extra dispatches costing 8.9 us of a 32.5 us call,
-        # more than Triton spends on its entire reduce. CUTLASS's Blackwell gen
-        # kernel does the same thing, folding the GQA group into the M mode and
-        # pointing M's stride at Q's head stride (sm100_fmha_gen_kernel, 214-221).
+        # permute + copy is unnecessary. CUTLASS's Blackwell gen kernel does the
+        # same thing, folding the GQA group into the M mode and pointing M's
+        # stride at Q's head stride (sm100_fmha_gen_kernel).
         # Longer query blocks work too: a row encodes (group, token), which is
         # two terms rather than one stride, but both divisors are compile-time
         # constants -- see _qo_row_offset. The outer gate already requires
@@ -1354,11 +1348,11 @@ def _flydsl_flash_attn_paged(
     # Anything else keeps the caller's explicit value, so `num_kv_splits=1` remains
     # an exact opt-out.
     # `_paged_num_kv_splits` above has already sized this for the paged routes it
-    # covers, and it sizes by KV-chain length rather than occupancy -- a grid that
-    # fills every CU can still be latency-stalled, which occupancy cannot see. Only
-    # resolve the `0` sentinel for what it left alone, and never overwrite a count
-    # it chose: doing so pushed shapes off the light kernel onto dualwave, which
-    # carries a masking defect at non-tile-aligned seqlen_k (1e-2, above bf16 eps).
+    # covers, by KV-chain length rather than occupancy -- a grid that fills every
+    # CU can still be latency-stalled, which occupancy cannot see. Only resolve
+    # the `0` sentinel for what it left alone; never overwrite a count it chose,
+    # which moves shapes off the light kernel onto dualwave, where non-tile-
+    # aligned seqlen_k mis-masks (1e-2, above bf16 eps).
     if num_kv_splits == 0:
         num_kv_splits = 1
 
