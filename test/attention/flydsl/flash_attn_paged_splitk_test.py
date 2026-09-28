@@ -246,8 +246,8 @@ def test_per_request_seqlen_k_is_honoured():
     them in the kernel under the KV_LENS trait, so the light route is correct
     for ragged batches and no longer has to trade throughput for it by routing
     to the head-packed decode kernel. The scan is a device op, so this needs no
-    device-to-host sync and stays legal under CUDA-graph capture. Measured cost
-    over the 268-case grid: geomean 1.0002x, i.e. none.
+    device-to-host sync and stays legal under CUDA-graph capture. Measured cost:
+    geomean 1.0002x, i.e. none.
 
     This was xfail(strict) while unfixed; the marker is gone because the
     behaviour it guarded now holds.
