@@ -116,16 +116,6 @@ def _dense_generic_tile(
 # Generic split-K uses BLOCK_M=64, so the "mtile" (Q rows per workgroup) is 64.
 _GENERIC_SPLITK_BLOCK_M = 64
 
-# Waves per CTA, from the launch geometry of each paged kernel (confirmed against
-# Workgroup_Size_X in rocprofv3 kernel traces). Used to turn a workgroup count
-# into a wave count when judging whether the device is full.
-_LIGHT_WAVES_PER_CTA = 2  # flash_attn_generic, 128 threads
-_DUALWAVE_WAVES_PER_CTA = 8  # flash_attn_dualwave_swp_gfx950, 512 threads
-
-# Resident waves per CU to aim for. Matches the target in auto_split_k_hp
-# (decode/pa_decode_dense.py) so the two split heuristics agree.
-_TARGET_WAVES_PER_CU = 8
-
 
 def _generic_splitk_list(i: int) -> int:
     # Mirror CK generate_splits_list: 1,2,4,8,16,32,64,96,128,... .
@@ -143,22 +133,12 @@ def _num_kv_splits_heuristic(
     head_dim: int,
     num_cu: int,
     max_splits: int = 8,
-    waves_per_cta: int = 0,
 ) -> int:
     """Port of CK get_num_kv_splits_heuristic for the generic BLOCK_M=64 kernel.
 
     Returns the number of KV splits (1 = no split-K). CK varies the mtile by
     head-dim, but the generic kernel always uses BLOCK_M=64, so the occupancy
     estimate uses mtile=64 (or 16 for tiny q, matching CK's smallq branch).
-
-    ``waves_per_cta`` makes the "is the device full?" test count **waves** rather
-    than workgroups. Counting workgroups silently assumes every kernel has the
-    same CTA width, which is false here: the light kernel is 128 threads (2
-    waves), dualwave is 512 (8). At B=8/H=32 the workgroup test sees
-    ``256 >= 0.9*256`` and declines to split, but those are 2-wave CTAs --
-    measured ``SQ_WAVES = 512`` on 256 CUs, i.e. 2 waves/CU -- the most starved
-    case measured. Left at 0 the original workgroup-based test is used, so
-    existing callers are unaffected.
     """
 
     def ceildiv(a: int, b: int) -> int:
@@ -179,10 +159,7 @@ def _num_kv_splits_heuristic(
     if seqlen_q <= 16:
         mtile = 16
     blocks = num_batches * num_heads * ceildiv(seqlen_q, mtile)
-    if waves_per_cta > 0:
-        if blocks * waves_per_cta >= _TARGET_WAVES_PER_CU * num_cu:
-            return 1
-    elif blocks >= 0.9 * num_cu:
+    if blocks >= 0.9 * num_cu:
         return 1
 
     max_splits = min(max_splits, num_cu)
@@ -486,17 +463,6 @@ _PAGED_BT_LDS_SIZE = 2048
 # A page must be a whole number of tiles so a tile never straddles two pages.
 _PAGED_DECODE_TILE_N = 32
 
-# Each KV split must own enough pages to be worth a workgroup + its combine pass.
-_PAGED_MIN_PAGES_PER_SPLIT = 4
-
-# Kill-switch for the automatic paged split-K selection below, mirroring
-# `MSLK_DISABLE_SPLITK` in csrc/gemm/cutlass/mx6mx6bf16.cu. Forces
-# `num_kv_splits=0` (auto) to resolve to 1 so the dense single-pass paged kernel
-# is used, for A/B measurement and for bisecting regressions.
-_DISABLE_PAGED_AUTO_SPLITK: bool = (
-    os.environ.get("MSLK_DISABLE_PAGED_SPLITK", "0") != "0"
-)
-
 # Kill-switch for routing paged Sq=1 decode to the head-packed decode kernel
 # (`decode/pa_decode_gfx950.py`). Set to fall back to the dualwave paged path,
 # for A/B measurement and for bisecting regressions.
@@ -606,47 +572,6 @@ def _hp_decode_ok(
     )
     ctas = num_batches * num_kv_heads * split_k
     return groups if ctas >= _HP_MIN_CTAS_PER_CU * num_cu else 0
-
-
-def _auto_paged_kv_splits(
-    *,
-    num_batches: int,
-    num_heads: int,
-    seqlen_q: int,
-    head_dim: int,
-    max_kv_pages: int,
-    dtype_str: str,
-    device,
-) -> int:
-    """Pick ``num_kv_splits`` for the dense paged path from occupancy.
-
-    Decode shapes (``Sq`` of 1..16 against a long paged cache) produce only
-    ``B * H`` workgroups, which leaves most CUs idle: at B=1/H=32 that is 32 of
-    256 CUs on MI350X. The KV dimension is the only parallelism left, so reuse
-    the same occupancy heuristic the dense path already applies
-    (``_num_kv_splits_heuristic``) instead of silently running single-split.
-
-    Returns 1 when the shape is ineligible or already fills the device, so the
-    caller can treat the result as unconditional.
-    """
-    if _DISABLE_PAGED_AUTO_SPLITK:
-        return 1
-    if head_dim not in (64, 128) or dtype_str not in ("bf16", "f16"):
-        return 1
-    # Judge occupancy in waves: at splits<=1 the paged path runs the light kernel
-    # (_paged_light_ok), whose CTAs are 2 waves, so a workgroup count understates
-    # how empty the device is by 4x against the 8 waves/CU target.
-    splits = _num_kv_splits_heuristic(
-        num_batches,
-        num_heads,
-        seqlen_q,
-        head_dim,
-        _dense_light_cu(device),
-        waves_per_cta=_LIGHT_WAVES_PER_CTA,
-    )
-    # Never split finer than the cache can feed: each split needs its own pages.
-    splits = min(splits, max(1, max_kv_pages // _PAGED_MIN_PAGES_PER_SPLIT))
-    return max(1, splits)
 
 
 # Paged split-K sizing. `_num_kv_splits_heuristic` (CK's) stops as soon as the
@@ -1236,7 +1161,8 @@ def _flydsl_flash_attn_paged(
     # walks the whole context as a serial ~ctx/BLOCK_N_OUT chain of dependent
     # loads, so wall time is (ctx/64) x memory latency no matter how idle the GPU
     # is. Splitting shortens that chain, which is the entire lever on these shapes.
-    # No caller sizes num_kv_splits for paged, so do it here.
+    # No caller sizes num_kv_splits for paged, so do it here, treating the
+    # historical default of 1 the same as the 0 sentinel.
     if (
         num_kv_splits <= 1
         and _paged_light_ok
@@ -1339,14 +1265,6 @@ def _flydsl_flash_attn_paged(
     # workgroups + a combine pass. Fills the GPU for low-occupancy shapes (small B / few
     # heads), where single-split paged underutilizes the device.
     #
-    # `num_kv_splits == 0` means "choose for me" (same sentinel as
-    # `pa_decode_launch(split_k=0)` and `mx6mx6bf16(splits=0)`). Auto-selection is
-    # restricted to the dense native-paged kernel:
-    #   - varlen packed Q has no split-K variant (rejected below), and
-    #   - gappy paged and `return_lse` both require the generic light kernel, which
-    #     `_paged_light_ok` only selects when num_kv_splits <= 1.
-    # Anything else keeps the caller's explicit value, so `num_kv_splits=1` remains
-    # an exact opt-out.
     # `_paged_num_kv_splits` above has already sized this for the paged routes it
     # covers, by KV-chain length rather than occupancy -- a grid that fills every
     # CU can still be latency-stalled, which occupancy cannot see. Only resolve
@@ -1662,13 +1580,13 @@ def flydsl_flash_attn_func(
         cross_seqlen: Whether seqlen_q and seqlen_kv differ. Required in varlen mode;
             dense mode infers it from ``q.shape[1] != k.shape[1]``.
         block_table / seqlen_k: vLLM-style 2D block table metadata.
-        num_kv_splits: Split-K factor. ``0`` (default) means auto: the dense paged
-            path picks a split count from occupancy via ``_auto_paged_kv_splits``
-            and every other path resolves it to 1, so behaviour is unchanged
-            outside paged decode. ``1`` forces the single-pass kernel everywhere
-            (also reachable with ``MSLK_DISABLE_PAGED_SPLITK=1``). ``>1`` forces
-            that many splits (gfx950 only, D=64/128, bf16/f16; the dense
-            non-paged path additionally requires seq>=384).
+        num_kv_splits: Split-K factor. ``0`` (default) and ``1`` both mean auto
+            on the paged light route (D=64/128, bf16/f16, uniform-q, not
+            gappy): the split count is sized from KV-chain length by
+            ``_paged_num_kv_splits``. Everywhere else they run a single pass,
+            except the dense non-paged path, which applies its own occupancy
+            heuristic. ``>1`` forces that many splits (gfx950 only, D=64/128,
+            bf16/f16; the dense non-paged path additionally requires seq>=384).
         q_descale / k_descale / v_descale: fp32 shape-[1] descales required
             for dense fp8 e4m3fn inputs.
         out: Optional pre-allocated output tensor. For fp8, output is bf16;

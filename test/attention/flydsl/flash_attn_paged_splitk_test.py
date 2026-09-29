@@ -4,21 +4,22 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Automatic paged split-K selection (``num_kv_splits=0``).
+"""Automatic paged split-K selection.
 
-Decode shapes (short Q against a long paged cache) produce only ``B * H``
-workgroups and leave most CUs idle. ``_auto_paged_kv_splits`` recovers that
+Decode shapes (short Q against a long paged cache) walk the whole context as
+one serial chain per workgroup. ``_paged_num_kv_splits`` recovers that
 parallelism along KV. These tests pin the two properties that matter:
-splitting must not change the result, and it must not fire where the device is
-already full or where the kernel cannot support it.
+splitting must not change the result, and the split count must stay within
+the chain, grid and workspace bounds.
 """
 
 import math
 
 import pytest
 import torch
+from mslk.attention.flydsl import flash_attn_interface as fai
 from mslk.attention.flydsl.flash_attn_interface import (
-    _auto_paged_kv_splits,
+    _paged_num_kv_splits,
     flydsl_flash_attn_func,
 )
 from mslk.flydsl.common import is_flydsl_available
@@ -60,92 +61,76 @@ def _run(q, k, v, block_table, seqlen_k, num_kv_splits):
     )
 
 
+def _run_single_pass(monkeypatch, *args):
+    """Reference with auto-sizing pinned to one split.
+
+    ``num_kv_splits=1`` cannot serve as the reference: on the paged light route
+    it is auto-sized exactly like ``0``.
+    """
+    with monkeypatch.context() as m:
+        m.setattr(fai, "_paged_num_kv_splits", lambda *a, **kw: 1)
+        return _run(*args, num_kv_splits=1)
+
+
 @pytest.mark.parametrize("B,Sq", [(1, 1), (1, 16), (2, 16), (4, 4)])
 @pytest.mark.parametrize("D", [64, 128])
-def test_auto_splitk_matches_single_split(B, Sq, D):
+@pytest.mark.parametrize("num_kv_splits", [0, 1])
+def test_auto_splitk_matches_single_split(monkeypatch, B, Sq, D, num_kv_splits):
     """Auto split-K must be numerically equivalent to the single-pass kernel."""
     args = _paged_inputs(B, Sq, 32768, D)
-    ref = _run(*args, num_kv_splits=1)
-    got = _run(*args, num_kv_splits=0)
+    ref = _run_single_pass(monkeypatch, *args)
+    got = _run(*args, num_kv_splits=num_kv_splits)
     # Split-K reorders the softmax reduction, so allow bf16 rounding but nothing
     # structural: bf16 epsilon is ~7.8e-3 and observed deviation is ~2e-4.
     torch.testing.assert_close(got.float(), ref.float(), atol=2e-3, rtol=2e-3)
 
 
 @pytest.mark.parametrize("nks", [2, 4, 8])
-def test_forced_splitk_matches_single_split_at_short_q(nks):
+def test_forced_splitk_matches_single_split_at_short_q(monkeypatch, nks):
     """Explicit split-K at Sq < 384 (previously rejected outright) is correct."""
     args = _paged_inputs(1, 1, 32768, 128)
-    ref = _run(*args, num_kv_splits=1)
+    ref = _run_single_pass(monkeypatch, *args)
     got = _run(*args, num_kv_splits=nks)
     torch.testing.assert_close(got.float(), ref.float(), atol=2e-3, rtol=2e-3)
 
 
-def test_explicit_one_disables_splitting():
-    """num_kv_splits=1 stays an exact opt-out even where auto would split."""
-    args = _paged_inputs(1, 1, 32768, 128)
-    torch.testing.assert_close(
-        _run(*args, num_kv_splits=1).float(), _run(*args, num_kv_splits=1).float()
+@pytest.mark.parametrize("num_kv_splits", [0, 1])
+def test_default_split_counts_are_auto_sized(monkeypatch, num_kv_splits):
+    """Both 0 and the historical default 1 reach the paged split sizing."""
+    seen = []
+    real = fai._paged_num_kv_splits
+    monkeypatch.setattr(
+        fai, "_paged_num_kv_splits", lambda *a: (seen.append(real(*a)), seen[-1])[1]
     )
+    _run(*_paged_inputs(1, 1, 32768, 128), num_kv_splits)
+    assert len(seen) == 1 and seen[0] > 1
 
 
-def test_heuristic_declines_when_device_is_full():
-    """Large batch already fills the CUs, so auto must return 1 (no combine pass)."""
-    device = torch.device("cuda")
-    full = _auto_paged_kv_splits(
-        num_batches=64,
-        num_heads=H,
-        seqlen_q=1,
-        head_dim=128,
-        max_kv_pages=2048,
-        dtype_str="bf16",
-        device=device,
-    )
-    assert full == 1
+def test_paged_splits_decline_short_chain():
+    """A context that fits in the target chain gains nothing from a combine pass."""
+    ctx = fai._PAGED_TARGET_CHAIN * fai._PAGED_BLOCK_N_OUT
+    assert _paged_num_kv_splits(1, HKV, 8, ctx, 128) == 1
 
 
-def test_heuristic_splits_when_device_is_starved():
-    """B=1 leaves most CUs idle, so auto must split."""
-    starved = _auto_paged_kv_splits(
-        num_batches=1,
-        num_heads=H,
-        seqlen_q=1,
-        head_dim=128,
-        max_kv_pages=2048,
-        dtype_str="bf16",
-        device=torch.device("cuda"),
-    )
-    assert starved > 1
+def test_paged_splits_when_chain_is_long():
+    assert _paged_num_kv_splits(1, HKV, 8, 32768, 128) > 1
 
 
-def test_heuristic_capped_by_available_pages():
-    """A tiny cache cannot feed many splits, whatever the occupancy says."""
-    capped = _auto_paged_kv_splits(
-        num_batches=1,
-        num_heads=H,
-        seqlen_q=1,
-        head_dim=128,
-        max_kv_pages=4,
-        dtype_str="bf16",
-        device=torch.device("cuda"),
-    )
-    assert capped == 1
+def test_paged_splits_capped_by_grid():
+    """A large base grid must not be split past the workgroup ceiling."""
+    B = 256
+    blocks = B * H
+    splits = _paged_num_kv_splits(B, H, 1, 131072, 128)
+    assert splits <= max(1, fai._PAGED_MAX_WG // blocks)
 
 
-def test_heuristic_declines_unsupported_dtype():
-    """fp8 has no paged split-K variant; auto must not select one."""
-    assert (
-        _auto_paged_kv_splits(
-            num_batches=1,
-            num_heads=H,
-            seqlen_q=1,
-            head_dim=128,
-            max_kv_pages=2048,
-            dtype_str="fp8",
-            device=torch.device("cuda"),
-        )
-        == 1
-    )
+def test_paged_splits_capped_by_workspace(monkeypatch):
+    """The fp32 workspace must stay under its budget."""
+    monkeypatch.setattr(fai, "_PAGED_WS_BUDGET_MB", 1)
+    B, Sq, D = 4, 16, 128
+    splits = _paged_num_kv_splits(B, H, Sq, 131072, D)
+    elems = splits * B * H * Sq * (D // 2 + 2)
+    assert splits == 1 or elems * 4 <= 1024 * 1024
 
 
 @pytest.mark.parametrize("ctx", [128, 512])
