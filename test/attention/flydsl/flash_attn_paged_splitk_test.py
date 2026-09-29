@@ -148,6 +148,21 @@ def test_heuristic_declines_unsupported_dtype():
     )
 
 
+@pytest.mark.parametrize("ctx", [128, 512])
+@pytest.mark.parametrize("Sq,D", [(1, 64), (4, 128)])
+def test_single_split_gqa_packed_matches_reference(ctx, Sq, D):
+    """Short contexts run one split with GQA stride packing.
+
+    The packed M tile has padding rows past the real (group, token) rows; they
+    sit HEAD_DIM apart in the caller's buffer, so an unmasked store lands on
+    the next KV heads' output. Split-K masked them, the single pass did not.
+    """
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, Sq, ctx, D)
+    got = _run(q, k, v, block_table, seqlen_k, 0)
+    ref = _windowed_reference(q, k, v, ctx, ctx, HKV)
+    torch.testing.assert_close(got[0].float(), ref, atol=2e-2, rtol=2e-2)
+
+
 def test_return_lse_still_works_under_auto():
     """return_lse needs the generic light kernel, which requires splits <= 1."""
     args = _paged_inputs(1, 1, 32768, 128)

@@ -2700,11 +2700,20 @@ class GenericFlashAttnContext:
 
     def global_idx_q(self, token_idx, col):
         traits = self.traits
-        return (
+        idx = (
             _qo_row_offset(traits, token_idx, traits.STRIDE_TOKEN_Q)
             + self.q_head_idx * _qo_head_stride(traits)
             + col
         )
+        if const_expr(_q_pack_group(traits) > 0):
+            # Unpacked, a padding row past seqlen_q_b lands beyond the per-batch
+            # Q/O resource and the hardware drops it. Stride-packed rows sit
+            # HEAD_DIM apart, so padding rows alias the next KV heads' rows and
+            # would overwrite their output. Send them to the resource end instead.
+            idx = (token_idx < self.seqlen_q_b).select(
+                idx, self.seqlen_q_b * fx.Index(traits.STRIDE_TOKEN_Q)
+            )
+        return idx
 
     def global_idx_kv(self, token_idx, col):
         traits = self.traits
