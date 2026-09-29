@@ -229,7 +229,13 @@ def compile_pa_decode_gfx950(
             bt_rsrc = buffer_ops.create_buffer_resource(bt_ptr, max_size=False)
 
         seq_len = buffer_ops.buffer_load(seq_rsrc, b_idx, vec_width=1, dtype=T.i32)
-        t_full = arith.select(seq_len > fx.Int32(0), seq_len, kv_max)
+        if const_expr(_PAGED):
+            # Paged lengths are exact: an empty (e.g. padding) request, or a
+            # query group whose shifted length went negative, attends to nothing
+            # rather than walking stale block-table entries up to kv_max.
+            t_full = arith.select(seq_len > fx.Int32(0), seq_len, fx.Int32(0))
+        else:
+            t_full = arith.select(seq_len > fx.Int32(0), seq_len, kv_max)
         if const_expr(_SPLIT):
             chunk = (t_full + split_total - fx.Int32(1)) // split_total
             # Round the chunk up to TILE_N so every tile_start stays TILE_N-aligned.
@@ -804,17 +810,16 @@ def pa_decode_gfx950_launch(
     supplied by the caller -- deriving it from ``seq_positions`` would be a
     device->host sync and is illegal under CUDA-graph capture.
 
-    **Q must be contiguous.** The single-split epilogue addresses the output with
-    Q's strides, so a non-contiguous Q (a slice, say) whose stride(0) differs from
-    the freshly allocated output's will write to the wrong place for every batch
-    element after the first. The split-K path is unaffected because it computes
-    partial-buffer offsets itself.
+    Q is made contiguous here: the single-split epilogue addresses the output
+    with Q's strides, so a non-contiguous Q (a slice of a fused QKV, say) would
+    write to the wrong place for every batch element after the first.
     """
     from mslk.flydsl.jit import run_compiled
 
     from .pa_decode_dense import auto_split_k_hp
 
     paged = block_table is not None
+    Q = Q.contiguous()
     B, Sq, G, H_q, D = Q.shape
     if paged:
         H_kv = K.shape[2]

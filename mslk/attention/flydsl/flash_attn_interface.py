@@ -1217,15 +1217,16 @@ def _flydsl_flash_attn_paged(
     # gappy have no decode kernel, `return_lse` is not exposed by it, and the
     # vectorized cache layout is a different memory format.
     #
-    # `causal` is deliberately not a condition: the decode kernel applies the
-    # bottom-right causal bound per query token itself (query i attends to
-    # [0, seqlen_kv - Sq + i + 1)), which degenerates to the full range at Sq=1.
+    # The decode kernel always applies the bottom-right causal bound per query
+    # token (query i attends to [0, seqlen_kv - Sq + i + 1)). That degenerates
+    # to the full range at Sq=1, so only Sq=1 may take this route non-causally.
     _hp_groups = 0
     if (
         not _DISABLE_PAGED_DECODE_HP
         # pa_decode_gfx950 applies its own bottom-right causal bound and has no
         # window term, so it would silently ignore one.
         and not _paged_window
+        and (causal or Sq == 1)
         # The GQA head-packing above removes the same fan-out this kernel was
         # routed here to avoid, and covers Sq up to 64 rather than the M-tile
         # budget's 4-16. When it fires it has already reshaped q, so this path

@@ -601,6 +601,71 @@ def test_head_packed_declined_for_wide_gqa_ratio(monkeypatch):
     assert calls == []
 
 
+def test_head_packed_declined_for_non_causal_multi_token(monkeypatch):
+    """The decode kernel always masks causally, so Sq > 1 non-causal must not
+    reach it; Sq=1 is unaffected by the mask and still may."""
+    calls = _count_hp_calls(monkeypatch)
+    q, k, v, block_table, seqlen_k = _paged_inputs(2, 4, 4096, 128)
+    kw = dict(
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=0,
+    )
+    flydsl_flash_attn_func(q, k, v, causal=False, **kw)
+    assert calls == []
+    flydsl_flash_attn_func(q[:, :1].contiguous(), k, v, causal=False, **kw)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("split_k", [1, 0])
+def test_head_packed_non_contiguous_q(monkeypatch, split_k):
+    """A Q sliced out of a fused QKV must not change the answer.
+
+    The single-split epilogue addresses the output with Q's strides.
+    """
+    from mslk.attention.flydsl.decode import pa_decode_dense
+
+    if split_k:
+        monkeypatch.setattr(pa_decode_dense, "auto_split_k_hp", lambda *a: split_k)
+    calls = _count_hp_calls(monkeypatch)
+    B, Sq, ctx, D = 8, 2, 1024, 64
+    _, k, v, block_table, seqlen_k = _paged_inputs(B, Sq, ctx, D)
+    qkv = torch.randn(B, Sq, H + 2 * HKV, D, device="cuda", dtype=torch.bfloat16)
+    q = qkv[:, :, :H]
+    got = _run(q, k, v, block_table, seqlen_k, 0)
+    ref = _run(q.contiguous(), k, v, block_table, seqlen_k, 0)
+    assert len(calls) == 2
+    torch.testing.assert_close(got, ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("split_k", [1, 0])
+def test_head_packed_empty_request(monkeypatch, split_k):
+    """seqlen_k == 0 (e.g. batch padding) attends to nothing, not to kv_max."""
+    from mslk.attention.flydsl.decode import pa_decode_dense
+
+    if split_k:
+        monkeypatch.setattr(pa_decode_dense, "auto_split_k_hp", lambda *a: split_k)
+    calls = _count_hp_calls(monkeypatch)
+    q, k, v, block_table, _ = _paged_inputs(2, 1, 4096, 64)
+    seqlen_k = torch.tensor([4096, 0], device="cuda", dtype=torch.int32)
+    out = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=0,
+        max_seqlen_kv=4096,
+    )
+    assert len(calls) == 1
+    assert torch.equal(out[1], torch.zeros_like(out[1]))
+
+
 def test_head_packed_kill_switch(monkeypatch):
     calls = _count_hp_calls(monkeypatch)
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
