@@ -75,7 +75,6 @@ BLOCK = WARP_SIZE  # one warp per CTA
 # So D=64 is clean to 8 tiles and D=128 to 6. Spilling a bandwidth-bound decode
 # kernel is self-defeating.
 MAX_M_TILES_BY_HEAD_DIM = {64: 8, 128: 6}
-MAX_M_TILES = max(MAX_M_TILES_BY_HEAD_DIM.values())
 
 
 def max_m_tiles(head_dim: int) -> int:
@@ -826,7 +825,7 @@ def pa_decode_gfx950_launch(
         _, KV_MAX, _, H_kv, _ = K.shape
     ratio = H_q // H_kv if H_kv > 0 else 0
     # M holds ratio*Sq (qtok, head) pairs in MFMA_M slots, so ratio must divide
-    # MFMA_M for the tiling to be even, and Sq is capped by _MAX_M_TILES tiles.
+    # MFMA_M for the tiling to be even, and Sq is capped by max_m_tiles(D) tiles.
     t_pack = MFMA_M // ratio if ratio and MFMA_M % ratio == 0 else 0
     ok = (
         H_kv > 0

@@ -774,7 +774,7 @@ def build_flash_attn_dualwave_swp_module(
         if const_expr(traits.SPLITK):
             output_store.store_empty_split()
 
-    # Combine kernel computes weighted split-K O, with one wave row covering four cols per lane.
+    # Combine kernel computes weighted split-K O; see combine_rows_per_block for the layout.
     COMBINE_BLOCK = 256
     COMBINE_LANES_PER_ROW = combine_lanes_per_row(traits.HEAD_DIM)
     # One row per wave; the spare lanes divide the split dimension (see

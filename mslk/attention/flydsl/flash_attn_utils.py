@@ -1285,11 +1285,10 @@ class FlashAttnGenericTraits:
     Q_PACK_QLEN: int
     # GQA packing without materialising the packed Q/O. When > 0 this is the GQA
     # group size and the M axis is read straight out of the caller's
-    # [B, 1, H_q, D] buffer: rows (the group members) are HEAD_DIM apart and a KV
-    # head is Q_PACK_GROUP * HEAD_DIM apart, so the pack is a stride change
-    # rather than a permute + copy. Only valid at Q_PACK_QLEN == 1, where the row
-    # index is the group member alone; for longer query blocks a row encodes
-    # (group, token) and is no longer affine in one stride.
+    # [B, q_len, H_q, D] buffer: group members are HEAD_DIM apart and a KV head
+    # is Q_PACK_GROUP * HEAD_DIM apart, so the pack is a stride change rather
+    # than a permute + copy. For q_len > 1 a row encodes (group, token); see
+    # _qo_row_offset.
     Q_PACK_GROUP: int
     VARLEN: bool
     # Per-request KV length from the CuSeqKv cumulative deltas while Q/O keep the
@@ -6427,12 +6426,13 @@ class DualwaveSplitKCombineContext:
     def init_thread_mapping(self, combine_rows_per_block, combine_lanes_per_row):
         """One output row per wave, with the splits spread across the wave.
 
-        A lane owns four head-dim values, so a row only needs HEAD_DIM/4 lanes.
+        A lane owns combine_chunk(HEAD_DIM) head-dim values, so a row only
+        needs combine_lanes_per_row lanes.
         Giving the row a whole wave leaves 64 / lanes_per_row "split groups" to
         divide the split dimension between, which is the only axis with any work
         left: every lane used to walk all NUM_KV_SPLITS partials itself, and that
         walk is what the combine spends its time on -- block size makes no
-        difference to it (measured flat from 16 to 256 threads), and neither does
+        difference to it (measured flat across block sizes), and neither does
         CU count. The groups are contiguous lane ranges, so the cross-group merge
         is an in-wave butterfly with no LDS and no barrier.
         """
@@ -6525,23 +6525,6 @@ class DualwaveSplitKCombineContext:
 
     def split_z(self, split_i):
         return self.batch_idx * self.traits.NUM_KV_SPLITS + split_i
-
-    def opart_resource(self, split_z):
-        return self.workspace_resource(
-            split_z * self.ws_opart_per_split_bytes, self.ws_opart_per_split_bytes
-        )
-
-    def mrow_resource(self, split_z):
-        return self.workspace_resource(
-            self.ws_mrow_abs_bytes + split_z * self.ws_ml_per_split_bytes,
-            self.ws_ml_per_split_bytes,
-        )
-
-    def lrow_resource(self, split_z):
-        return self.workspace_resource(
-            self.ws_lrow_abs_bytes + split_z * self.ws_ml_per_split_bytes,
-            self.ws_ml_per_split_bytes,
-        )
 
 
 class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):

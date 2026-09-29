@@ -480,7 +480,7 @@ def test_head_packed_selected_at_sq1(monkeypatch):
 
 @pytest.mark.parametrize("Sq", [2, 4])
 def test_head_packed_selected_for_short_query_blocks(monkeypatch, Sq):
-    """M holds ratio*Sq pairs over MAX_M_TILES tiles: at ratio 8 that is Sq <= 4."""
+    """M holds ratio*Sq pairs over max_m_tiles(D) tiles; Sq=2/4 fit at any D."""
     calls = _count_hp_calls(monkeypatch)
     _run(*_paged_inputs(1, Sq, 32768, 64), 0)
     assert len(calls) == 1

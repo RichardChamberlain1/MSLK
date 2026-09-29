@@ -583,9 +583,9 @@ def _hp_decode_ok(
 # the fp32 workspace and combine pass stay cheap.
 _PAGED_BLOCK_N_OUT = 64  # generic paged builds with path_tag="N32"
 # Target KV tiles per workgroup. Measured on MI350X (gfx950, bf16) across the
-# supported head dims: the optimum sits at 16 tiles over a wide range of request
-# counts and query lengths, and the curve is flat between 8 and 32 before combine
-# overhead takes over past ~64.
+# supported head dims: the curve is flat between 8 and 32 tiles over a wide
+# range of request counts and query lengths before combine overhead takes over
+# past ~64.
 _PAGED_TARGET_CHAIN = int(os.getenv("FLYDSL_PAGED_TARGET_CHAIN", "8"))
 _PAGED_MAX_SPLITS = int(os.getenv("FLYDSL_PAGED_MAX_SPLITS", "64"))
 # A base grid this small cannot fill the device even at MAX_SPLITS, so it is
@@ -971,9 +971,6 @@ def _flydsl_flash_attn_paged(
     _gqa_heads = H
     _gqa_varlen = varlen
     _gqa_user_out = None
-    # Per-request `seqlen_k` is honoured here: the paged launch forwards the
-    # cumulative lengths and the kernel reads them under the KV_LENS trait, so a
-    # request shorter than `max_seqlen_kv` does not attend to stale cache.
     _gqa_stride_packed = False
     if (
         _PAGED_GQA_PACK
@@ -1076,10 +1073,11 @@ def _flydsl_flash_attn_paged(
         )
 
     # ── MTP two-pass (q_len > 1) ────────────────────────────────────────────
-    # Same motivation as the q_len==1 packing below -- kill the GQA fan-out --
-    # but q_len>1 needs the KV range split to keep the mask expressible. See
+    # Same motivation as the GQA packing above -- kill the GQA fan-out -- but
+    # q_len>1 needs the KV range split to keep the mask expressible. See
     # _paged_mtp_two_pass. Gated on distinct-KV size: below the threshold the
-    # tail pass costs more than the bandwidth it saves.
+    # tail pass costs more than the bandwidth it saves. Packing has already set
+    # H = num_kv_heads wherever it fired, so this only sees shapes it declined.
     #
     # Windowed shapes are excluded: the two passes split the KV range, so the
     # window bound would have to be re-expressed per pass.
@@ -1211,8 +1209,9 @@ def _flydsl_flash_attn_paged(
     # head) pairs onto M instead, so the matrix core stays full.
     #
     # `_hp_decode_ok` bounds that: M holds `ratio * Sq` pairs across at most
-    # `_HP_MAX_M_TILES` tiles, so at GQA ratio 8 this covers Sq <= 4. Longer
-    # query blocks keep the dualwave path until the M-tile budget is raised.
+    # `max_m_tiles(D)` tiles (8 at D=64, 6 at D=128), so at GQA ratio 8 this
+    # covers Sq <= 16 and Sq <= 12, or more with query groups. Longer query
+    # blocks keep the dualwave path.
     #
     # Everything else excluded here also keeps the dualwave path: varlen and
     # gappy have no decode kernel, `return_lse` is not exposed by it, and the
