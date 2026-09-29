@@ -403,7 +403,8 @@ AOT_ARCHS: List[str] = ["gfx942", "gfx950"]
 AOT_CONFIGS: List[Dict[str, Any]] = [
     {"head_size": hs, "max_parts": mp, "output_dtype_str": dt}
     for hs in (64, 128, 256)
-    for mp in (1, 2, 4, 8, 16, 32, 64)
+    # Matches pa_decode_dense._SPLIT_KS; 128 and 256 take the slow path.
+    for mp in (1, 2, 4, 8, 16, 32, 64, 128, 256)
     for dt in ("f32", "f16", "bf16")
 ]
 

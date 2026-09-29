@@ -785,6 +785,30 @@ def test_head_packed_cache_over_4gib():
     torch.testing.assert_close(got[0, 0].float(), ref, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("ratio", [3, 6])
+def test_dense_decode_head_packed_non_dividing_ratio(monkeypatch, ratio):
+    """A single query token fits any GQA ratio <= 16 heads-only, so dense
+    decode must not fall back to the generic kernel for ratios like 3 or 6."""
+    from mslk.attention.flydsl.decode import pa_decode_generic
+    from mslk.attention.flydsl.decode.pa_decode_gfx950 import pa_decode_gfx950_launch
+
+    def _no_fallback(*a, **kw):
+        raise AssertionError("fell back to pa_decode_generic")
+
+    monkeypatch.setattr(pa_decode_generic, "pa_decode_generic_launch", _no_fallback)
+    B, ctx, hkv, D = 2, 1024, 4, 128
+    torch.manual_seed(0)
+    q = torch.randn(B, 1, 1, hkv * ratio, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, ctx, 1, hkv, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    got = pa_decode_gfx950_launch(q, k, v, None, D**-0.5, 0, torch.bfloat16)
+    kk = k[:, :, 0].float().repeat_interleave(ratio, 2)
+    vv = v[:, :, 0].float().repeat_interleave(ratio, 2)
+    scores = torch.einsum("bhd,bkhd->bhk", q[:, 0, 0].float(), kk) * D**-0.5
+    ref = torch.einsum("bhk,bkhd->bhd", scores.softmax(-1), vv)
+    torch.testing.assert_close(got[:, 0, 0].float(), ref, atol=2e-2, rtol=2e-2)
+
+
 def test_head_packed_kill_switch(monkeypatch):
     calls = _count_hp_calls(monkeypatch)
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)

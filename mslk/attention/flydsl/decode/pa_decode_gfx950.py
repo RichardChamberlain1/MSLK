@@ -129,12 +129,13 @@ def compile_pa_decode_gfx950(
     _RATIO = int(gqa_ratio)
     _SQ = int(seqlen_q)
     assert 1 <= _RATIO <= MFMA_M, f"gqa_ratio must be in [1,{MFMA_M}], got {_RATIO}"
-    assert MFMA_M % _RATIO == 0, (
-        f"gqa_ratio must divide MFMA_M={MFMA_M} so (qtok, head) tiles evenly; "
-        f"got {_RATIO}"
+    assert _SQ == 1 or MFMA_M % _RATIO == 0, (
+        f"gqa_ratio must divide MFMA_M={MFMA_M} so (qtok, head) tiles evenly "
+        f"when seqlen_q > 1; got {_RATIO}"
     )
     assert _SQ >= 1
-    _T_PACK = MFMA_M // _RATIO
+    # At a single query token any ratio <= MFMA_M fits one tile heads-only.
+    _T_PACK = MFMA_M // _RATIO if MFMA_M % _RATIO == 0 else 1
     _M_TILES = (_SQ + _T_PACK - 1) // _T_PACK
     _FX_KV = _FX_DTYPE[kv_dtype_str]
     _FX_OUT = _FX_DTYPE[output_dtype_str]
@@ -851,15 +852,15 @@ def pa_decode_gfx950_launch(
     else:
         _, KV_MAX, _, H_kv, _ = K.shape
     ratio = H_q // H_kv if H_kv > 0 else 0
-    # M holds ratio*Sq (qtok, head) pairs in MFMA_M slots, so ratio must divide
-    # MFMA_M for the tiling to be even, and Sq is capped by max_m_tiles(D) tiles.
+    # M holds ratio*Sq (qtok, head) pairs in MFMA_M slots, so for Sq > 1 ratio
+    # must divide MFMA_M for the tiling to be even, and Sq is capped by
+    # max_m_tiles(D) tiles. A single query token fits any ratio <= MFMA_M.
     t_pack = MFMA_M // ratio if ratio and MFMA_M % ratio == 0 else 0
     ok = (
         H_kv > 0
         and H_q % H_kv == 0
         and 1 <= ratio <= MFMA_M
-        and MFMA_M % ratio == 0
-        and 1 <= Sq <= t_pack * max_m_tiles(D)
+        and (Sq == 1 or 1 <= Sq <= t_pack * max_m_tiles(D))
         # Sq>1 folds (qtok, head) in the split-K partials, which only matches the
         # [B, Sq, G, H_q, D] output layout when G == 1. It also applies a
         # bottom-right causal bound per query token, which is the paged caller's
