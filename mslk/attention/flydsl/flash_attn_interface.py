@@ -1163,6 +1163,7 @@ def _flydsl_flash_attn_paged(
     # is. Splitting shortens that chain, which is the entire lever on these shapes.
     # No caller sizes num_kv_splits for paged, so do it here, treating the
     # historical default of 1 the same as the 0 sentinel.
+    _auto_sized = False
     if (
         num_kv_splits <= 1
         and _paged_light_ok
@@ -1174,16 +1175,17 @@ def _flydsl_flash_attn_paged(
             int(max_seqlen_kv) if max_seqlen_kv is not None else int(seqlen_k.max())
         )
         num_kv_splits = _paged_num_kv_splits(B, H, Sq, _kv_tiles, D)
+        _auto_sized = True
 
     splitk = num_kv_splits > 1
-    # The dualwave split-K route needs enough Q rows to amortise its pipeline; the
-    # generic light route has no such floor, and short-q is exactly where splitting
-    # pays. Keep the old requirement only for the route it was written for.
     if splitk and not _splitk_dtype_ok:
         raise ValueError(
             f"flydsl_flash_attn_func: paged split-K requires D=64/128, dtype "
             f"bf16/f16; got D={D}, dtype={dtype_str}"
         )
+    # The dualwave split-K route needs enough Q rows to amortise its pipeline; the
+    # generic light route has no such floor, and short-q is exactly where splitting
+    # pays. Keep the old requirement only for the route it was written for.
     if splitk and not _paged_light_ok and Sq < 384:
         raise ValueError(
             f"flydsl_flash_attn_func: dualwave paged split-K requires seq_len>=384; "
@@ -1252,7 +1254,9 @@ def _flydsl_flash_attn_paged(
             float(sm_scale) if sm_scale is not None else float(D**-0.5),
             page_size=page_size,
             max_seqlen_kv=skv,
-            split_k=0 if num_kv_splits == 0 else num_kv_splits,
+            # A count sized for the light kernel's chain means nothing to this
+            # kernel (and need not be a compiled power of two); let it pick.
+            split_k=0 if _auto_sized else num_kv_splits,
             output_dtype=q.dtype,
             query_groups=_hp_groups,
         ).view(B, Sq, H, D)
@@ -1275,16 +1279,6 @@ def _flydsl_flash_attn_paged(
         num_kv_splits = 1
 
     splitk = num_kv_splits > 1
-    # NOTE: the dense (non-paged) path additionally requires seq_len >= 384. That floor
-    # does not apply here: the dualwave native-paged kernel splits along KV, not Q, so
-    # short-Q decode shapes are exactly the ones that need it. Verified on MI350X across
-    # B in {1,2,4}, Sq in {1,4,16}, D in {64,128}, ctx in {32k,128k}: max deviation from
-    # the single-split result was 2e-4, well inside bf16 epsilon (~7.8e-3).
-    if splitk and (D not in (64, 128) or dtype_str not in ("bf16", "f16")):
-        raise ValueError(
-            f"flydsl_flash_attn_func: paged split-K requires D=64/128, dtype bf16/f16; "
-            f"got D={D}, dtype={dtype_str}"
-        )
     max_pages_per_split = (max_kv_pages + int(num_kv_splits) - 1) // int(num_kv_splits)
     if max_pages_per_split > _PAGED_BT_LDS_SIZE:
         max_supported_kv = _PAGED_BT_LDS_SIZE * int(num_kv_splits) * page_size
