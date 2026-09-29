@@ -1291,11 +1291,11 @@ class FlashAttnGenericTraits:
     # _qo_row_offset.
     Q_PACK_GROUP: int
     VARLEN: bool
-    # Per-request KV length from the CuSeqKv cumulative deltas while Q/O keep the
-    # dense [B, Sq, H, D] addressing. Without it a request is masked to the batch
-    # maximum and a short one attends to stale cache. VARLEN already reads the
-    # deltas; this reuses that without moving the caller onto the packed varlen
-    # Q layout.
+    # Per-request KV length read straight from CuSeqKv[b] (the caller's
+    # seqlen_k, not a prefix sum) while Q/O keep the dense [B, Sq, H, D]
+    # addressing. Without it a request is masked to the batch maximum and a short
+    # one attends to stale cache. Paged KV takes its base from the block table,
+    # so the length is all that is needed and no host-side scan has to run.
     KV_LENS: bool
     CROSS_SEQLEN: bool
     # Gappy KV: per-seq KV base comes from an absolute KvSeqStart[b] (non-paged) or
@@ -2518,22 +2518,12 @@ class GenericFlashAttnContext:
             self.kv_seq_start = fx.Index(0)
             self.seqlen_q_b = self.seq_len_v
             if const_expr(traits.KV_LENS):
-                # Same cumulative deltas VARLEN reads; only the KV length is
-                # per-request here, Q/O addressing stays dense.
+                # Only the KV length is per-request; Q/O addressing stays dense.
                 cuk_div = fx.logical_divide(
                     fx.rocdl.make_buffer_tensor(CuSeqKv), fx.make_layout(1, 1)
                 )
-                _kv_base = _cu_load(
+                self.seqlen_kv_b = _cu_load(
                     cuk_div, self.batch_idx, self.load_atom_32, self.v1i32_type
-                )
-                self.seqlen_kv_b = (
-                    _cu_load(
-                        cuk_div,
-                        self.batch_idx + fx.Index(1),
-                        self.load_atom_32,
-                        self.v1i32_type,
-                    )
-                    - _kv_base
                 )
             else:
                 self.seqlen_kv_b = self.seq_len_kv_v

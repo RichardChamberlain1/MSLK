@@ -241,12 +241,10 @@ def test_per_request_seqlen_k_is_honoured():
     Tolerance is bf16 epsilon (7.81e-03): it clears split-K's reordering noise
     (~2e-04) by a wide margin while still rejecting the two wrong answers.
 
-    Fixed by forwarding the cumulative lengths to the paged launch and reading
-    them in the kernel under the KV_LENS trait, so the light route is correct
-    for ragged batches and no longer has to trade throughput for it by routing
-    to the head-packed decode kernel. The scan is a device op, so this needs no
-    device-to-host sync and stays legal under CUDA-graph capture. Measured cost:
-    geomean 1.0002x, i.e. none.
+    Fixed by forwarding ``seqlen_k`` to the paged launch and reading each
+    request's length in the kernel under the KV_LENS trait, so the light route
+    is correct for ragged batches without a device-to-host sync or a host-side
+    scan, and stays legal under CUDA-graph capture.
 
     This was xfail(strict) while unfixed; the marker is gone because the
     behaviour it guarded now holds.
@@ -306,6 +304,52 @@ def test_per_request_seqlen_k_on_dualwave_route(num_kv_splits):
         scores = torch.einsum("thd,khd->htk", q[b].float(), kb) / math.sqrt(D)
         ref = torch.einsum("htk,khd->thd", scores.softmax(-1), vb)
         torch.testing.assert_close(got[b].float(), ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("Sq", [1, 4])
+def test_cuda_graph_sees_updated_seqlen_k(Sq):
+    """The KV-length scan is memoised on ``seqlen_k``, but a graph captured
+    after an eager warm-up must record it: replays after ``seqlen_k.copy_()``
+    have to use the new lengths. The same holds for the packed-Q prefix sums."""
+    ctx = 4096
+    q, k, v, block_table, seqlen_k = _paged_inputs(2, Sq, ctx, 64)
+    out = torch.empty_like(q)
+
+    def step():
+        flydsl_flash_attn_func(
+            q,
+            k,
+            v,
+            causal=True,
+            num_kv_heads=HKV,
+            block_table=block_table,
+            seqlen_k=seqlen_k,
+            kv_cache_layout="linear",
+            num_kv_splits=0,
+            max_seqlen_kv=ctx,
+            out=out,
+        )
+
+    step()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    seqlen_k.copy_(torch.tensor([ctx, 1000], device="cuda", dtype=torch.int32))
+    graph.replay()
+    torch.cuda.synchronize()
+    ref = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k.clone(),
+        kv_cache_layout="linear",
+        num_kv_splits=0,
+        max_seqlen_kv=ctx,
+    )
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
 
 
 # ── Paged sliding window ──────────────────────────────────────────────────────

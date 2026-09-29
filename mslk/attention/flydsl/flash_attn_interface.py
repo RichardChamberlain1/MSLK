@@ -608,14 +608,27 @@ _PAGED_GQA_PACK = os.getenv("FLYDSL_PAGED_GQA_PACK", "1") == "1"
 _PAGED_LIGHT_BLOCK_M = int(os.getenv("FLYDSL_PAGED_BLOCK_M", "64"))
 
 
-@functools.lru_cache(maxsize=256)
+_UNIFORM_CU_SEQLENS: dict = {}
+
+
 def _uniform_cu_seqlens(count: int, step: int, device: str) -> torch.Tensor:
     """Cached prefix sums for uniform sequence lengths.
 
     Pure function of (count, step, device), so caching is safe. Saves an arange
-    dispatch per call; decode replays the same shape indefinitely.
+    dispatch per call; decode replays the same shape indefinitely. Nothing is
+    stored while a CUDA graph is being captured: a tensor first built there
+    lives in the graph's pool and holds nothing until the graph replays.
+    Entries are never evicted, since a captured graph may still point at one;
+    they are a few bytes each and keyed by batch shape.
     """
-    return torch.arange(0, (count + 1) * step, step, dtype=torch.int32, device=device)
+    key = (count, step, device)
+    cached = _UNIFORM_CU_SEQLENS.get(key)
+    if cached is not None:
+        return cached
+    cu = torch.arange(0, (count + 1) * step, step, dtype=torch.int32, device=device)
+    if not torch.cuda.is_current_stream_capturing():
+        _UNIFORM_CU_SEQLENS[key] = cu
+    return cu
 
 
 # Two-pass MTP packing (q_len > 1). See _paged_mtp_two_pass.
@@ -769,18 +782,25 @@ def _paged_mtp_two_pass(
 def _paged_kv_cumsum(seqlen_k: torch.Tensor) -> torch.Tensor:
     """Exclusive scan of the per-request KV lengths, memoised on the tensor.
 
-    The kernel reads lengths as cumulative deltas, so the scan has to exist even
+    For the dualwave varlen route, which reads lengths as cumulative deltas even
     though paged KV takes its base from the block table. Cached because this sits
     on the launch path and `seqlen_k` is typically reused across steps; the scan
     itself is a device op, so it stays capturable.
+
+    Bypassed while a CUDA graph is being captured, so the graph records the scan:
+    a cache hit there would bake in the lengths of the eager warm-up call and
+    ignore every later in-place update of `seqlen_k` between replays.
     """
+    capturing = torch.cuda.is_current_stream_capturing()
     key = (seqlen_k.data_ptr(), seqlen_k._version, int(seqlen_k.numel()))
     cached = getattr(seqlen_k, "_flydsl_kv_cum", None)
-    if cached is not None and cached[0] == key:
+    if not capturing and cached is not None and cached[0] == key:
         return cached[1]
     cum = torch.nn.functional.pad(
         seqlen_k.to(torch.int32).cumsum(0, dtype=torch.int32), (1, 0)
     )
+    if capturing:
+        return cum
     try:
         seqlen_k._flydsl_kv_cum = (key, cum)
     except AttributeError:  # tensor subclasses may reject attributes
@@ -1407,10 +1427,17 @@ def _flydsl_flash_attn_paged(
             )
             _ws = torch.empty(ws_elems, dtype=torch.float32, device=q.device)
             kwargs["workspace"] = _ws
-        if _dense_kv_lens:
-            kwargs["cu_seqlens_kv"] = _paged_kv_cumsum(seqlen_k)
         if _dw_kv_lens:
+            # Dualwave's varlen variant reads lengths as cumulative deltas.
+            kwargs["cu_seqlens_kv"] = _paged_kv_cumsum(seqlen_k)
             kwargs["cu_seqlens_q"] = _uniform_cu_seqlens(B, Sq, str(q.device))
+        elif _dense_kv_lens:
+            # KV_LENS reads each request's length directly.
+            kwargs["cu_seqlens_kv"] = (
+                seqlen_k
+                if seqlen_k.dtype == torch.int32 and seqlen_k.is_contiguous()
+                else seqlen_k.to(torch.int32).contiguous()
+            )
         exe(q_flat, k_flat, v_flat, o_flat, B, Sq, **kwargs)
         if o_flat.data_ptr() != out.data_ptr():
             out.copy_(o_flat.view_as(out))
