@@ -851,13 +851,21 @@ def _paged_num_kv_splits(
     per_split_elems = num_batches * num_heads * max(seqlen_q, 1) * (head_dim // 2 + 2)
     budget_elems = _PAGED_WS_BUDGET_MB * 1024 * 1024 // 4
     affordable = max(1, budget_elems // max(per_split_elems, 1))
+    limit = max(1, min(cap, by_grid, affordable, kv_tiles))
+    splits = max(1, min(want, limit))
     # NUM_KV_SPLITS is compiled in, and the raw count moves with every ~512
     # tokens of context, so a growing decode would JIT a new kernel pair each
     # time. Powers of two keep it to a handful: round the target up, then back
-    # down under the caps.
-    want = 1 << (max(want, 1) - 1).bit_length()
-    splits = max(1, min(want, by_grid, affordable, kv_tiles))
-    return 1 << (splits.bit_length() - 1)
+    # down under every cap.
+    pow2 = 1 << (max(want, 1) - 1).bit_length()
+    while pow2 > limit:
+        pow2 //= 2
+    # Each split's pages must fit the block-table LDS window; never round down
+    # past that, or a shape that ran would start raising.
+    pages = ceildiv(max(seqlen_kv, 1), _PAGED_PAGE_SIZE)
+    if ceildiv(pages, pow2) > _PAGED_BT_LDS_SIZE:
+        return splits
+    return pow2
 
 
 def _flydsl_flash_attn_paged(

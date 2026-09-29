@@ -145,6 +145,24 @@ def test_paged_splits_are_powers_of_two():
     assert len(seen) <= 8
 
 
+def test_paged_splits_respect_user_cap(monkeypatch):
+    """Power-of-two rounding must never exceed FLYDSL_PAGED_MAX_SPLITS."""
+    monkeypatch.setattr(fai, "_PAGED_MAX_SPLITS", 48)
+    for B, Sq, ctx in ((1, 8, 32000), (16, 8, 128000), (1, 1, 512000)):
+        blocks = B * HKV * math.ceil(Sq / 64)
+        cap = 48 * (2 if blocks < fai._PAGED_STARVED_BLOCKS else 1)
+        assert _paged_num_kv_splits(B, HKV, Sq, ctx, 128) <= cap
+
+
+def test_paged_splits_keep_block_table_window():
+    """Rounding down must not leave a split owning more pages than the
+    block-table LDS window holds; that shape would raise instead of run."""
+    B, ctx = 640, 300000  # by_grid allows 3 splits; 2 would need 2344 pages
+    splits = _paged_num_kv_splits(B, HKV, 1, ctx, 128)
+    pages = math.ceil(ctx / PAGE)
+    assert math.ceil(pages / splits) <= fai._PAGED_BT_LDS_SIZE
+
+
 @pytest.mark.parametrize("ctx", [128, 512])
 @pytest.mark.parametrize("Sq,D", [(1, 64), (4, 128)])
 def test_single_split_gqa_packed_matches_reference(ctx, Sq, D):
@@ -745,7 +763,7 @@ def test_head_packed_empty_request(monkeypatch, split_k):
     assert torch.equal(out[1], torch.zeros_like(out[1]))
 
 
-def test_head_packed_cache_over_4gib():
+def test_head_packed_cache_over_4gib(monkeypatch):
     """Page offsets must not wrap in 32 bits on a cache larger than 4 GiB.
 
     MHA with 32 KV heads at D=128 is 512 KiB per page, so page 8192 already
@@ -759,6 +777,9 @@ def test_head_packed_cache_over_4gib():
     free, _ = torch.cuda.mem_get_info()
     if free < need * 1.2:
         pytest.skip("needs ~9 GiB of free device memory")
+    # MHA declines GQA packing, so this must reach the head-packed kernel; the
+    # light kernel already addresses pages in 64 bits and would not test it.
+    calls = _count_hp_calls(monkeypatch)
     torch.manual_seed(0)
     k = torch.zeros(pages, PAGE, hkv, D, device="cuda", dtype=torch.bfloat16)
     v = torch.zeros_like(k)
@@ -778,6 +799,7 @@ def test_head_packed_cache_over_4gib():
         num_kv_splits=0,
         max_seqlen_kv=ctx,
     )
+    assert len(calls) == 1
     kk = k[ids.long()].reshape(-1, hkv, D).float()
     vv = v[ids.long()].reshape(-1, hkv, D).float()
     scores = torch.einsum("hd,khd->hk", q[0, 0].float(), kk) / math.sqrt(D)
