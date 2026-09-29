@@ -990,6 +990,10 @@ def _flydsl_flash_attn_paged(
     # `not _paged_window`; `_paged_light_ok` is forced True below.
     _paged_window = window_left >= 0
 
+    # Resolve the KV head count before any route that keys on it (GQA packing
+    # below would otherwise decline every caller that leaves it unset).
+    if num_kv_heads is None:
+        num_kv_heads = int(k.shape[1] if vectorized else k.shape[2])
     _gqa_packed = False
     _gqa_group = 0
     _gqa_qlen = 0

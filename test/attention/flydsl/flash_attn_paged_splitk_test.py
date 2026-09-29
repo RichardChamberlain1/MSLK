@@ -525,6 +525,29 @@ def test_head_packed_matches_dualwave_at_sq1(monkeypatch):
     torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
 
 
+def test_gqa_packing_infers_num_kv_heads(monkeypatch):
+    """Omitting num_kv_heads must not change the route: it is read from K."""
+    seen = []
+    real = fai._build_paged_light
+    monkeypatch.setattr(
+        fai, "_build_paged_light", lambda **kw: (seen.append(kw), real(**kw))[1]
+    )
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, 4, 2048, 64)
+    got = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=0,
+    )
+    assert seen[-1]["q_pack_qlen"] == 4
+    ref = _run(q, k, v, block_table, seqlen_k, 0)
+    torch.testing.assert_close(got, ref, atol=0, rtol=0)
+
+
 def test_head_packed_selected_at_sq1(monkeypatch):
     calls = _count_hp_calls(monkeypatch)
     _run(*_paged_inputs(1, 1, 32768, 64), 0)
