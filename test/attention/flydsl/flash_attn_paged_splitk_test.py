@@ -277,6 +277,38 @@ def test_per_request_seqlen_k_is_honoured():
     )
 
 
+@pytest.mark.parametrize("num_kv_splits", [0, 2])
+def test_per_request_seqlen_k_on_dualwave_route(num_kv_splits):
+    """bf16 non-causal Sq > 256 on gfx950 takes the dualwave kernel, which has
+    no dense per-request KV length; a short request must still stop at its own
+    end rather than read the stale cache up to ``max_seqlen_kv``."""
+    ctx, Sq, D = 4096, 512, 64
+    q, k, v, block_table, _ = _paged_inputs(2, Sq, ctx, D)
+    seqlen_k = torch.tensor([ctx, 3001], device="cuda", dtype=torch.int32)
+    got = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=False,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=num_kv_splits,
+        max_seqlen_kv=ctx,
+    )
+    for b in range(2):
+        n = int(seqlen_k[b])
+        pages = block_table[b]
+        kb = k[pages].reshape(-1, HKV, D)[:n].float()
+        vb = v[pages].reshape(-1, HKV, D)[:n].float()
+        kb = kb.repeat_interleave(H // HKV, 1)
+        vb = vb.repeat_interleave(H // HKV, 1)
+        scores = torch.einsum("thd,khd->htk", q[b].float(), kb) / math.sqrt(D)
+        ref = torch.einsum("htk,khd->thd", scores.softmax(-1), vb)
+        torch.testing.assert_close(got[b].float(), ref, atol=2e-2, rtol=2e-2)
+
+
 # ── Paged sliding window ──────────────────────────────────────────────────────
 # The window mask lives in the generic kernel's N32 path, which the paged light
 # route already builds. Every other paged route masks by its own rules and has

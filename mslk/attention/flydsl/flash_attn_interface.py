@@ -1148,7 +1148,10 @@ def _flydsl_flash_attn_paged(
         or (
             _splitk_dtype_ok
             and (
-                dtype_str == "f16"
+                # Dualwave takes per-request KV lengths only via its varlen
+                # variant, which has no split-K.
+                (_dense_kv_lens and num_kv_splits > 1)
+                or dtype_str == "f16"
                 or causal
                 or not _arch.startswith("gfx950")
                 or Sq <= _VARLEN_LIGHT_MAX_SEQ
@@ -1287,10 +1290,14 @@ def _flydsl_flash_attn_paged(
             f"({_PAGED_BT_LDS_SIZE} pages/split, max_kv_len={max_supported_kv} for "
             f"num_kv_splits={num_kv_splits}, page_size={page_size})"
         )
+    # Only the light kernel reads KV_LENS. Dualwave has no dense per-request KV
+    # length, but its varlen variant reads cu_seqlens_kv, and dense Q/O are the
+    # same bytes as uniform packed varlen, so run that instead.
+    _dw_kv_lens = _dense_kv_lens and not _paged_light_ok
     if varlen:
         cross = bool(cross_seqlen) if cross_seqlen is not None else True
     else:
-        cross = skv != Sq
+        cross = _dw_kv_lens or skv != Sq
     block_table_stride = int(block_table.shape[1])
     # Flatten so the kernel's flat row-major index addresses block_table correctly.
     block_table_i32 = (
@@ -1361,7 +1368,7 @@ def _flydsl_flash_attn_paged(
                 setprio=dualwave_swp_setprio,
                 enable_stagger=dualwave_swp_enable_stagger,
                 num_kv_splits=int(num_kv_splits),
-                varlen=varlen,
+                varlen=varlen or _dw_kv_lens,
                 kv_cache_layout=kv_cache_layout,
             )
         if out is None:
@@ -1372,6 +1379,9 @@ def _flydsl_flash_attn_paged(
         k_flat = k.contiguous()
         v_flat = v.contiguous()
         o_flat = out.contiguous()
+        if _dw_kv_lens:
+            q_flat = q_flat.view(B * Sq, H, D)
+            o_flat = o_flat.view(B * Sq, H, D)
         kwargs = dict(
             block_table=block_table_i32,
             block_table_stride=block_table_stride,
@@ -1399,9 +1409,11 @@ def _flydsl_flash_attn_paged(
             kwargs["workspace"] = _ws
         if _dense_kv_lens:
             kwargs["cu_seqlens_kv"] = _paged_kv_cumsum(seqlen_k)
+        if _dw_kv_lens:
+            kwargs["cu_seqlens_q"] = _uniform_cu_seqlens(B, Sq, str(q.device))
         exe(q_flat, k_flat, v_flat, o_flat, B, Sq, **kwargs)
         if o_flat.data_ptr() != out.data_ptr():
-            out.copy_(o_flat)
+            out.copy_(o_flat.view_as(out))
 
     if _gqa_packed and not _gqa_stride_packed:
         # Invert the pack permutation: (group, token, kv-head) -> (token, head).
