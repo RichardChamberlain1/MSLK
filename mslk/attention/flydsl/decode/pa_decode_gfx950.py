@@ -75,7 +75,6 @@ BLOCK = WARP_SIZE  # one warp per CTA
 # So D=64 is clean to 8 tiles and D=128 to 6. Spilling a bandwidth-bound decode
 # kernel is self-defeating.
 MAX_M_TILES_BY_HEAD_DIM = {64: 8, 128: 6}
-MAX_M_TILES = max(MAX_M_TILES_BY_HEAD_DIM.values())
 
 
 def max_m_tiles(head_dim: int) -> int:
@@ -99,6 +98,7 @@ def compile_pa_decode_gfx950(
     page_size: int = 0,
     gqa_ratio: int = MFMA_M,
     seqlen_q: int = 1,
+    kv_i64: bool = False,
 ) -> Any:  # pyre-ignore[3]
     if not arch:
         arch = get_rocm_arch()
@@ -118,6 +118,9 @@ def compile_pa_decode_gfx950(
     _SPLIT = _SK > 1
     _PAGED = bool(paged)
     _PAGE_SIZE = int(page_size)
+    # Paged caches past 4 GiB need 64-bit page offsets. That costs a descriptor
+    # per tile (measured ~6% at D=128), so it is only compiled in when needed.
+    _KV_I64 = _PAGED and bool(kv_i64)
 
     # M-axis packing. The 16 M slots hold (query-token, head) pairs laid out as
     # m = qtok * ratio + head, so _T_PACK query tokens ride on one tile and a
@@ -126,12 +129,13 @@ def compile_pa_decode_gfx950(
     _RATIO = int(gqa_ratio)
     _SQ = int(seqlen_q)
     assert 1 <= _RATIO <= MFMA_M, f"gqa_ratio must be in [1,{MFMA_M}], got {_RATIO}"
-    assert MFMA_M % _RATIO == 0, (
-        f"gqa_ratio must divide MFMA_M={MFMA_M} so (qtok, head) tiles evenly; "
-        f"got {_RATIO}"
+    assert _SQ == 1 or MFMA_M % _RATIO == 0, (
+        f"gqa_ratio must divide MFMA_M={MFMA_M} so (qtok, head) tiles evenly "
+        f"when seqlen_q > 1; got {_RATIO}"
     )
     assert _SQ >= 1
-    _T_PACK = MFMA_M // _RATIO
+    # At a single query token any ratio <= MFMA_M fits one tile heads-only.
+    _T_PACK = MFMA_M // _RATIO if MFMA_M % _RATIO == 0 else 1
     _M_TILES = (_SQ + _T_PACK - 1) // _T_PACK
     _FX_KV = _FX_DTYPE[kv_dtype_str]
     _FX_OUT = _FX_DTYPE[output_dtype_str]
@@ -161,6 +165,7 @@ def compile_pa_decode_gfx950(
             f"pa_gfx950_h{_HEAD}_{kv_dtype_str}_sk{_SK}"
             + (f"_pg{_PAGE_SIZE}" if _PAGED else "")
             + f"_r{_RATIO}q{_SQ}"
+            + ("_i64" if _KV_I64 else "")
         ),
     )
     alloc.ptr = _LDS_TOTAL
@@ -230,7 +235,13 @@ def compile_pa_decode_gfx950(
             bt_rsrc = buffer_ops.create_buffer_resource(bt_ptr, max_size=False)
 
         seq_len = buffer_ops.buffer_load(seq_rsrc, b_idx, vec_width=1, dtype=T.i32)
-        t_full = arith.select(seq_len > fx.Int32(0), seq_len, kv_max)
+        if const_expr(_PAGED):
+            # Paged lengths are exact: an empty (e.g. padding) request, or a
+            # query group whose shifted length went negative, attends to nothing
+            # rather than walking stale block-table entries up to kv_max.
+            t_full = arith.select(seq_len > fx.Int32(0), seq_len, fx.Int32(0))
+        else:
+            t_full = arith.select(seq_len > fx.Int32(0), seq_len, kv_max)
         if const_expr(_SPLIT):
             chunk = (t_full + split_total - fx.Int32(1)) // split_total
             # Round the chunk up to TILE_N so every tile_start stays TILE_N-aligned.
@@ -325,12 +336,27 @@ def compile_pa_decode_gfx950(
                     dtype=T.i32,
                 )
                 # Origin of this tile inside its page.
-                tile_org = (
-                    kv_base
-                    + fx.Int32(_page) * stride_kb
-                    + (tile_start % fx.Int32(_PAGE_SIZE)) * stride_km
-                )
+                tile_org = kv_base + (tile_start % fx.Int32(_PAGE_SIZE)) * stride_km
+                if const_expr(_KV_I64):
+                    # Fold the page into a per-tile descriptor base in 64 bits: as
+                    # a 32-bit element offset, page * stride_kb wraps past 4 GiB.
+                    _page_u = rocdl.readfirstlane(T.i32, arith.unwrap(fx.Int32(_page)))
+                    _page_bytes = (
+                        fx.Int64(fx.Int32(_page_u))
+                        * fx.Int64(stride_kb)
+                        * fx.Int64(2)  # f16/bf16
+                    )
+                    k_tile_rsrc = buffer_ops.create_buffer_resource(
+                        k_ptr, max_size=True, base_byte_offset=_page_bytes
+                    )
+                    v_tile_rsrc = buffer_ops.create_buffer_resource(
+                        v_ptr, max_size=True, base_byte_offset=_page_bytes
+                    )
+                else:
+                    k_tile_rsrc, v_tile_rsrc = k_rsrc, v_rsrc
+                    tile_org = tile_org + fx.Int32(_page) * stride_kb
             else:
+                k_tile_rsrc, v_tile_rsrc = k_rsrc, v_rsrc
                 tile_org = kv_base + tile_start * stride_km
 
             # ── Issue V HBM loads EARLY (into regs) so latency overlaps the
@@ -346,7 +372,7 @@ def compile_pa_decode_gfx950(
                 _col = _dp * fx.Int32(16) + _half * fx.Int32(8)
                 _v8s.append(
                     buffer_ops.buffer_load(
-                        v_rsrc,
+                        v_tile_rsrc,
                         tile_org + _tok * stride_km + _col,
                         vec_width=8,
                         dtype=_FX_KV,
@@ -378,7 +404,7 @@ def compile_pa_decode_gfx950(
                         + grp * fx.Int32(8)
                     )
                     k8 = buffer_ops.buffer_load(
-                        k_rsrc, k_off, vec_width=8, dtype=_FX_KV
+                        k_tile_rsrc, k_off, vec_width=8, dtype=_FX_KV
                     )
                     for t in range_constexpr(_M_TILES):
                         qk_st[t][st] = _mfma(
@@ -705,6 +731,7 @@ def _make_gfx950_jit_launcher(
     page_size=0,
     gqa_ratio=MFMA_M,
     seqlen_q=1,
+    kv_i64=False,
 ):
     kernel, _alloc = compile_pa_decode_gfx950(
         head_size=head_size,
@@ -715,6 +742,7 @@ def _make_gfx950_jit_launcher(
         page_size=page_size,
         gqa_ratio=gqa_ratio,
         seqlen_q=seqlen_q,
+        kv_i64=kv_i64,
     )
 
     @flyc.jit
@@ -805,17 +833,16 @@ def pa_decode_gfx950_launch(
     supplied by the caller -- deriving it from ``seq_positions`` would be a
     device->host sync and is illegal under CUDA-graph capture.
 
-    **Q must be contiguous.** The single-split epilogue addresses the output with
-    Q's strides, so a non-contiguous Q (a slice, say) whose stride(0) differs from
-    the freshly allocated output's will write to the wrong place for every batch
-    element after the first. The split-K path is unaffected because it computes
-    partial-buffer offsets itself.
+    Q is made contiguous here: the single-split epilogue addresses the output
+    with Q's strides, so a non-contiguous Q (a slice of a fused QKV, say) would
+    write to the wrong place for every batch element after the first.
     """
     from mslk.flydsl.jit import run_compiled
 
     from .pa_decode_dense import auto_split_k_hp
 
     paged = block_table is not None
+    Q = Q.contiguous()
     B, Sq, G, H_q, D = Q.shape
     if paged:
         H_kv = K.shape[2]
@@ -825,15 +852,15 @@ def pa_decode_gfx950_launch(
     else:
         _, KV_MAX, _, H_kv, _ = K.shape
     ratio = H_q // H_kv if H_kv > 0 else 0
-    # M holds ratio*Sq (qtok, head) pairs in MFMA_M slots, so ratio must divide
-    # MFMA_M for the tiling to be even, and Sq is capped by _MAX_M_TILES tiles.
+    # M holds ratio*Sq (qtok, head) pairs in MFMA_M slots, so for Sq > 1 ratio
+    # must divide MFMA_M for the tiling to be even, and Sq is capped by
+    # max_m_tiles(D) tiles. A single query token fits any ratio <= MFMA_M.
     t_pack = MFMA_M // ratio if ratio and MFMA_M % ratio == 0 else 0
     ok = (
         H_kv > 0
         and H_q % H_kv == 0
         and 1 <= ratio <= MFMA_M
-        and MFMA_M % ratio == 0
-        and 1 <= Sq <= t_pack * max_m_tiles(D)
+        and (Sq == 1 or 1 <= Sq <= t_pack * max_m_tiles(D))
         # Sq>1 folds (qtok, head) in the split-K partials, which only matches the
         # [B, Sq, G, H_q, D] output layout when G == 1. It also applies a
         # bottom-right causal bound per query token, which is the paged caller's
@@ -889,13 +916,19 @@ def pa_decode_gfx950_launch(
         bt = torch.empty(0, dtype=torch.int32, device=dev)
         bt_stride = 0
     n_cta_base = B * G * H_kv
+    # Bytes addressed from the base pointer, so strided views of a larger cache
+    # count what they can actually reach.
+    kv_span = max(
+        1 + sum((n - 1) * st for n, st in zip(t.shape, t.stride())) for t in (K, V)
+    )
+    kv_i64 = paged and kv_span * K.element_size() >= 2**32
     # Thread the live stream into .launch so the kernel is captured under CUDA graphs
     # (a default-stream launch would capture empty).
     stream = torch.cuda.current_stream()
     if split_k == 1:
         dummy = torch.empty(0, dtype=torch.float32, device=dev)
         launcher = _make_gfx950_jit_launcher(
-            D, kv_str, out_str, 1, paged, page_size if paged else 0, ratio, Sq
+            D, kv_str, out_str, 1, paged, page_size if paged else 0, ratio, Sq, kv_i64
         )
         run_compiled(
             launcher,
@@ -931,7 +964,15 @@ def pa_decode_gfx950_launch(
         pm = torch.empty((B, G, split_k, HQ_EFF), dtype=torch.float32, device=dev)
         ps = torch.empty((B, G, split_k, HQ_EFF), dtype=torch.float32, device=dev)
         launcher = _make_gfx950_jit_launcher(
-            D, kv_str, "f32", split_k, paged, page_size if paged else 0, ratio, Sq
+            D,
+            kv_str,
+            "f32",
+            split_k,
+            paged,
+            page_size if paged else 0,
+            ratio,
+            Sq,
+            kv_i64,
         )
         run_compiled(
             launcher,

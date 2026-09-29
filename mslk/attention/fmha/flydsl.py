@@ -196,20 +196,28 @@ def _paged_launch_tensors(bias, device, sub):
     Invalidation is by storage identity and version counter, so a caller that
     swaps in a new block table -- or mutates one in place, which bumps
     ``_version`` -- gets a rebuild rather than stale indices.
+
+    Bypassed while a CUDA graph is being captured, so the graph records the
+    rebuild: a cache hit there would bake in the eager warm-up call's metadata
+    and ignore in-place updates of the mask between replays.
     """
+    capturing = torch.cuda.is_current_stream_capturing()
     block_tables = bias.block_tables
     seqlen = bias.k_seqinfo.seqlen
+    qseqstart = bias.q_seqinfo.seqstart
     key = (
         block_tables.data_ptr(),
         block_tables._version,
         tuple(block_tables.shape),
         seqlen.data_ptr(),
         seqlen._version,
+        qseqstart.data_ptr(),
+        qseqstart._version,
         int(sub),
         str(device),
     )
     cached = getattr(bias, "_flydsl_launch_cache", None)
-    if cached is not None and cached[0] == key:
+    if not capturing and cached is not None and cached[0] == key:
         return cached[1]
 
     seqlen_k = seqlen.to(device)
@@ -222,7 +230,9 @@ def _paged_launch_tensors(bias, device, sub):
             bt.unsqueeze(-1) * sub + torch.arange(sub, dtype=torch.int32, device=device)
         ).reshape(bt.shape[0], bt.shape[1] * sub)
     bt = bt.contiguous()
-    value = (bt, kseq, seqlen_k, bias.q_seqinfo.seqstart.to(device))
+    value = (bt, kseq, seqlen_k, qseqstart.to(device))
+    if capturing:
+        return value
     try:
         bias._flydsl_launch_cache = (key, value)
     except (AttributeError, TypeError):

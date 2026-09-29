@@ -1285,18 +1285,17 @@ class FlashAttnGenericTraits:
     Q_PACK_QLEN: int
     # GQA packing without materialising the packed Q/O. When > 0 this is the GQA
     # group size and the M axis is read straight out of the caller's
-    # [B, 1, H_q, D] buffer: rows (the group members) are HEAD_DIM apart and a KV
-    # head is Q_PACK_GROUP * HEAD_DIM apart, so the pack is a stride change
-    # rather than a permute + copy. Only valid at Q_PACK_QLEN == 1, where the row
-    # index is the group member alone; for longer query blocks a row encodes
-    # (group, token) and is no longer affine in one stride.
+    # [B, q_len, H_q, D] buffer: group members are HEAD_DIM apart and a KV head
+    # is Q_PACK_GROUP * HEAD_DIM apart, so the pack is a stride change rather
+    # than a permute + copy. For q_len > 1 a row encodes (group, token); see
+    # _qo_row_offset.
     Q_PACK_GROUP: int
     VARLEN: bool
-    # Per-request KV length from the CuSeqKv cumulative deltas while Q/O keep the
-    # dense [B, Sq, H, D] addressing. Without it a request is masked to the batch
-    # maximum and a short one attends to stale cache. VARLEN already reads the
-    # deltas; this reuses that without moving the caller onto the packed varlen
-    # Q layout.
+    # Per-request KV length read straight from CuSeqKv[b] (the caller's
+    # seqlen_k, not a prefix sum) while Q/O keep the dense [B, Sq, H, D]
+    # addressing. Without it a request is masked to the batch maximum and a short
+    # one attends to stale cache. Paged KV takes its base from the block table,
+    # so the length is all that is needed and no host-side scan has to run.
     KV_LENS: bool
     CROSS_SEQLEN: bool
     # Gappy KV: per-seq KV base comes from an absolute KvSeqStart[b] (non-paged) or
@@ -2519,22 +2518,12 @@ class GenericFlashAttnContext:
             self.kv_seq_start = fx.Index(0)
             self.seqlen_q_b = self.seq_len_v
             if const_expr(traits.KV_LENS):
-                # Same cumulative deltas VARLEN reads; only the KV length is
-                # per-request here, Q/O addressing stays dense.
+                # Only the KV length is per-request; Q/O addressing stays dense.
                 cuk_div = fx.logical_divide(
                     fx.rocdl.make_buffer_tensor(CuSeqKv), fx.make_layout(1, 1)
                 )
-                _kv_base = _cu_load(
+                self.seqlen_kv_b = _cu_load(
                     cuk_div, self.batch_idx, self.load_atom_32, self.v1i32_type
-                )
-                self.seqlen_kv_b = (
-                    _cu_load(
-                        cuk_div,
-                        self.batch_idx + fx.Index(1),
-                        self.load_atom_32,
-                        self.v1i32_type,
-                    )
-                    - _kv_base
                 )
             else:
                 self.seqlen_kv_b = self.seq_len_kv_v
@@ -2661,14 +2650,18 @@ class GenericFlashAttnContext:
         # so start the KV loop past them. Keep kv_col > q_row + delta - WINDOW_LEFT;
         # the first survivable column across the tile is at q_start (min q row), so
         # skip whole BLOCK_N_OUT tiles below it. Window implies causal (delta set).
+        # Packed rows carry query position t = row % Q_PACK_QLEN, and any tile can
+        # hold t = 0, so the lowest q position is 0 rather than q_start.
         self.kv_lower = fx.Index(0)
         if const_expr(traits.WINDOW_LEFT >= 0 and traits.CAUSAL):
             step_w = fx.Index(traits.BLOCK_N_OUT)
+            q_lo_i32 = (
+                fx.Int32(0)
+                if const_expr(traits.Q_PACK_QLEN > 0)
+                else fx.Int32(self.q_start)
+            )
             first_col_i32 = (
-                fx.Int32(self.q_start)
-                + self.delta_i32
-                - fx.Int32(traits.WINDOW_LEFT)
-                + fx.Int32(1)
+                q_lo_i32 + self.delta_i32 - fx.Int32(traits.WINDOW_LEFT) + fx.Int32(1)
             )
             first_col_i32 = (first_col_i32 > fx.Int32(0)).select(
                 first_col_i32, fx.Int32(0)
@@ -2700,11 +2693,20 @@ class GenericFlashAttnContext:
 
     def global_idx_q(self, token_idx, col):
         traits = self.traits
-        return (
+        idx = (
             _qo_row_offset(traits, token_idx, traits.STRIDE_TOKEN_Q)
             + self.q_head_idx * _qo_head_stride(traits)
             + col
         )
+        if const_expr(_q_pack_group(traits) > 0):
+            # Unpacked, a padding row past seqlen_q_b lands beyond the per-batch
+            # Q/O resource and the hardware drops it. Stride-packed rows sit
+            # HEAD_DIM apart, so padding rows alias the next KV heads' rows and
+            # would overwrite their output. Send them to the resource end instead.
+            idx = (token_idx < self.seqlen_q_b).select(
+                idx, self.seqlen_q_b * fx.Index(traits.STRIDE_TOKEN_Q)
+            )
+        return idx
 
     def global_idx_kv(self, token_idx, col):
         traits = self.traits
@@ -3697,7 +3699,11 @@ class GenericSoftmaxHelper:
             has_window = const_expr(traits.WINDOW_LEFT >= 0)
             if has_window:
                 window_left_i32 = fx.Int32(traits.WINDOW_LEFT)
-                q_end_i32 = fx.Int32(ctx.q_start + traits.BLOCK_M) + ctx.delta_i32
+                if const_expr(traits.Q_PACK_QLEN > 0):
+                    # Highest packed query position is QLEN - 1 in every tile.
+                    q_end_i32 = fx.Int32(traits.Q_PACK_QLEN) + ctx.delta_i32
+                else:
+                    q_end_i32 = fx.Int32(ctx.q_start + traits.BLOCK_M) + ctx.delta_i32
                 window_lo_edge_i32 = q_end_i32 - window_left_i32
                 tile_needs_mask = tile_needs_mask | (kv_start_i32 < window_lo_edge_i32)
             col_base_i32, moff = self._kv_mask_lane_off(kv_start_i32)
@@ -6418,12 +6424,13 @@ class DualwaveSplitKCombineContext:
     def init_thread_mapping(self, combine_rows_per_block, combine_lanes_per_row):
         """One output row per wave, with the splits spread across the wave.
 
-        A lane owns four head-dim values, so a row only needs HEAD_DIM/4 lanes.
+        A lane owns combine_chunk(HEAD_DIM) head-dim values, so a row only
+        needs combine_lanes_per_row lanes.
         Giving the row a whole wave leaves 64 / lanes_per_row "split groups" to
         divide the split dimension between, which is the only axis with any work
         left: every lane used to walk all NUM_KV_SPLITS partials itself, and that
         walk is what the combine spends its time on -- block size makes no
-        difference to it (measured flat from 16 to 256 threads), and neither does
+        difference to it (measured flat across block sizes), and neither does
         CU count. The groups are contiguous lane ranges, so the cross-group merge
         is an in-wave butterfly with no LDS and no barrier.
         """
@@ -6516,23 +6523,6 @@ class DualwaveSplitKCombineContext:
 
     def split_z(self, split_i):
         return self.batch_idx * self.traits.NUM_KV_SPLITS + split_i
-
-    def opart_resource(self, split_z):
-        return self.workspace_resource(
-            split_z * self.ws_opart_per_split_bytes, self.ws_opart_per_split_bytes
-        )
-
-    def mrow_resource(self, split_z):
-        return self.workspace_resource(
-            self.ws_mrow_abs_bytes + split_z * self.ws_ml_per_split_bytes,
-            self.ws_ml_per_split_bytes,
-        )
-
-    def lrow_resource(self, split_z):
-        return self.workspace_resource(
-            self.ws_lrow_abs_bytes + split_z * self.ws_ml_per_split_bytes,
-            self.ws_ml_per_split_bytes,
-        )
 
 
 class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):

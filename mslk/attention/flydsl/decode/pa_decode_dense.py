@@ -258,6 +258,9 @@ _SPLIT_KS = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 # path is fixed at these (see _PAGED_PAGE_SIZE in flash_attn_interface.py).
 _PAGED_HEAD_SIZES = (64, 128)
 _PAGED_PAGE_SIZE = 64
+# The head-packed gfx950 kernel compiles the GQA ratio in. Cover the common
+# power-of-two ratios at a single query token; anything else JITs on first use.
+_GFX950_AOT_GQA_RATIOS = (1, 2, 4, 8, 16)
 
 AOT_CONFIGS: List[Dict[str, Any]] = [
     {
@@ -300,22 +303,25 @@ def compile_aot_config(config: Dict[str, Any], arch: str) -> None:
             split_k=sk,
             arch=arch,
         )
-        compile_pa_decode_gfx950(
-            head_size=hs,
-            kv_dtype_str=kv,
-            output_dtype_str=od,
-            split_k=sk,
-            arch=arch,
-        )
-        # Paged variant (block-table KV), used by the flydsl_flash_attn_func
-        # paged decode fast path. Only D=64/128 reach it -- 256 is dense-only.
-        if hs in _PAGED_HEAD_SIZES:
+        for ratio in _GFX950_AOT_GQA_RATIOS:
             compile_pa_decode_gfx950(
                 head_size=hs,
                 kv_dtype_str=kv,
                 output_dtype_str=od,
                 split_k=sk,
                 arch=arch,
-                paged=True,
-                page_size=_PAGED_PAGE_SIZE,
+                gqa_ratio=ratio,
             )
+            # Paged variant (block-table KV), used by the flydsl_flash_attn_func
+            # paged decode fast path. Only D=64/128 reach it -- 256 is dense-only.
+            if hs in _PAGED_HEAD_SIZES:
+                compile_pa_decode_gfx950(
+                    head_size=hs,
+                    kv_dtype_str=kv,
+                    output_dtype_str=od,
+                    split_k=sk,
+                    arch=arch,
+                    paged=True,
+                    page_size=_PAGED_PAGE_SIZE,
+                    gqa_ratio=ratio,
+                )

@@ -39,6 +39,7 @@ from .flash_attn_utils import (
     _waitcnt_vm_n,
     combine_lanes_per_row,
     combine_rows_per_block,
+    combine_split_groups,
     DualwaveSplitKCombineContext,
     DualwaveSplitKCombineHelper,
     GenericFlashAttnContext,
@@ -681,15 +682,16 @@ def build_flash_attn_func_module_primary(
 
     # Split-K combine: merge per-split partials into final O + LSE. The generic O
     # register/pack layout matches the dualwave path, so the shared combine kernel
-    # reads the workspace verbatim (one wave row covers four O columns per lane).
-    # Threads per combine block. The grid is ceil(rows / (COMBINE_BLOCK/lanes)),
-    # and a block is the unit of CU assignment -- at 256 threads a low-concurrency
-    # decode (32 output rows, D=64) lands on 2 CUs and the combine costs more than
-    # the attention kernel itself. Smaller blocks spread the same waves wider.
+    # reads the workspace verbatim.
+    # Threads per combine block; a block is the unit of CU assignment.
     COMBINE_BLOCK = int(os.getenv("FLYDSL_COMBINE_BLOCK", "256"))
     COMBINE_LANES_PER_ROW = combine_lanes_per_row(traits.HEAD_DIM)
-    # A row owns a whole wave: HEAD_DIM/4 lanes carry the head dim and the
-    # remaining 64/(HEAD_DIM/4) lanes divide the split dimension between them.
+    # A row owns a whole wave: HEAD_DIM/combine_chunk lanes carry the head dim
+    # and the remaining lanes divide the split dimension between them, merged
+    # by an in-wave butterfly. A partial wave would drop split groups, so the
+    # block must be whole waves.
+    if combine_split_groups(traits.HEAD_DIM) > 1:
+        COMBINE_BLOCK = max(64, COMBINE_BLOCK // 64 * 64)
     COMBINE_ROWS_PER_BLOCK = combine_rows_per_block(traits.HEAD_DIM, COMBINE_BLOCK)
 
     @flyc.kernel(known_block_size=[COMBINE_BLOCK, 1, 1])
