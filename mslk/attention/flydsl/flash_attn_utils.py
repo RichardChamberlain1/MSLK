@@ -2650,14 +2650,18 @@ class GenericFlashAttnContext:
         # so start the KV loop past them. Keep kv_col > q_row + delta - WINDOW_LEFT;
         # the first survivable column across the tile is at q_start (min q row), so
         # skip whole BLOCK_N_OUT tiles below it. Window implies causal (delta set).
+        # Packed rows carry query position t = row % Q_PACK_QLEN, and any tile can
+        # hold t = 0, so the lowest q position is 0 rather than q_start.
         self.kv_lower = fx.Index(0)
         if const_expr(traits.WINDOW_LEFT >= 0 and traits.CAUSAL):
             step_w = fx.Index(traits.BLOCK_N_OUT)
+            q_lo_i32 = (
+                fx.Int32(0)
+                if const_expr(traits.Q_PACK_QLEN > 0)
+                else fx.Int32(self.q_start)
+            )
             first_col_i32 = (
-                fx.Int32(self.q_start)
-                + self.delta_i32
-                - fx.Int32(traits.WINDOW_LEFT)
-                + fx.Int32(1)
+                q_lo_i32 + self.delta_i32 - fx.Int32(traits.WINDOW_LEFT) + fx.Int32(1)
             )
             first_col_i32 = (first_col_i32 > fx.Int32(0)).select(
                 first_col_i32, fx.Int32(0)
@@ -3695,7 +3699,11 @@ class GenericSoftmaxHelper:
             has_window = const_expr(traits.WINDOW_LEFT >= 0)
             if has_window:
                 window_left_i32 = fx.Int32(traits.WINDOW_LEFT)
-                q_end_i32 = fx.Int32(ctx.q_start + traits.BLOCK_M) + ctx.delta_i32
+                if const_expr(traits.Q_PACK_QLEN > 0):
+                    # Highest packed query position is QLEN - 1 in every tile.
+                    q_end_i32 = fx.Int32(traits.Q_PACK_QLEN) + ctx.delta_i32
+                else:
+                    q_end_i32 = fx.Int32(ctx.q_start + traits.BLOCK_M) + ctx.delta_i32
                 window_lo_edge_i32 = q_end_i32 - window_left_i32
                 tile_needs_mask = tile_needs_mask | (kv_start_i32 < window_lo_edge_i32)
             col_base_i32, moff = self._kv_mask_lane_off(kv_start_i32)

@@ -414,13 +414,17 @@ def _windowed_reference(q, k, v, ctx, window, num_kv_heads):
 
 
 @pytest.mark.parametrize("num_kv_splits", [1, 4, 0])
-def test_paged_window_matches_reference(num_kv_splits):
+@pytest.mark.parametrize("Sq", [1, 4, 16, 32, 64])
+@pytest.mark.parametrize("window", [17, 256, 2048])
+def test_paged_window_matches_reference(num_kv_splits, Sq, window):
     """A windowed paged call must match an explicitly windowed reference.
 
     Parametrised over split counts because split-K partitions the KV range: the
-    window bound has to hold inside each partition, not just end to end.
+    window bound has to hold inside each partition, not just end to end. Query
+    lengths cover GQA packing (rows = group x Sq, 128 rows at Sq=16), and the
+    windows span less than one KV tile up to the whole context.
     """
-    ctx, window, B, Sq, D = 2048, 256, 1, 4, 64
+    ctx, B, D = 2048, 1, 64
     q, k, v, block_table, seqlen_k = _paged_inputs(B, Sq, ctx, D)
     got = flydsl_flash_attn_func(
         q,
@@ -439,10 +443,41 @@ def test_paged_window_matches_reference(num_kv_splits):
     torch.testing.assert_close(got[0].float(), ref, atol=2e-2, rtol=2e-2)
 
 
-def test_paged_window_declines_gqa_packing(monkeypatch):
-    """Packing rewrites Sq, so the window's per-row bound would stop meaning
-    query position. A windowed shape must therefore decline it and still reach
-    the light kernel, carrying the window with it."""
+def test_paged_window_splits_bounded():
+    """Windowed sizing splits by grid, never past the reachable KV tiles, and
+    stays a power of two (the split count is compiled in)."""
+    for B, rows, reach in ((1, 8, 2049), (64, 32, 2052), (4, 128, 17), (16, 8, 300)):
+        s = fai._paged_window_num_kv_splits(B, HKV, rows, reach, 128)
+        assert s & (s - 1) == 0
+        assert s <= max(1, math.ceil(reach / fai._PAGED_BLOCK_N_OUT))
+        assert s <= fai._PAGED_WINDOW_MAX_SPLITS
+
+
+def test_paged_window_long_context_matches_reference():
+    """A window over a context past one split's block-table window (2048 pages)
+    still needs enough splits for the pages, even though it reads few keys."""
+    ctx, window, D = 262144, 2048, 64
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, 1, ctx, D)
+    got = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=0,
+        max_seqlen_kv=ctx,
+        window_left=window,
+    )
+    ref = _windowed_reference(q, k, v, ctx, window, HKV)
+    torch.testing.assert_close(got[0].float(), ref, atol=2e-2, rtol=2e-2)
+
+
+def test_paged_window_keeps_gqa_packing(monkeypatch):
+    """A causal window stays on the light kernel under GQA packing: the packed
+    rows carry their query position, so the window bound still applies per row."""
 
     seen = []
     real = fai._build_paged_light
@@ -469,7 +504,7 @@ def test_paged_window_declines_gqa_packing(monkeypatch):
         window_left=255,
     )
     assert seen[-1]["window_left"] == 255, "window must reach the light builder"
-    assert seen[-1]["q_pack_qlen"] == 0, "packing must decline a windowed shape"
+    assert seen[-1]["q_pack_qlen"] == 4, "causal windowed shapes should pack"
 
 
 @pytest.mark.parametrize(

@@ -868,6 +868,30 @@ def _paged_num_kv_splits(
     return pow2
 
 
+# Windowed paged split-K sizing. A window bounds the KV walk to a short range,
+# so chain length stops being the constraint and the fixed per-split cost
+# dominates; size by grid instead, aiming for about _PAGED_WINDOW_TARGET_WG
+# workgroups in total.
+_PAGED_WINDOW_TARGET_WG = 1024
+_PAGED_WINDOW_MIN_SPLITS = 2
+_PAGED_WINDOW_MAX_SPLITS = 32
+
+
+def _paged_window_num_kv_splits(
+    num_batches: int, num_heads: int, seqlen_q: int, reach: int, head_dim: int
+) -> int:
+    """KV splits for a windowed paged call that can see `reach` keys."""
+    if _PAGED_FORCE_SPLITS > 0:
+        return _PAGED_FORCE_SPLITS
+    kv_tiles = -(-max(reach, 1) // _PAGED_BLOCK_N_OUT)
+    units = num_batches * num_heads * -(-max(seqlen_q, 1) // 64)
+    per_split_elems = num_batches * num_heads * max(seqlen_q, 1) * (head_dim // 2 + 2)
+    affordable = _PAGED_WS_BUDGET_MB * 1024 * 1024 // 4 // max(per_split_elems, 1)
+    splits = max(_PAGED_WINDOW_TARGET_WG // max(units, 1), _PAGED_WINDOW_MIN_SPLITS)
+    splits = max(1, min(splits, _PAGED_WINDOW_MAX_SPLITS, kv_tiles, affordable))
+    return 1 << (splits.bit_length() - 1)
+
+
 def _flydsl_flash_attn_paged(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -991,11 +1015,13 @@ def _flydsl_flash_attn_paged(
     # the row index. Without that trait this is only expressible at q_len == 1.
     #
     # A sliding window is only expressible on the generic (light) paged kernel,
-    # whose N32 mask path carries WINDOW_LEFT. Every other paged route -- MTP
-    # two-pass, GQA head packing, the head-packed decode kernel, dualwave --
-    # either masks by its own rules or rewrites the KV range, and would drop the
-    # window *silently* rather than failing. Each of those gates gets
-    # `not _paged_window`; `_paged_light_ok` is forced True below.
+    # whose N32 mask path carries WINDOW_LEFT. GQA packing stays on that kernel
+    # and its window bound uses the same per-row position t as the causal bound,
+    # so causal windowed shapes may pack. Every other paged route -- MTP
+    # two-pass, the head-packed decode kernel, dualwave -- either masks by its
+    # own rules or rewrites the KV range, and would drop the window *silently*
+    # rather than failing. Each of those gates gets `not _paged_window`;
+    # `_paged_light_ok` is forced True below.
     _paged_window = window_left >= 0
 
     # Resolve the KV head count before any route that keys on it (GQA packing
@@ -1012,9 +1038,9 @@ def _flydsl_flash_attn_paged(
     _gqa_stride_packed = False
     if (
         _PAGED_GQA_PACK
-        # Packing folds heads onto M and rewrites Sq, so the per-row causal
-        # bound the window is measured against no longer means query position.
-        and not _paged_window
+        # The kernel applies the window only under its causal mask, where packed
+        # rows carry their query position (Q_PACK_QLEN); keep non-causal off.
+        and (causal or not _paged_window)
         and not return_lse
         and kv_seqstart is None
         and 1 <= Sq <= 64
@@ -1213,7 +1239,20 @@ def _flydsl_flash_attn_paged(
         _kv_tiles = (
             int(max_seqlen_kv) if max_seqlen_kv is not None else int(seqlen_k.max())
         )
-        num_kv_splits = _paged_num_kv_splits(B, H, Sq, _kv_tiles, D)
+        if _paged_window:
+            # The kernel only walks the keys the window can reach and splits
+            # that range, so size by it rather than by the whole context. The
+            # block-table window still spans the whole context, so keep at
+            # least enough splits for its pages.
+            _q_len = _gqa_qlen if _gqa_packed else Sq
+            _reach = min(_kv_tiles, int(window_left) + _q_len)
+            _pages = -(-_kv_tiles // page_size)
+            _floor = -(-_pages // _PAGED_BT_LDS_SIZE)
+            num_kv_splits = _paged_window_num_kv_splits(B, H, Sq, _reach, D)
+            if num_kv_splits < _floor:
+                num_kv_splits = 1 << (_floor - 1).bit_length()
+        else:
+            num_kv_splits = _paged_num_kv_splits(B, H, Sq, _kv_tiles, D)
         _auto_sized = True
 
     splitk = num_kv_splits > 1
