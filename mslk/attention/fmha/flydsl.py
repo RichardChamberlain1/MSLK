@@ -204,12 +204,15 @@ def _paged_launch_tensors(bias, device, sub):
     capturing = torch.cuda.is_current_stream_capturing()
     block_tables = bias.block_tables
     seqlen = bias.k_seqinfo.seqlen
+    qseqstart = bias.q_seqinfo.seqstart
     key = (
         block_tables.data_ptr(),
         block_tables._version,
         tuple(block_tables.shape),
         seqlen.data_ptr(),
         seqlen._version,
+        qseqstart.data_ptr(),
+        qseqstart._version,
         int(sub),
         str(device),
     )
@@ -227,7 +230,7 @@ def _paged_launch_tensors(bias, device, sub):
             bt.unsqueeze(-1) * sub + torch.arange(sub, dtype=torch.int32, device=device)
         ).reshape(bt.shape[0], bt.shape[1] * sub)
     bt = bt.contiguous()
-    value = (bt, kseq, seqlen_k, bias.q_seqinfo.seqstart.to(device))
+    value = (bt, kseq, seqlen_k, qseqstart.to(device))
     if capturing:
         return value
     try:

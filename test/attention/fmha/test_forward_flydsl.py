@@ -110,3 +110,27 @@ def test_paged_cuda_graph_sees_updated_seqlens():
         q, k, v, attn_bias=paged_mask([ctx, 300]), op=flydsl.FwOp
     )
     torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+@rocm_only
+def test_paged_launch_cache_tracks_q_seqstart():
+    """The memoised launch metadata includes the Q seqstart, so an in-place
+    update of it must invalidate the cache like the other mask tensors do."""
+    import torch
+    from mslk.attention.fmha import attn_bias as ab
+
+    B, ctx, page = 2, 256, 64
+    # A CPU mask makes the cached seqstart a copy rather than an alias.
+    mask = ab.BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
+        q_seqlen=[1] * B, kv_padding=ctx, kv_seqlen=[ctx] * B, device="cpu"
+    )
+    block_tables = torch.arange(B * ctx // page, device="cuda", dtype=torch.int32)
+    bias = mask.make_paged(
+        block_tables.view(B, -1),
+        page,
+        ab.PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
+    )
+    first = flydsl._paged_launch_tensors(bias, torch.device("cuda"), 1)[3].clone()
+    bias.q_seqinfo.seqstart.add_(1)
+    second = flydsl._paged_launch_tensors(bias, torch.device("cuda"), 1)[3]
+    torch.testing.assert_close(second.cpu(), first.cpu() + 1)
