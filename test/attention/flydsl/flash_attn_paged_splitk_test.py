@@ -185,7 +185,6 @@ def _count_hp_calls(monkeypatch):
     pin -- so they select it explicitly rather than depending on which
     mechanism happens to win.
     """
-    from mslk.attention.flydsl import flash_attn_interface as fai
     from mslk.attention.flydsl.decode import pa_decode_dense
 
     monkeypatch.setattr(fai, "_PAGED_GQA_PACK", False)
@@ -370,7 +369,6 @@ def test_paged_window_declines_gqa_packing(monkeypatch):
     """Packing rewrites Sq, so the window's per-row bound would stop meaning
     query position. A windowed shape must therefore decline it and still reach
     the light kernel, carrying the window with it."""
-    from mslk.attention.flydsl import flash_attn_interface as fai
 
     seen = []
     real = fai._build_paged_light
@@ -461,7 +459,6 @@ def calls_groups(calls):
 
 def test_head_packed_matches_dualwave_at_sq1(monkeypatch):
     """The two kernels must agree; the head-packed one is the faster path."""
-    from mslk.attention.flydsl import flash_attn_interface as fai
 
     args = _paged_inputs(2, 1, 32768, 64)
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
@@ -513,7 +510,6 @@ def test_head_packed_uses_query_groups_when_single_pass_would_spill(monkeypatch)
     Two passes of 8 query tokens need 4 tiles each -- under the budget -- at the
     cost of reading KV twice. Measured 1.9x faster than the path it replaces.
     """
-    from mslk.attention.flydsl import flash_attn_interface as fai
 
     calls = _count_hp_calls(monkeypatch)
     _run(*_paged_inputs(8, 16, 32768, 128), 0)
@@ -523,7 +519,6 @@ def test_head_packed_uses_query_groups_when_single_pass_would_spill(monkeypatch)
 
 def test_query_grouping_kill_switch(monkeypatch):
     """With grouping disabled, a shape that only fits via groups declines."""
-    from mslk.attention.flydsl import flash_attn_interface as fai
 
     monkeypatch.setattr(fai, "_DISABLE_PAGED_QGROUPS", True)
     calls = _count_hp_calls(monkeypatch)
@@ -572,7 +567,6 @@ def test_head_packed_matches_dualwave_multi_token(monkeypatch, Sq, D):
     `min(t_end, t_full - Sq + qtok + 1)` itself, so a wrong bound shows up here
     as a mismatch on the earlier query rows only.
     """
-    from mslk.attention.flydsl import flash_attn_interface as fai
 
     args = _paged_inputs(2, Sq, 32768, D)
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
@@ -608,8 +602,6 @@ def test_head_packed_declined_for_wide_gqa_ratio(monkeypatch):
 
 
 def test_head_packed_kill_switch(monkeypatch):
-    from mslk.attention.flydsl import flash_attn_interface as fai
-
     calls = _count_hp_calls(monkeypatch)
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
     _run(*_paged_inputs(1, 1, 32768, 64), 0)
