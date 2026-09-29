@@ -133,6 +133,18 @@ def test_paged_splits_capped_by_workspace(monkeypatch):
     assert splits == 1 or elems * 4 <= 1024 * 1024
 
 
+def test_paged_splits_are_powers_of_two():
+    """The split count is a compile-time trait; a growing decode context must
+    not walk through a new value (and a new JIT) every few hundred tokens."""
+    seen = set()
+    for ctx in range(1024, 131072, 512):
+        for B, Sq in ((1, 8), (4, 32), (16, 8)):
+            splits = _paged_num_kv_splits(B, HKV, Sq, ctx, 128)
+            assert splits & (splits - 1) == 0, (ctx, B, Sq, splits)
+            seen.add(splits)
+    assert len(seen) <= 8
+
+
 @pytest.mark.parametrize("ctx", [128, 512])
 @pytest.mark.parametrize("Sq,D", [(1, 64), (4, 128)])
 def test_single_split_gqa_packed_matches_reference(ctx, Sq, D):
