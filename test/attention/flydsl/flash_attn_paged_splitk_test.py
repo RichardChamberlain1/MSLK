@@ -666,6 +666,46 @@ def test_head_packed_empty_request(monkeypatch, split_k):
     assert torch.equal(out[1], torch.zeros_like(out[1]))
 
 
+def test_head_packed_cache_over_4gib():
+    """Page offsets must not wrap in 32 bits on a cache larger than 4 GiB.
+
+    MHA with 32 KV heads at D=128 is 512 KiB per page, so page 8192 already
+    sits at 4 GiB. Place the live pages above that and zero the rest, so a
+    wrapped offset reads zeros instead of the request's KV.
+    """
+    hkv, D, ctx = H, 128, 1024
+    n = ctx // PAGE
+    pages = 8400
+    need = 2 * pages * PAGE * hkv * D * 2
+    free, _ = torch.cuda.mem_get_info()
+    if free < need * 1.2:
+        pytest.skip("needs ~9 GiB of free device memory")
+    torch.manual_seed(0)
+    k = torch.zeros(pages, PAGE, hkv, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.zeros_like(k)
+    ids = torch.arange(pages - n, pages, device="cuda", dtype=torch.int32)
+    k[ids.long()] = torch.randn(n, PAGE, hkv, D, device="cuda", dtype=torch.bfloat16)
+    v[ids.long()] = torch.randn(n, PAGE, hkv, D, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(1, 1, H, D, device="cuda", dtype=torch.bfloat16)
+    got = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=hkv,
+        block_table=ids.view(1, n),
+        seqlen_k=torch.tensor([ctx], device="cuda", dtype=torch.int32),
+        kv_cache_layout="linear",
+        num_kv_splits=0,
+        max_seqlen_kv=ctx,
+    )
+    kk = k[ids.long()].reshape(-1, hkv, D).float()
+    vv = v[ids.long()].reshape(-1, hkv, D).float()
+    scores = torch.einsum("hd,khd->hk", q[0, 0].float(), kk) / math.sqrt(D)
+    ref = torch.einsum("hk,khd->hd", scores.softmax(-1), vv)
+    torch.testing.assert_close(got[0, 0].float(), ref, atol=2e-2, rtol=2e-2)
+
+
 def test_head_packed_kill_switch(monkeypatch):
     calls = _count_hp_calls(monkeypatch)
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
