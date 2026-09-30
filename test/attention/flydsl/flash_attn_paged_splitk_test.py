@@ -197,6 +197,60 @@ def test_return_lse_still_works_under_auto():
     assert lse.shape == (1, H, 1)
 
 
+# ── Head-packed paged decode fast path (Sq == 1) ──────────────────────────────
+# The dualwave paged kernel maps the MFMA M-axis to query rows, so at Sq=1 only
+# 1 of 32 rows is real work. `decode/pa_decode_gfx950.py` packs query heads onto
+# M instead; `_flydsl_flash_attn_paged` routes Sq=1 to it. These tests pin the
+# routing conditions and the equivalence of the two kernels.
+
+
+def _count_hp_calls(monkeypatch):
+    """Patch the head-packed launcher to record invocations; returns the log.
+
+    Also disables GQA head packing. Packing removes the same fan-out the
+    head-packed decode kernel was routed here to avoid, covers Sq up to 64
+    rather than the M-tile budget's 4-16, and therefore takes precedence by
+    default (see test_gqa_packing_takes_precedence). The decode kernel remains
+    the route for everything packing declines, and that is what these tests
+    pin -- so they select it explicitly rather than depending on which
+    mechanism happens to win.
+    """
+    from mslk.attention.flydsl.decode import pa_decode_dense
+
+    monkeypatch.setattr(fai, "_PAGED_GQA_PACK", False)
+    calls = []
+    real = pa_decode_dense.pa_decode_paged_launch
+
+    def _spy(*a, **kw):
+        calls.append(kw)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(pa_decode_dense, "pa_decode_paged_launch", _spy)
+    return calls
+
+
+def test_gqa_packing_takes_precedence(monkeypatch):
+    """With both available, GQA packing owns the shape and the decode kernel idles.
+
+    Packing folds query heads into M inside the generic paged kernel, so it
+    fixes the same fan-out with a far wider reach. Measured across the paged
+    decode shapes it is equal at a single query token, within noise at four, and
+    2.8x better for longer query blocks, so it must win wherever it applies.
+    """
+    from mslk.attention.flydsl.decode import pa_decode_dense
+
+    calls = []
+    real = pa_decode_dense.pa_decode_paged_launch
+
+    def _spy(*a, **kw):
+        calls.append(kw)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(pa_decode_dense, "pa_decode_paged_launch", _spy)
+    _run(*_paged_inputs(1, 1, 32768, 64), 0)
+    assert calls == []
+
+
 def test_per_request_seqlen_k_is_honoured():
     """A request shorter than ``max_seqlen_kv`` must not attend to stale cache.
 
@@ -505,3 +559,327 @@ def test_paged_window_still_rejected_for_gappy_kv():
             max_seqlen_kv=ctx,
             window_left=255,
         )
+
+
+def calls_groups(calls):
+    """Query-group count the routing layer asked for on the first call."""
+    return calls[0].get("query_groups", 1)
+
+
+def test_head_packed_matches_dualwave_at_sq1(monkeypatch):
+    """The two kernels must agree; the head-packed one is the faster path."""
+
+    args = _paged_inputs(2, 1, 32768, 64)
+    monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
+    ref = _run(*args, 1)
+    monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", False)
+    got = _run(*args, 0)
+    assert got.shape == ref.shape
+    torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
+
+
+def test_gqa_packing_infers_num_kv_heads(monkeypatch):
+    """Omitting num_kv_heads must not change the route: it is read from K."""
+    seen = []
+    real = fai._build_paged_light
+    monkeypatch.setattr(
+        fai, "_build_paged_light", lambda **kw: (seen.append(kw), real(**kw))[1]
+    )
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, 4, 2048, 64)
+    got = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=0,
+    )
+    assert seen[-1]["q_pack_qlen"] == 4
+    ref = _run(q, k, v, block_table, seqlen_k, 0)
+    torch.testing.assert_close(got, ref, atol=0, rtol=0)
+
+
+def test_head_packed_selected_at_sq1(monkeypatch):
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(1, 1, 32768, 64), 0)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("Sq", [2, 4])
+def test_head_packed_selected_for_short_query_blocks(monkeypatch, Sq):
+    """M holds ratio*Sq pairs over max_m_tiles(D) tiles; Sq=2/4 fit at any D."""
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(1, Sq, 32768, 64), 0)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("Sq", [8, 13, 16])
+def test_head_packed_selected_for_deep_tiling_at_d64(monkeypatch, Sq):
+    """D=64 is measured clean to 8 M-tiles, so Sq up to 16 is in range."""
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(8, Sq, 32768, 64), 0)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("Sq", [13, 15])
+def test_head_packed_declined_when_d128_would_spill(monkeypatch, Sq):
+    """D=128 spills past 6 M-tiles (measured 280B at 7, 916B at 8).
+
+    Spilling a bandwidth-bound decode kernel is self-defeating, so these fall
+    through to the existing path. 13 and 15 are odd, so equal-span query
+    grouping cannot rescue them either -- see the Sq=16 case below.
+    """
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(8, Sq, 32768, 128), 0)
+    assert calls == []
+
+
+def test_head_packed_uses_query_groups_when_single_pass_would_spill(monkeypatch):
+    """D=128 / Sq=16 needs 8 tiles in one pass, which spills.
+
+    Two passes of 8 query tokens need 4 tiles each -- under the budget -- at the
+    cost of reading KV twice. Measured 1.9x faster than the path it replaces.
+    """
+
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(8, 16, 32768, 128), 0)
+    assert len(calls) == 1
+    assert calls_groups(calls) == 2
+
+
+def test_query_grouping_kill_switch(monkeypatch):
+    """With grouping disabled, a shape that only fits via groups declines."""
+
+    monkeypatch.setattr(fai, "_DISABLE_PAGED_QGROUPS", True)
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(8, 16, 32768, 128), 0)
+    assert calls == []
+
+
+def test_query_grouping_not_used_when_single_pass_fits(monkeypatch):
+    """Grouping is only for rescuing shapes the register budget would reject.
+
+    D=64 fits Sq=16 in one pass, and grouping there measured inside run-to-run
+    noise, so the extra KV pass must not be spent.
+    """
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(8, 16, 32768, 64), 0)
+    assert len(calls) == 1
+    assert calls_groups(calls) == 1
+
+
+def test_head_packed_declined_when_too_few_ctas(monkeypatch):
+    """Deep tiling costs occupancy, so it needs enough CTAs to stay resident.
+
+    One CTA per CU measured 0.74x the path it replaced; the floor rejects it.
+    """
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(1, 16, 32000, 64), 0)  # 8 tiles, batch 1 -> ~1 CTA/CU
+    assert calls == []
+
+
+def test_head_packed_floor_does_not_reject_shallow_tiling(monkeypatch):
+    """The CTA floor applies to deep tiling only.
+
+    Sq=4 is two tiles and still holds 6 waves/SIMD; it was measured winning at
+    batch 1, so the floor must not take it away.
+    """
+    calls = _count_hp_calls(monkeypatch)
+    _run(*_paged_inputs(1, 4, 32000, 64), 0)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("Sq,D", [(2, 64), (4, 64), (4, 128)])
+def test_head_packed_matches_dualwave_multi_token(monkeypatch, Sq, D):
+    """Packed (qtok, head) rows must agree with the dualwave path.
+
+    This is the check on the per-query-token causal bound: the kernel applies
+    `min(t_end, t_full - Sq + qtok + 1)` itself, so a wrong bound shows up here
+    as a mismatch on the earlier query rows only.
+    """
+
+    args = _paged_inputs(2, Sq, 32768, D)
+    monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
+    ref = _run(*args, 1)
+    monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", False)
+    got = _run(*args, 0)
+    assert got.shape == ref.shape == (2, Sq, H, D)
+    torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
+
+
+def test_head_packed_declined_for_wide_gqa_ratio(monkeypatch):
+    """ratio = H // HKV must be <= MFMA_M (16); here it is 32."""
+    calls = _count_hp_calls(monkeypatch)
+    ctx, D, pages = 32768, 64, 32768 // PAGE
+    torch.manual_seed(0)
+    q = torch.randn(1, 1, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(pages, PAGE, 1, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    bt = torch.arange(pages, device="cuda", dtype=torch.int32).view(1, pages)
+    sk = torch.full((1,), ctx, device="cuda", dtype=torch.int32)
+    flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=1,
+        block_table=bt,
+        seqlen_k=sk,
+        kv_cache_layout="linear",
+        num_kv_splits=0,
+    )
+    assert calls == []
+
+
+def test_head_packed_declined_for_non_causal_multi_token(monkeypatch):
+    """The decode kernel always masks causally, so Sq > 1 non-causal must not
+    reach it; Sq=1 is unaffected by the mask and still may."""
+    calls = _count_hp_calls(monkeypatch)
+    q, k, v, block_table, seqlen_k = _paged_inputs(2, 4, 4096, 128)
+    kw = dict(
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=0,
+    )
+    flydsl_flash_attn_func(q, k, v, causal=False, **kw)
+    assert calls == []
+    flydsl_flash_attn_func(q[:, :1].contiguous(), k, v, causal=False, **kw)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("split_k", [1, 0])
+def test_head_packed_non_contiguous_q(monkeypatch, split_k):
+    """A Q sliced out of a fused QKV must not change the answer.
+
+    The single-split epilogue addresses the output with Q's strides.
+    """
+    from mslk.attention.flydsl.decode import pa_decode_dense
+
+    if split_k:
+        monkeypatch.setattr(pa_decode_dense, "auto_split_k_hp", lambda *a: split_k)
+    calls = _count_hp_calls(monkeypatch)
+    B, Sq, ctx, D = 8, 2, 1024, 64
+    _, k, v, block_table, seqlen_k = _paged_inputs(B, Sq, ctx, D)
+    qkv = torch.randn(B, Sq, H + 2 * HKV, D, device="cuda", dtype=torch.bfloat16)
+    q = qkv[:, :, :H]
+    got = _run(q, k, v, block_table, seqlen_k, 0)
+    ref = _run(q.contiguous(), k, v, block_table, seqlen_k, 0)
+    assert len(calls) == 2
+    torch.testing.assert_close(got, ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("split_k", [1, 0])
+def test_head_packed_empty_request(monkeypatch, split_k):
+    """seqlen_k == 0 (e.g. batch padding) attends to nothing, not to kv_max."""
+    from mslk.attention.flydsl.decode import pa_decode_dense
+
+    if split_k:
+        monkeypatch.setattr(pa_decode_dense, "auto_split_k_hp", lambda *a: split_k)
+    calls = _count_hp_calls(monkeypatch)
+    q, k, v, block_table, _ = _paged_inputs(2, 1, 4096, 64)
+    seqlen_k = torch.tensor([4096, 0], device="cuda", dtype=torch.int32)
+    out = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=0,
+        max_seqlen_kv=4096,
+    )
+    assert len(calls) == 1
+    assert torch.equal(out[1], torch.zeros_like(out[1]))
+
+
+def test_head_packed_cache_over_4gib(monkeypatch):
+    """Page offsets must not wrap in 32 bits on a cache larger than 4 GiB.
+
+    MHA with 32 KV heads at D=128 is 512 KiB per page, so page 8192 already
+    sits at 4 GiB. Place the live pages above that and zero the rest, so a
+    wrapped offset reads zeros instead of the request's KV.
+    """
+    hkv, D, ctx = H, 128, 1024
+    n = ctx // PAGE
+    pages = 8400
+    need = 2 * pages * PAGE * hkv * D * 2
+    free, _ = torch.cuda.mem_get_info()
+    if free < need * 1.2:
+        pytest.skip("needs ~9 GiB of free device memory")
+    # MHA declines GQA packing, so this must reach the head-packed kernel; the
+    # light kernel already addresses pages in 64 bits and would not test it.
+    calls = _count_hp_calls(monkeypatch)
+    torch.manual_seed(0)
+    k = torch.zeros(pages, PAGE, hkv, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.zeros_like(k)
+    ids = torch.arange(pages - n, pages, device="cuda", dtype=torch.int32)
+    k[ids.long()] = torch.randn(n, PAGE, hkv, D, device="cuda", dtype=torch.bfloat16)
+    v[ids.long()] = torch.randn(n, PAGE, hkv, D, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(1, 1, H, D, device="cuda", dtype=torch.bfloat16)
+    got = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=hkv,
+        block_table=ids.view(1, n),
+        seqlen_k=torch.tensor([ctx], device="cuda", dtype=torch.int32),
+        kv_cache_layout="linear",
+        num_kv_splits=0,
+        max_seqlen_kv=ctx,
+    )
+    assert len(calls) == 1
+    kk = k[ids.long()].reshape(-1, hkv, D).float()
+    vv = v[ids.long()].reshape(-1, hkv, D).float()
+    scores = torch.einsum("hd,khd->hk", q[0, 0].float(), kk) / math.sqrt(D)
+    ref = torch.einsum("hk,khd->hd", scores.softmax(-1), vv)
+    torch.testing.assert_close(got[0, 0].float(), ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("ratio", [3, 6])
+def test_dense_decode_head_packed_non_dividing_ratio(monkeypatch, ratio):
+    """A single query token fits any GQA ratio <= 16 heads-only, so dense
+    decode must not fall back to the generic kernel for ratios like 3 or 6."""
+    from mslk.attention.flydsl.decode import pa_decode_generic
+    from mslk.attention.flydsl.decode.pa_decode_gfx950 import pa_decode_gfx950_launch
+
+    def _no_fallback(*a, **kw):
+        raise AssertionError("fell back to pa_decode_generic")
+
+    monkeypatch.setattr(pa_decode_generic, "pa_decode_generic_launch", _no_fallback)
+    B, ctx, hkv, D = 2, 1024, 4, 128
+    torch.manual_seed(0)
+    q = torch.randn(B, 1, 1, hkv * ratio, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, ctx, 1, hkv, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    got = pa_decode_gfx950_launch(q, k, v, None, D**-0.5, 0, torch.bfloat16)
+    kk = k[:, :, 0].float().repeat_interleave(ratio, 2)
+    vv = v[:, :, 0].float().repeat_interleave(ratio, 2)
+    scores = torch.einsum("bhd,bkhd->bhk", q[:, 0, 0].float(), kk) * D**-0.5
+    ref = torch.einsum("bhk,bkhd->bhd", scores.softmax(-1), vv)
+    torch.testing.assert_close(got[:, 0, 0].float(), ref, atol=2e-2, rtol=2e-2)
+
+
+def test_head_packed_kill_switch(monkeypatch):
+    calls = _count_hp_calls(monkeypatch)
+    monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
+    _run(*_paged_inputs(1, 1, 32768, 64), 0)
+    assert calls == []
+
+
+def test_head_packed_exceeds_dualwave_page_table_cap():
+    """The dualwave path caps at 2048 pages/split (131072 tokens at page 64).
+
+    The decode kernel reads the block table straight from memory, so it has no
+    such window -- this context would raise on the old path.
+    """
+    ctx = 262144
+    out = _run(*_paged_inputs(1, 1, ctx, 64), 0)
+    assert out.shape == (1, 1, H, 64)
+    assert torch.isfinite(out).all()

@@ -458,6 +458,121 @@ def _build_paged(
 _PAGED_PAGE_SIZE = 64
 _PAGED_BT_LDS_SIZE = 2048
 
+# Streaming tile of the head-packed decode kernel (TILE_N in decode/pa_decode_gfx950.py).
+# A page must be a whole number of tiles so a tile never straddles two pages.
+_PAGED_DECODE_TILE_N = 32
+
+# Kill-switch for routing paged Sq=1 decode to the head-packed decode kernel
+# (`decode/pa_decode_gfx950.py`). Set to fall back to the dualwave paged path,
+# for A/B measurement and for bisecting regressions.
+_DISABLE_PAGED_DECODE_HP: bool = (
+    os.environ.get("MSLK_DISABLE_PAGED_DECODE_HP", "0") != "0"
+)
+
+# The head-packed decode kernel maps the MFMA M-axis to (query-token, head) pairs,
+# so it needs `ratio` to divide MFMA_M and `ratio * Sq` to fit the M-tile budget.
+# Mirrors MFMA_M / MAX_M_TILES_BY_HEAD_DIM in decode/pa_decode_gfx950.py.
+_HP_MFMA_M = 16
+
+# One CTA is one wave here, so CTA count is the wave count. Below this the kernel
+# cannot hide memory latency: more M-tiles cost occupancy (9 waves/SIMD at 1 tile
+# down to 2 at 8), and with too few CTAs there is nothing else resident to cover
+# the stall. Measured on a deeply-tiled block: 1.0 CTA/CU ran 0.74x the path it
+# replaced, while every shape at >= 4.0 CTA/CU won (1.27x-3.23x).
+_HP_MIN_CTAS_PER_CU = 2
+
+# Tile count at which the occupancy cost becomes worth guarding. Measured
+# waves/SIMD at the smaller head dim: 9 at one tile, 6 at two, then 4 and below.
+# Shallow tiling keeps enough waves resident to hide latency on its own, and
+# short query blocks were measured winning even at a single request (1.45x), so
+# the floor must not reject them.
+_HP_FLOOR_MIN_TILES = 3
+
+# Query groups to use when one pass would exceed the register budget. Measured
+# where a single pass would spill: G=2 is 1.92x-1.97x over single-pass, G=4 is
+# slower than G=2 in 9 of 10 shapes (the extra launches cost more than the
+# occupancy they buy), so there is no reason to go beyond 2.
+_HP_QUERY_GROUPS = 2
+
+# Kill-switch for query grouping, mirroring MSLK_DISABLE_PAGED_DECODE_HP. With
+# this set, shapes that only fit via grouping decline to the dualwave path as
+# they did before.
+_DISABLE_PAGED_QGROUPS: bool = os.environ.get("MSLK_DISABLE_PAGED_QGROUPS", "0") != "0"
+
+
+def _hp_decode_ok(
+    num_heads: int,
+    num_kv_heads: int,
+    seqlen_q: int,
+    head_dim: int,
+    num_batches: int,
+    max_kv_pages: int,
+    device,
+) -> int:
+    """How should this shape run on the head-packed decode kernel?
+
+    Returns the number of query groups to split the block into, or 0 to decline.
+    1 is the ordinary single pass.
+
+    Three derived gates -- no tuned table:
+
+    1. **Register budget.** `ratio * Sq` pairs must fit in `MFMA_M` slots across
+       at most `max_m_tiles(head_dim)` tiles, the measured point before the
+       compiler spills.
+    2. **Query grouping.** A block too deep for that budget can instead be run as
+       `_HP_QUERY_GROUPS` shallower passes (see `query_group_seqlen`). Costs one
+       extra KV pass per group but avoids the spill, measured 1.5x-2.0x where a
+       single pass would spill. Only used to rescue a shape the budget would
+       reject: where single-pass already fits, it was inside run-to-run noise
+       (1.03x-1.28x) and is not worth the extra traffic.
+    3. **Parallelism floor.** The resulting CTA count must reach
+       `_HP_MIN_CTAS_PER_CU * CUs`. More tiles buy fewer KV passes but cost
+       occupancy, and that trade only pays when enough CTAs are resident.
+    """
+    from .decode.pa_decode_dense import auto_split_k_hp
+    from .decode.pa_decode_gfx950 import max_m_tiles
+
+    if _DISABLE_PAGED_QGROUPS:
+        groups_allowed = 1
+    else:
+        groups_allowed = _HP_QUERY_GROUPS
+
+    if num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
+        return 0
+    ratio = num_heads // num_kv_heads
+    if not (1 <= ratio <= _HP_MFMA_M) or _HP_MFMA_M % ratio != 0:
+        return 0
+    t_pack = _HP_MFMA_M // ratio  # query tokens per M-tile
+    budget = t_pack * max_m_tiles(head_dim)
+
+    groups = 1
+    if seqlen_q > budget:
+        # Too deep for one pass: can grouping bring it under the budget?
+        if (
+            groups_allowed > 1
+            and seqlen_q % groups_allowed == 0
+            and seqlen_q // groups_allowed <= budget
+        ):
+            groups = groups_allowed
+        else:
+            return 0
+    if seqlen_q < 1:
+        return 0
+
+    # Only deep tiling trades enough occupancy away to need the floor; shallow
+    # tiling still leaves 6+ waves/SIMD resident. Grouping makes each pass
+    # shallower, so the depth that matters is the per-group one.
+    tiles = -(-(seqlen_q // groups) // t_pack)
+    if tiles < _HP_FLOOR_MIN_TILES:
+        return groups
+    num_cu = _dense_light_cu(device)
+    split_k = auto_split_k_hp(
+        num_batches, 1, num_heads, num_kv_heads, max_kv_pages * _PAGED_PAGE_SIZE
+    )
+    ctas = num_batches * num_kv_heads * split_k
+    return groups if ctas >= _HP_MIN_CTAS_PER_CU * num_cu else 0
+
+
 # Paged split-K sizing. `_num_kv_splits_heuristic` (CK's) stops as soon as the
 # workgroup count covers the CUs once, because it assumes a workgroup that has
 # started is a workgroup making progress. That does not hold for the paged light
@@ -909,6 +1024,7 @@ def _flydsl_flash_attn_paged(
     # is. Splitting shortens that chain, which is the entire lever on these shapes.
     # No caller sizes num_kv_splits for paged, so do it here, treating the
     # historical default of 1 the same as the 0 sentinel.
+    _auto_sized = False
     if (
         num_kv_splits <= 1
         and _paged_light_ok
@@ -933,6 +1049,7 @@ def _flydsl_flash_attn_paged(
                 num_kv_splits = 1 << (_floor - 1).bit_length()
         else:
             num_kv_splits = _paged_num_kv_splits(B, H, Sq, _kv_tiles, D)
+        _auto_sized = True
 
     splitk = num_kv_splits > 1
     if splitk and not _splitk_dtype_ok:
@@ -955,6 +1072,75 @@ def _flydsl_flash_attn_paged(
         int(max_seqlen_kv) if max_seqlen_kv is not None else int(seqlen_k.max().item())
     )
     max_kv_pages = (skv + page_size - 1) // page_size
+
+    # ── Paged decode fast path (short query blocks) ───────────────────────────
+    # The dualwave kernel below maps the MFMA M-axis to query *rows*, so at Sq=1
+    # only 1 of 32 M-rows carries work: measured on MI350X it issues 64x the MFMA
+    # instructions of an equivalent head-packed kernel for the same maths, and
+    # spends ~50% of its stall cycles on the barriers needed to assemble a tile
+    # that is 31/32 padding. `decode/pa_decode_gfx950.py` packs (query-token,
+    # head) pairs onto M instead, so the matrix core stays full.
+    #
+    # `_hp_decode_ok` bounds that: M holds `ratio * Sq` pairs across at most
+    # `max_m_tiles(D)` tiles (8 at D=64, 6 at D=128), so at GQA ratio 8 this
+    # covers Sq <= 16 and Sq <= 12, or more with query groups. Longer query
+    # blocks keep the dualwave path.
+    #
+    # Everything else excluded here also keeps the dualwave path: varlen and
+    # gappy have no decode kernel, `return_lse` is not exposed by it, and the
+    # vectorized cache layout is a different memory format.
+    #
+    # The decode kernel always applies the bottom-right causal bound per query
+    # token (query i attends to [0, seqlen_kv - Sq + i + 1)). That degenerates
+    # to the full range at Sq=1, so only Sq=1 may take this route non-causally.
+    _hp_groups = 0
+    if (
+        not _DISABLE_PAGED_DECODE_HP
+        # pa_decode_gfx950 applies its own bottom-right causal bound and has no
+        # window term, so it would silently ignore one.
+        and not _paged_window
+        and (causal or Sq == 1)
+        # The GQA head-packing above removes the same fan-out this kernel was
+        # routed here to avoid, and covers Sq up to 64 rather than the M-tile
+        # budget's 4-16. When it fires it has already reshaped q, so this path
+        # must not also run. It stays as the route for shapes that packing
+        # declines (FLYDSL_PAGED_GQA_PACK=0, Sq>64, non-causal multi-token, MHA).
+        and not _gqa_packed
+        and not varlen
+        and kv_seqstart is None
+        and not return_lse
+        and not vectorized
+        and D in (64, 128)
+        and dtype_str in ("bf16", "f16")
+        and page_size % _PAGED_DECODE_TILE_N == 0
+        and _gpu_arch(q.device).startswith("gfx950")
+    ):
+        # 0 declines; otherwise the number of query groups to cover Sq with.
+        _hp_groups = _hp_decode_ok(H, num_kv_heads, Sq, D, B, max_kv_pages, q.device)
+    if _hp_groups:
+        from .decode.pa_decode_dense import pa_decode_paged_launch
+
+        # Kernel Q layout is [B, Sq, G, H_q, D]; the paged ABI has no G axis (G=1).
+        hp_out = pa_decode_paged_launch(
+            q.view(B, Sq, 1, H, D),
+            k,
+            v,
+            block_table,
+            seqlen_k,
+            float(sm_scale) if sm_scale is not None else float(D**-0.5),
+            page_size=page_size,
+            max_seqlen_kv=skv,
+            # A count sized for the light kernel's chain means nothing to this
+            # kernel (and need not be a compiled power of two); let it pick.
+            split_k=0 if _auto_sized else num_kv_splits,
+            output_dtype=q.dtype,
+            query_groups=_hp_groups,
+        ).view(B, Sq, H, D)
+        if out is not None:
+            out.copy_(hp_out)
+            return out
+        return hp_out
+
     # Split-K (paged, dense only): split the KV dimension across grid_z = B*num_kv_splits
     # workgroups + a combine pass. Fills the GPU for low-occupancy shapes (small B / few
     # heads), where single-split paged underutilizes the device.
