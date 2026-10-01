@@ -652,7 +652,12 @@ def build_flash_attn_func_module_primary(
                     )
                 else:
                     p_packs_lo = softmax_helper.build_p_packs(p_vals_lo)
-                    p_packs_hi = softmax_helper.build_p_packs(p_vals_hi)
+                    # Wave-split-K leaves the hi half to the other wave.
+                    p_packs_hi = (
+                        None
+                        if const_expr(traits.ENABLE_WAVE_SPLITK)
+                        else softmax_helper.build_p_packs(p_vals_hi)
+                    )
                     o_accs = gemm_helper.gemm2_pv(
                         kv_lds_to_vgpr, o_accs, p_packs_lo, p_packs_hi, v_base, corr_vec
                     )
@@ -673,6 +678,9 @@ def build_flash_attn_func_module_primary(
 
         # ---- Store O ----
         if const_expr(traits.SPLITK):
+            # Fold the waves' KV halves into one (m, l, acc) before storing.
+            if const_expr(traits.ENABLE_WAVE_SPLITK):
+                loop_results = softmax_helper.merge_wave_splitk(loop_results)
             # Split-K writes an unnormalized-then-reweighted partial to the workspace;
             # the combine kernel merges splits into the final O + LSE.
             store_helper.store_splitk_partial(loop_results, ctx.q_row)
