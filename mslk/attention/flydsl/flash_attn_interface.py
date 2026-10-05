@@ -604,6 +604,18 @@ _PAGED_FORCE_SPLITS = int(os.getenv("FLYDSL_PAGED_FORCE_SPLITS", "0"))
 # _flydsl_flash_attn_paged). Set to 0 to fall back to one workgroup per query head.
 _PAGED_GQA_STRIDE = os.getenv("FLYDSL_PAGED_GQA_STRIDE", "1") == "1"
 _PAGED_GQA_PACK = os.getenv("FLYDSL_PAGED_GQA_PACK", "1") == "1"
+
+
+# Concurrency at which wave-split-K becomes worthwhile below
+# FLYDSL_WAVE_SPLITK_MIN_D. The trait builder cannot see batch and num_kv_splits
+# does not stand in for it -- the batches that win and the batches that lose
+# share a split count -- so the decision is made here and passed through as a
+# single bool. A bool rather than the batch itself because the builders are
+# lru_cached on their arguments: one more distinct value forks the cache, and
+# only the answer matters. Below the cutoff the transform costs more than it
+# saves -- steeply so at long context -- so the floor is not a rounding
+# choice. 0 disables it entirely, leaving the head-dim bound alone.
+_WAVE_SPLITK_MIN_BATCH = int(os.getenv("FLYDSL_WAVE_SPLITK_MIN_BATCH", "8"))
 _PAGED_LIGHT_BLOCK_M = int(os.getenv("FLYDSL_PAGED_BLOCK_M", "64"))
 
 
@@ -1219,6 +1231,12 @@ def _flydsl_flash_attn_paged(
                 num_kv_splits=int(num_kv_splits),
                 q_pack_qlen=_gqa_qlen if (_gqa_packed and causal) else 0,
                 q_pack_group=_gqa_group if _gqa_stride_packed else 0,
+                # Resolved here because the builder cannot see batch. Passed as
+                # a bool, not B, so the lru_cache forks once rather than per
+                # distinct batch; 0 disables, keeping the head-dim bound alone.
+                high_concurrency=(
+                    _WAVE_SPLITK_MIN_BATCH > 0 and B >= _WAVE_SPLITK_MIN_BATCH
+                ),
                 kv_lens=_dense_kv_lens,
                 # Packing multiplies the M rows by the GQA group size. Rows that
                 # overflow BLOCK_M spill into a second Q tile, and each tile
@@ -1335,6 +1353,7 @@ def _build_paged_light(
     kv_lens: bool = False,
     block_m: int = 0,
     window_left: int = -1,
+    high_concurrency: bool = False,
 ):
     """Build a lightweight paged-varlen launcher for short attention.
 
@@ -1368,6 +1387,7 @@ def _build_paged_light(
         num_kv_splits=num_kv_splits,
         q_pack_qlen=q_pack_qlen,
         q_pack_group=q_pack_group,
+        high_concurrency=high_concurrency,
         kv_lens=kv_lens,
     )
 

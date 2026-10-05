@@ -86,6 +86,7 @@ def build_flash_attn_func_module_primary(
     q_pack_qlen=0,
     q_pack_group=0,
     kv_lens=False,
+    high_concurrency=False,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
@@ -270,6 +271,7 @@ def build_flash_attn_func_module_primary(
         q_pack_qlen=q_pack_qlen,
         q_pack_group=q_pack_group,
         kv_lens=kv_lens,
+        high_concurrency=high_concurrency,
     )
     _flash_attn_generic_cache_tag = traits.cache_tag
 
@@ -652,7 +654,12 @@ def build_flash_attn_func_module_primary(
                     )
                 else:
                     p_packs_lo = softmax_helper.build_p_packs(p_vals_lo)
-                    p_packs_hi = softmax_helper.build_p_packs(p_vals_hi)
+                    # Wave-split-K leaves the hi half to the other wave.
+                    p_packs_hi = (
+                        None
+                        if const_expr(traits.ENABLE_WAVE_SPLITK)
+                        else softmax_helper.build_p_packs(p_vals_hi)
+                    )
                     o_accs = gemm_helper.gemm2_pv(
                         kv_lds_to_vgpr, o_accs, p_packs_lo, p_packs_hi, v_base, corr_vec
                     )
@@ -673,6 +680,9 @@ def build_flash_attn_func_module_primary(
 
         # ---- Store O ----
         if const_expr(traits.SPLITK):
+            # Fold the waves' KV halves into one (m, l, acc) before storing.
+            if const_expr(traits.ENABLE_WAVE_SPLITK):
+                loop_results = softmax_helper.merge_wave_splitk(loop_results)
             # Split-K writes an unnormalized-then-reweighted partial to the workspace;
             # the combine kernel merges splits into the final O + LSE.
             store_helper.store_splitk_partial(loop_results, ctx.q_row)
@@ -683,8 +693,13 @@ def build_flash_attn_func_module_primary(
     # Split-K combine: merge per-split partials into final O + LSE. The generic O
     # register/pack layout matches the dualwave path, so the shared combine kernel
     # reads the workspace verbatim.
-    # Threads per combine block; a block is the unit of CU assignment.
-    COMBINE_BLOCK = int(os.getenv("FLYDSL_COMBINE_BLOCK", "256"))
+    # Threads per combine block; a block is the unit of CU assignment, so this
+    # sets how many workgroups the combine launches. One wave per block spreads
+    # a given thread count over the most CUs. Wider blocks do not win it back:
+    # the combine is latency-bound on its walk over the splits, so its cost
+    # keeps falling with workgroups in flight even once the grid covers the
+    # device, leaving no shape-dependent crossover to size this by.
+    COMBINE_BLOCK = int(os.getenv("FLYDSL_COMBINE_BLOCK", "64"))
     COMBINE_LANES_PER_ROW = combine_lanes_per_row(traits.HEAD_DIM)
     # A row owns a whole wave: HEAD_DIM/combine_chunk lanes carry the head dim
     # and the remaining lanes divide the split dimension between them, merged
