@@ -1590,7 +1590,7 @@ def _make_flash_attn_generic_traits(
         and window_left < 0
         and head_dim >= 128
         and not enable_gfx942_kv_gpfetch
-        and os.getenv("FLYDSL_FLASH_ATTN_FUNC_WAVE_SPLITK", "0") == "1"
+        and os.getenv("FLYDSL_FLASH_ATTN_FUNC_WAVE_SPLITK", "1") == "1"
     )
     enable_gfx942_vec_k = (
         gpu_arch.startswith("gfx942")
