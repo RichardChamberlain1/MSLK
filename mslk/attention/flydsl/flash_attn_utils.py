@@ -1519,6 +1519,7 @@ def _make_flash_attn_generic_traits(
     q_pack_qlen=0,
     q_pack_group=0,
     kv_lens=False,
+    high_concurrency=False,
 ):
     """Build compile-time traits for ``flash_attn_generic``."""
     block_n = 64
@@ -1576,19 +1577,22 @@ def _make_flash_attn_generic_traits(
     # while the real rows fit in one wave's share, since every wave owns all of
     # them. GPFETCH's fused GEMM2 has no half-width form.
     #
-    # Limited to packed-GQA decode over a full (unwindowed) context at
-    # D >= 128. The merge costs two barriers and an LDS round trip per
-    # workgroup, and below that cutoff there is not enough MFMA per tile to
-    # absorb it. D < 128 is excluded outright: whether it pays turns on batch,
-    # which is a runtime value this builder cannot see, and num_kv_splits does
-    # not stand in for it.
+    # Limited to packed-GQA decode over a full (unwindowed) context. The merge
+    # costs two barriers and an LDS round trip per workgroup, and below
+    # FLYDSL_WAVE_SPLITK_MIN_D there is not enough MFMA per tile to absorb it
+    # outright -- there it only pays at high concurrency. Whether a given call
+    # clears that bar turns on batch, which this builder cannot see:
+    # num_kv_splits does not stand in for it, because the batches that win and
+    # the batches that lose share a split count. The caller resolves it and
+    # passes the answer as `high_concurrency`.
+    _wsk_min_d = int(os.getenv("FLYDSL_WAVE_SPLITK_MIN_D", "128"))
     enable_wave_splitk = (
         int(num_kv_splits) > 1
         and q_pack_group > 0
         and q_pack_qlen == 1
         and q_pack_group * q_pack_qlen <= rows_per_wave
         and window_left < 0
-        and head_dim >= 128
+        and (head_dim >= _wsk_min_d or high_concurrency)
         and not enable_gfx942_kv_gpfetch
         and os.getenv("FLYDSL_FLASH_ATTN_FUNC_WAVE_SPLITK", "1") == "1"
     )

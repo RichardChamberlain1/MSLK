@@ -86,6 +86,7 @@ def build_flash_attn_func_module_primary(
     q_pack_qlen=0,
     q_pack_group=0,
     kv_lens=False,
+    high_concurrency=False,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
@@ -270,6 +271,7 @@ def build_flash_attn_func_module_primary(
         q_pack_qlen=q_pack_qlen,
         q_pack_group=q_pack_group,
         kv_lens=kv_lens,
+        high_concurrency=high_concurrency,
     )
     _flash_attn_generic_cache_tag = traits.cache_tag
 
