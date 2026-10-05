@@ -683,8 +683,13 @@ def build_flash_attn_func_module_primary(
     # Split-K combine: merge per-split partials into final O + LSE. The generic O
     # register/pack layout matches the dualwave path, so the shared combine kernel
     # reads the workspace verbatim.
-    # Threads per combine block; a block is the unit of CU assignment.
-    COMBINE_BLOCK = int(os.getenv("FLYDSL_COMBINE_BLOCK", "256"))
+    # Threads per combine block; a block is the unit of CU assignment, so this
+    # sets how many workgroups the combine launches. One wave per block spreads
+    # a given thread count over the most CUs. Wider blocks do not win it back:
+    # the combine is latency-bound on its walk over the splits, so its cost
+    # keeps falling with workgroups in flight even once the grid covers the
+    # device, leaving no shape-dependent crossover to size this by.
+    COMBINE_BLOCK = int(os.getenv("FLYDSL_COMBINE_BLOCK", "64"))
     COMBINE_LANES_PER_ROW = combine_lanes_per_row(traits.HEAD_DIM)
     # A row owns a whole wave: HEAD_DIM/combine_chunk lanes carry the head dim
     # and the remaining lanes divide the split dimension between them, merged
