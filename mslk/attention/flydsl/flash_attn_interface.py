@@ -615,7 +615,7 @@ _PAGED_GQA_PACK = os.getenv("FLYDSL_PAGED_GQA_PACK", "1") == "1"
 # only the answer matters. Below the cutoff the transform costs more than it
 # saves -- steeply so at long context -- so the floor is not a rounding
 # choice. 0 disables it entirely, leaving the head-dim bound alone.
-_WAVE_SPLITK_MIN_BATCH = int(os.getenv("FLYDSL_WAVE_SPLITK_MIN_BATCH", "0"))
+_WAVE_SPLITK_MIN_BATCH = int(os.getenv("FLYDSL_WAVE_SPLITK_MIN_BATCH", "8"))
 _PAGED_LIGHT_BLOCK_M = int(os.getenv("FLYDSL_PAGED_BLOCK_M", "64"))
 
 
