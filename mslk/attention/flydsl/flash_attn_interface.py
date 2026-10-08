@@ -689,6 +689,61 @@ def _paged_window_num_kv_splits(
     return splits
 
 
+# Workgroups below which the grid cannot keep the device busy on its own.
+_PAGED_OCC_TARGET_WG = int(os.getenv("FLYDSL_PAGED_OCC_TARGET_WG", "512"))
+
+
+def _paged_block_m(gqa_packed: bool, seqlen_q: int) -> int:
+    """Height of the Q tile the paged builder uses.
+
+    Widened for packed GQA so the packed rows stay in one Q tile; a second tile
+    re-reads the whole KV range.
+    """
+    return 128 if (gqa_packed and seqlen_q > 64) else _PAGED_LIGHT_BLOCK_M
+
+
+def _paged_combine_cap(head_dim: int) -> int:
+    """Split count past which the combine costs more than the shorter chain saves."""
+    return 128 if head_dim >= 128 else 256
+
+
+def _paged_occupancy_topup(
+    splits: int,
+    num_batches: int,
+    num_heads: int,
+    seqlen_q: int,
+    span: int,
+    head_dim: int,
+    gqa_packed: bool,
+) -> int:
+    """Raise the split count when the grid alone cannot fill the device.
+
+    Under _PAGED_OCC_TARGET_WG workgroups the kernel sits at one wave per SIMD
+    with nothing to hide memory latency behind, and splitting is the only lever.
+    The raise is bounded by the KV span and by _paged_combine_cap, and never
+    lowers the count it is given.
+    """
+
+    def ceildiv(a: int, b: int) -> int:
+        return -(-a // b)
+
+    grid = (
+        num_batches
+        * num_heads
+        * ceildiv(max(seqlen_q, 1), _paged_block_m(gqa_packed, seqlen_q))
+    )
+    if grid * splits >= _PAGED_OCC_TARGET_WG:
+        return splits
+    want = min(
+        ceildiv(_PAGED_OCC_TARGET_WG, max(grid, 1)),
+        _paged_combine_cap(head_dim),
+        max(ceildiv(max(span, 1), _PAGED_BLOCK_N_OUT), 1),
+    )
+    # Compiled into the kernel, so keep it a power of two.
+    want = 1 << (want.bit_length() - 1) if want > 0 else 1
+    return max(splits, want)
+
+
 # Streaming tile of the head-packed decode kernel
 # (TILE_N in decode/pa_decode_gfx950.py).
 # A page must be a whole number of tiles so a tile never straddles two pages.
@@ -1138,8 +1193,13 @@ def _flydsl_flash_attn_paged(
             reach = min(skv, int(window_left) + q_len)
             pages = (skv + page_size - 1) // page_size
             num_kv_splits = _paged_window_num_kv_splits(B, H, q_len, reach, D, pages)
+            span = reach
         else:
             num_kv_splits = _paged_num_kv_splits(B, H, Sq, skv, D)
+            span = skv
+        num_kv_splits = _paged_occupancy_topup(
+            num_kv_splits, B, H, Sq, span, D, _gqa_packed
+        )
     elif requested_num_kv_splits <= 1:
         num_kv_splits = 1
     else:
@@ -1280,7 +1340,7 @@ def _flydsl_flash_attn_paged(
                     q_pack_qlen=_gqa_qlen if (_gqa_packed and causal) else 0,
                     q_pack_group=_gqa_group if _gqa_stride_packed else 0,
                     kv_lens=_dense_kv_lens,
-                    block_m=128 if (_gqa_packed and Sq > 64) else 0,
+                    block_m=_paged_block_m(_gqa_packed, Sq),
                     window_left=window_left,
                     num_kv_splits=int(num_kv_splits),
                 )
