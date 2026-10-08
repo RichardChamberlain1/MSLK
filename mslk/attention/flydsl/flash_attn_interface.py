@@ -605,6 +605,59 @@ _PAGED_FORCE_SPLITS = int(os.getenv("FLYDSL_PAGED_FORCE_SPLITS", "0"))
 _PAGED_GQA_STRIDE = os.getenv("FLYDSL_PAGED_GQA_STRIDE", "1") == "1"
 _PAGED_GQA_PACK = os.getenv("FLYDSL_PAGED_GQA_PACK", "1") == "1"
 _PAGED_LIGHT_BLOCK_M = int(os.getenv("FLYDSL_PAGED_BLOCK_M", "64"))
+# Workgroups below which the grid cannot keep the device busy on its own.
+_PAGED_OCC_TARGET_WG = int(os.getenv("FLYDSL_PAGED_OCC_TARGET_WG", "512"))
+
+
+def _paged_block_m(gqa_packed: bool, seqlen_q: int) -> int:
+    """Height of the Q tile the paged builder uses.
+
+    Widened for packed GQA so the packed rows stay in one Q tile; a second tile
+    re-reads the whole KV range.
+    """
+    return 128 if (gqa_packed and seqlen_q > 64) else _PAGED_LIGHT_BLOCK_M
+
+
+def _paged_combine_cap(head_dim: int) -> int:
+    """Split count past which the combine costs more than the shorter chain saves."""
+    return 128 if head_dim >= 128 else 256
+
+
+def _paged_occupancy_topup(
+    splits: int,
+    num_batches: int,
+    num_heads: int,
+    seqlen_q: int,
+    span: int,
+    head_dim: int,
+    gqa_packed: bool,
+) -> int:
+    """Raise the split count when the grid alone cannot fill the device.
+
+    Under _PAGED_OCC_TARGET_WG workgroups the kernel sits at one wave per SIMD
+    with nothing to hide memory latency behind, and splitting is the only lever.
+    The raise is bounded by the KV span and by _paged_combine_cap, and never
+    lowers the count it is given.
+    """
+
+    def ceildiv(a: int, b: int) -> int:
+        return -(-a // b)
+
+    grid = (
+        num_batches
+        * num_heads
+        * ceildiv(max(seqlen_q, 1), _paged_block_m(gqa_packed, seqlen_q))
+    )
+    if grid * splits >= _PAGED_OCC_TARGET_WG:
+        return splits
+    want = min(
+        ceildiv(_PAGED_OCC_TARGET_WG, max(grid, 1)),
+        _paged_combine_cap(head_dim),
+        max(ceildiv(max(span, 1), _PAGED_BLOCK_N_OUT), 1),
+    )
+    # Compiled into the kernel, so keep it a power of two.
+    want = 1 << (want.bit_length() - 1) if want > 0 else 1
+    return max(splits, want)
 
 
 _UNIFORM_CU_SEQLENS: dict = {}
@@ -1047,8 +1100,13 @@ def _flydsl_flash_attn_paged(
             num_kv_splits = _paged_window_num_kv_splits(B, H, Sq, _reach, D)
             if num_kv_splits < _floor:
                 num_kv_splits = 1 << (_floor - 1).bit_length()
+            _span = _reach
         else:
             num_kv_splits = _paged_num_kv_splits(B, H, Sq, _kv_tiles, D)
+            _span = _kv_tiles
+        num_kv_splits = _paged_occupancy_topup(
+            num_kv_splits, B, H, Sq, _span, D, _gqa_packed
+        )
         _auto_sized = True
 
     splitk = num_kv_splits > 1
@@ -1225,7 +1283,7 @@ def _flydsl_flash_attn_paged(
                 # re-reads the whole KV range -- measured 4.08 -> 2.72 TB/s going
                 # from 64 rows to 88. Widen the tile instead. The reverse costs
                 # 19% when the rows do fit, so only widen when they do not.
-                block_m=128 if (_gqa_packed and Sq > 64) else 0,
+                block_m=_paged_block_m(_gqa_packed, Sq),
             )
         else:
             exe = _build_paged(
