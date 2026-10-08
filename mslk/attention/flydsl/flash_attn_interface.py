@@ -617,6 +617,86 @@ _PAGED_GQA_PACK = os.getenv("FLYDSL_PAGED_GQA_PACK", "1") == "1"
 # choice. 0 disables it entirely, leaving the head-dim bound alone.
 _WAVE_SPLITK_MIN_BATCH = int(os.getenv("FLYDSL_WAVE_SPLITK_MIN_BATCH", "8"))
 _PAGED_LIGHT_BLOCK_M = int(os.getenv("FLYDSL_PAGED_BLOCK_M", "64"))
+# Workgroups below which the grid cannot keep the device busy on its own and
+# the split count has to make up the difference. Deliberately lower than
+# _PAGED_WINDOW_TARGET_WG: that one sizes a heuristic from scratch, this one
+# only tops up what a heuristic already chose, so it has to clear the bar where
+# extra splits stop paying for their combine.
+_PAGED_OCC_TARGET_WG = int(os.getenv("FLYDSL_PAGED_OCC_TARGET_WG", "512"))
+
+
+def _paged_block_m(gqa_packed: bool, seqlen_q: int) -> int:
+    """Height of the Q tile the paged builder will actually use.
+
+    Packing multiplies the M rows by the GQA group size. Rows that overflow
+    BLOCK_M spill into a second Q tile, and each tile re-reads the whole KV
+    range -- measured 4.08 -> 2.72 TB/s going from 64 rows to 88. Widen the tile
+    instead. The reverse costs 19% when the rows do fit, so only widen when they
+    do not.
+
+    Shared with the split sizing so the two cannot disagree about the grid: the
+    heuristics assume 64 everywhere, and where this picks 128 that assumption
+    doubles the modelled block count.
+    """
+    return 128 if (gqa_packed and seqlen_q > 64) else _PAGED_LIGHT_BLOCK_M
+
+
+def _paged_combine_cap(head_dim: int) -> int:
+    """Split count past which the combine pass costs more than it saves.
+
+    Measured at D=128: combine 6.2 / 10.6 / 18.4 / 102.4 us at 64 / 128 / 256 /
+    512 splits, so 128. D=64 packs 8 split groups per wave against D=128's 4 and
+    combine_chunk records it blowing up an octave later, so 256 -- inferred from
+    that note rather than measured here.
+    """
+    return 128 if head_dim >= 128 else 256
+
+
+def _paged_occupancy_topup(
+    splits: int,
+    num_batches: int,
+    num_heads: int,
+    seqlen_q: int,
+    span: int,
+    head_dim: int,
+    gqa_packed: bool,
+) -> int:
+    """Raise the split count when the grid alone cannot fill the device.
+
+    Both split heuristics model the grid as ceildiv(seqlen_q, 64) tiles, but a
+    GQA-packed call widens the tile to 128 so the packed rows stay in one Q tile
+    (see the block_m note at the paged builder). On a single-request decode that
+    halves the real grid -- 4 workgroups, one per KV head, against the 8 the
+    heuristics believe they have. Those shapes land at one wave per SIMD with
+    nothing to hide memory latency behind, and more splits is the only lever
+    left.
+
+    Applied after the heuristics rather than inside them: the block count they
+    compute also feeds their own oversubscription clamp, so this only ever
+    RAISES the count, and only for grids under target. Well-occupied shapes are
+    untouched by construction.
+    """
+
+    def ceildiv(a: int, b: int) -> int:
+        return -(-a // b)
+
+    grid = (
+        num_batches
+        * num_heads
+        * ceildiv(max(seqlen_q, 1), _paged_block_m(gqa_packed, seqlen_q))
+    )
+    if grid * splits >= _PAGED_OCC_TARGET_WG:
+        return splits
+    want = min(
+        ceildiv(_PAGED_OCC_TARGET_WG, max(grid, 1)),
+        _paged_combine_cap(head_dim),
+        max(ceildiv(max(span, 1), _PAGED_BLOCK_N_OUT), 1),
+    )
+    # Keep the power-of-two invariant the heuristics maintain: the count is
+    # compiled into the kernel, so odd values fork the JIT cache for nothing.
+    # Rounding down is also the conservative direction.
+    want = 1 << (want.bit_length() - 1) if want > 0 else 1
+    return max(splits, want)
 
 
 _UNIFORM_CU_SEQLENS: dict = {}
@@ -1059,8 +1139,13 @@ def _flydsl_flash_attn_paged(
             num_kv_splits = _paged_window_num_kv_splits(B, H, Sq, _reach, D)
             if num_kv_splits < _floor:
                 num_kv_splits = 1 << (_floor - 1).bit_length()
+            _span = _reach
         else:
             num_kv_splits = _paged_num_kv_splits(B, H, Sq, _kv_tiles, D)
+            _span = _kv_tiles
+        num_kv_splits = _paged_occupancy_topup(
+            num_kv_splits, B, H, Sq, _span, D, _gqa_packed
+        )
         _auto_sized = True
 
     splitk = num_kv_splits > 1
@@ -1238,12 +1323,7 @@ def _flydsl_flash_attn_paged(
                     _WAVE_SPLITK_MIN_BATCH > 0 and B >= _WAVE_SPLITK_MIN_BATCH
                 ),
                 kv_lens=_dense_kv_lens,
-                # Packing multiplies the M rows by the GQA group size. Rows that
-                # overflow BLOCK_M spill into a second Q tile, and each tile
-                # re-reads the whole KV range -- measured 4.08 -> 2.72 TB/s going
-                # from 64 rows to 88. Widen the tile instead. The reverse costs
-                # 19% when the rows do fit, so only widen when they do not.
-                block_m=128 if (_gqa_packed and Sq > 64) else 0,
+                block_m=_paged_block_m(_gqa_packed, Sq),
             )
         else:
             exe = _build_paged(
