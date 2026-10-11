@@ -441,6 +441,7 @@ class FwOp(AttentionFwOpBase):
     SUPPORTS_BMGHK = True
     VARLEN_LSE_PACKED = True
     SUPPORTS_PARTIAL = False
+    SUPPORTS_QUANTIZED_KV = True
     CUDA_MINIMUM_COMPUTE_CAPABILITY = (10, 0)
     NAME = "cuteDSLF-blackwell"
 
@@ -594,6 +595,7 @@ class FwOpDecode(AttentionFwOpBase):
     SUPPORTS_BMGHK = True
     VARLEN_LSE_PACKED = True
     SUPPORTS_PARTIAL = False
+    SUPPORTS_QUANTIZED_KV = True
     CUDA_MINIMUM_COMPUTE_CAPABILITY = (10, 0)
     NAME = "cuteDSLF-blackwell-decode"
 

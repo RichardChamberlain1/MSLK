@@ -491,6 +491,7 @@ class AttentionOpBase(BaseOperator):
     SUPPORTS_PARTIAL: bool = False
     IS_DETERMINISTIC: bool = True
     SUPPORTS_BMGHK: bool = False
+    SUPPORTS_QUANTIZED_KV: bool = False
     NAME: str  # pyre-ignore[13]
     OPERATOR_CATEGORY = "memory_efficient_attention"
     # Format for the LSE computed in the FW pass, and accepted in the BW pass,
@@ -557,6 +558,8 @@ class AttentionOpBase(BaseOperator):
                 )
         if dtype not in cls.SUPPORTED_DTYPES:
             reasons.append(f"dtype={dtype} (supported: {cls.SUPPORTED_DTYPES})")
+        if d.key.dtype == torch.int32 and not cls.SUPPORTS_QUANTIZED_KV:
+            reasons.append("quantized (int32) key/value not supported")
         if type(d.attn_bias) not in cls.SUPPORTED_ATTN_BIAS_TYPES:
             reasons.append(f"attn_bias type is {type(d.attn_bias)}")
         if not cls.SUPPORTS_OUTPUT_DTYPE:

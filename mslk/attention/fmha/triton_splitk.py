@@ -201,6 +201,7 @@ class FwOp(AttentionFwOpBase):
     SUPPORTS_BMGHK = True
     SUPPORTS_OUTPUT_DTYPE = True
     SUPPORTS_PARTIAL = True
+    SUPPORTS_QUANTIZED_KV = True
     NAME = "triton_splitKF"
 
     SPLIT_K: Optional[int] = None
