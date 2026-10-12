@@ -2938,7 +2938,7 @@ class GenericKvGmemToLdsLoader:
             return self.page_ids.page_row_idx_cached(pid, logical)
         return pid * fx.Index(traits.PAGE_SIZE) + row_total
 
-    def coop_load_k(self, tile_start, buf_id=0):
+    def coop_load_k(self, tile_start, buf_id=0, pid=None):
         """Cooperative K load (row-major, XOR-swizzled)."""
         ctx = self.ctx
         traits = ctx.traits
@@ -2946,7 +2946,7 @@ class GenericKvGmemToLdsLoader:
         row = ctx.load_row_in_batch
         col = ctx.load_col_base
         k_base = self.k_buf_base(buf_id)
-        if const_expr(traits.PAGED):
+        if const_expr(traits.PAGED and pid is None):
             pid = self._tile_page_id(tile_start)
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
@@ -3066,12 +3066,16 @@ class GenericKvGmemToLdsLoader:
                     vec = self.load_f16xN(ctx.v_ptr, self.global_idx(row_idx, col))
                 self._v_store_to_lds(v_base, lds_row, vec)
 
-    def coop_load_v_global(self, tile_start):
-        """Issue global V loads; vectorized mode returns no-major v8 rows."""
+    def coop_load_v_global(self, tile_start, pid=None):
+        """Issue global V loads; vectorized mode returns no-major v8 rows.
+
+        ``pid`` is the tile's page id when the caller already has it.
+        """
         ctx = self.ctx
         traits = ctx.traits
-        if const_expr(traits.KV_VECTORIZED):
+        if const_expr(traits.PAGED and pid is None):
             pid = self._tile_page_id(tile_start)
+        if const_expr(traits.KV_VECTORIZED):
             base_v = pid * fx.Index(
                 traits.PAGE_STRIDE_VEC
             ) + ctx.kv_head_idx * fx.Index(traits.HEAD_STRIDE_VEC)
@@ -3088,8 +3092,6 @@ class GenericKvGmemToLdsLoader:
                 vecs.append(self.load_half_vec(ctx.v_ptr, src, traits.KV_VEC_SIZE))
             return vecs
         vecs = []
-        if const_expr(traits.PAGED):
-            pid = self._tile_page_id(tile_start)
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
             if const_expr(traits.PAGED):
