@@ -344,6 +344,9 @@ def build_flash_attn_func_module_primary(
         q_loader = GenericQLoader(ctx)
         store_helper = GenericStoreHelper(ctx)
 
+        ctx.pin_kernel_args(
+            Q, CuSeqQ, CuSeqKv, KvSeqStart, BlockTable, block_table_stride
+        )
         ctx.init_sequence_indices()
         ctx.init_lds_view()
         ctx.init_thread_mapping()

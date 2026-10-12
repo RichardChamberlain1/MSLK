@@ -2361,6 +2361,28 @@ class GenericFlashAttnContext:
         self.MFMA_LANE_K = traits.MFMA_LANE_K
         self.mma_atom_k16 = fx.make_mma_atom(fx.rocdl.MFMA(32, 32, 16, self.elem_dtype))
 
+    def pin_kernel_args(self, Q, CuSeqQ, CuSeqKv, KvSeqStart, BlockTable, bt_stride):
+        # Read the kernel arguments here so their loads issue together under one
+        # wait, rather than sunk to first use as serial round trips.
+        traits = self.traits
+        args = [self.seq_len, self.k_ptr, self.v_ptr, _extract_aligned_pointer(Q)]
+        if const_expr(traits.VARLEN):
+            args.append(_extract_aligned_pointer(CuSeqQ))
+        if const_expr(traits.VARLEN or traits.KV_LENS):
+            args.append(_extract_aligned_pointer(CuSeqKv))
+        if const_expr(traits.VARLEN and traits.GAPPY_KV):
+            args.append(_extract_aligned_pointer(KvSeqStart))
+        if const_expr(traits.PAGED):
+            args += [_extract_aligned_pointer(BlockTable), bt_stride]
+        irs = [as_mlir_value(a) for a in args]
+        llvm.inline_asm(
+            ir.Type.parse("!llvm.void"),
+            irs,
+            "",
+            ",".join(["s"] * len(irs)),
+            has_side_effects=True,
+        )
+
     def init_sequence_indices(self):
         self.seq_len_v = fx.Index(self.seq_len)
         self.seq_len_kv_v = fx.Index(self.seq_len_kv)
