@@ -444,6 +444,8 @@ def build_flash_attn_func_module_primary(
 
             for kv_sub in range_constexpr(traits.N_SUBTILES):
                 kv_start = kv_block_start + kv_sub * traits.BLOCK_N
+                # The tile's page id, looked up once and shared by its K and V loads.
+                _tile_pid = None
 
                 if const_expr(traits.ENABLE_PREFETCH_3BUF):
                     k_slot = (
@@ -489,7 +491,9 @@ def build_flash_attn_func_module_primary(
                         kv_gmem_to_lds.coop_dma_k(kv_start, k_slot)
                         rocdl.s_waitcnt(0)
                     else:
-                        kv_gmem_to_lds.coop_load_k(kv_start, k_slot)
+                        if const_expr(traits.PAGED):
+                            _tile_pid = kv_gmem_to_lds._tile_page_id(kv_start)
+                        kv_gmem_to_lds.coop_load_k(kv_start, k_slot, pid=_tile_pid)
                     gpu.barrier()
                 if const_expr(not _use_dma_dbuf):
                     k_base = kv_gmem_to_lds.k_buf_base(k_slot)
@@ -503,7 +507,9 @@ def build_flash_attn_func_module_primary(
                         or (not traits.ENABLE_DMA and not traits.ENABLE_PREFETCH_3BUF)
                     )
                 ):
-                    _v_vecs_prefetch = kv_gmem_to_lds.coop_load_v_global(kv_start)
+                    _v_vecs_prefetch = kv_gmem_to_lds.coop_load_v_global(
+                        kv_start, pid=_tile_pid
+                    )
 
                 # ==== GEMM1: S = K @ Q^T. Bulk-read K packs, DMA-prefetch V, pipeline MFMAs ====
                 _k_lo, _k_hi = kv_lds_to_vgpr.load_k_packs(k_base)
