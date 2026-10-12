@@ -744,6 +744,20 @@ def _paged_occupancy_topup(
     return max(splits, want)
 
 
+# Minimum KV tiles per workgroup for paged K double buffering.
+_PAGED_KV_DMA_MIN_ITERS = int(os.getenv("FLYDSL_PAGED_KV_DMA_MIN_ITERS", "63"))
+
+
+def _paged_kv_dma(
+    block_m: int, head_dim: int, window_left: int, kv_len: int, num_kv_splits: int
+) -> bool:
+    """Double-buffer K for a tall Q tile at D=64 over enough tiles, no window."""
+    if block_m <= _PAGED_LIGHT_BLOCK_M or head_dim != 64 or window_left >= 0:
+        return False
+    tiles = -(-max(kv_len, 1) // _PAGED_BLOCK_N_OUT)
+    return -(-tiles // max(num_kv_splits, 1)) >= _PAGED_KV_DMA_MIN_ITERS
+
+
 # Streaming tile of the head-packed decode kernel
 # (TILE_N in decode/pa_decode_gfx950.py).
 # A page must be a whole number of tiles so a tile never straddles two pages.
@@ -1341,6 +1355,13 @@ def _flydsl_flash_attn_paged(
                     q_pack_group=_gqa_group if _gqa_stride_packed else 0,
                     kv_lens=_dense_kv_lens,
                     block_m=_paged_block_m(_gqa_packed, Sq),
+                    kv_dma=_paged_kv_dma(
+                        _paged_block_m(_gqa_packed, Sq),
+                        D,
+                        window_left,
+                        skv,
+                        num_kv_splits,
+                    ),
                     window_left=window_left,
                     num_kv_splits=int(num_kv_splits),
                 )
@@ -1473,6 +1494,7 @@ def _build_paged_light(
     kv_lens: bool = False,
     block_m: int = 0,
     window_left: int = -1,
+    kv_dma: bool = False,
 ):
     """Build a lightweight paged-varlen launcher for short attention.
 
@@ -1507,6 +1529,7 @@ def _build_paged_light(
         q_pack_group=q_pack_group,
         kv_lens=kv_lens,
         num_kv_splits=num_kv_splits,
+        paged_kv_dma=kv_dma,
     )
 
 
