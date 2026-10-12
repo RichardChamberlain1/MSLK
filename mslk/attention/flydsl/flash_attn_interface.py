@@ -618,6 +618,20 @@ def _paged_block_m(gqa_packed: bool, seqlen_q: int) -> int:
     return 128 if (gqa_packed and seqlen_q > 64) else _PAGED_LIGHT_BLOCK_M
 
 
+# Minimum KV tiles per workgroup for paged K double buffering.
+_PAGED_KV_DMA_MIN_ITERS = int(os.getenv("FLYDSL_PAGED_KV_DMA_MIN_ITERS", "63"))
+
+
+def _paged_kv_dma(
+    block_m: int, head_dim: int, window_left: int, kv_len: int, num_kv_splits: int
+) -> bool:
+    """Double-buffer K for a tall Q tile at D=64 over enough tiles, no window."""
+    if block_m <= _PAGED_LIGHT_BLOCK_M or head_dim != 64 or window_left >= 0:
+        return False
+    tiles = -(-max(kv_len, 1) // _PAGED_BLOCK_N_OUT)
+    return -(-tiles // max(num_kv_splits, 1)) >= _PAGED_KV_DMA_MIN_ITERS
+
+
 def _paged_combine_cap(head_dim: int) -> int:
     """Split count past which the combine costs more than the shorter chain saves."""
     return 128 if head_dim >= 128 else 256
@@ -1284,6 +1298,9 @@ def _flydsl_flash_attn_paged(
                 # from 64 rows to 88. Widen the tile instead. The reverse costs
                 # 19% when the rows do fit, so only widen when they do not.
                 block_m=_paged_block_m(_gqa_packed, Sq),
+                kv_dma=_paged_kv_dma(
+                    _paged_block_m(_gqa_packed, Sq), D, window_left, skv, num_kv_splits
+                ),
             )
         else:
             exe = _build_paged(
@@ -1393,6 +1410,7 @@ def _build_paged_light(
     kv_lens: bool = False,
     block_m: int = 0,
     window_left: int = -1,
+    kv_dma: bool = False,
 ):
     """Build a lightweight paged-varlen launcher for short attention.
 
@@ -1427,6 +1445,7 @@ def _build_paged_light(
         q_pack_qlen=q_pack_qlen,
         q_pack_group=q_pack_group,
         kv_lens=kv_lens,
+        paged_kv_dma=kv_dma,
     )
 
 

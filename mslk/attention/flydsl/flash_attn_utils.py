@@ -1517,6 +1517,7 @@ def _make_flash_attn_generic_traits(
     q_pack_qlen=0,
     q_pack_group=0,
     kv_lens=False,
+    paged_kv_dma=False,
 ):
     """Build compile-time traits for ``flash_attn_generic``."""
     block_n = 64
@@ -1562,6 +1563,18 @@ def _make_flash_attn_generic_traits(
             or (os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_DMA", "0") == "1")
         )
     )
+    if paged:
+        # Paged DMA supports the linear, non-gappy layout only.
+        paged_dma_ok = (
+            has_lds_load_b128
+            and not gpu_arch.startswith("gfx942")
+            and kv_cache_layout == "linear"
+            and not gappy_kv
+        )
+        # FLYDSL_PAGED_KV_DMA=0/1 overrides the caller's choice.
+        forced = os.getenv("FLYDSL_PAGED_KV_DMA", "")
+        want = forced == "1" if forced in ("0", "1") else (enable_dma or paged_kv_dma)
+        enable_dma = paged_dma_ok and want
     enable_gfx942_kv_gpfetch = (
         gpu_arch.startswith("gfx942")
         and not enable_prefetch_3buf
@@ -3250,21 +3263,33 @@ class GenericKvGmemToLdsLoader:
         self._dma_soff = fx.Int32(0)
         self._dma_off = fx.Int32(0)
         self._dma_aux = fx.Int32(1)
-        self.k_rsrc = buffer_ops.create_buffer_resource(
-            ctx.K,
-            max_size=False,
-            num_records_bytes=ctx.kv_nrec_bytes,
-            base_byte_offset=ctx.kv_batch_byte_off,
-        )
         self.NUM_DMA_K = (traits.BLOCK_N * traits.K_STRIDE * 2) // self.DMA_BATCH_BYTES
         self.LANES_PER_K_ROW = traits.HEAD_DIM * 2 // self.DMA_BYTES
         self.ROWS_PER_DMA_BATCH = self.DMA_BATCH_BYTES // (traits.HEAD_DIM * 2)
-        self.v_rsrc = buffer_ops.create_buffer_resource(
-            ctx.V,
-            max_size=False,
-            num_records_bytes=ctx.kv_nrec_bytes,
-            base_byte_offset=ctx.kv_batch_byte_off,
-        )
+        if const_expr(traits.PAGED):
+            # Paged: per-page resources are built in _coop_dma_row.
+            self.k_rsrc = None
+            self.v_rsrc = None
+            self._k_dma_base_i64 = fx.Int64(
+                buffer_ops.extract_base_index(ctx.K, address_space=1)
+            )
+            self._v_dma_base_i64 = fx.Int64(
+                buffer_ops.extract_base_index(ctx.V, address_space=1)
+            )
+            self._dma_page_bytes = fx.Int64(traits.PAGE_STRIDE_VEC * 2)
+        else:
+            self.k_rsrc = buffer_ops.create_buffer_resource(
+                ctx.K,
+                max_size=False,
+                num_records_bytes=ctx.kv_nrec_bytes,
+                base_byte_offset=ctx.kv_batch_byte_off,
+            )
+            self.v_rsrc = buffer_ops.create_buffer_resource(
+                ctx.V,
+                max_size=False,
+                num_records_bytes=ctx.kv_nrec_bytes,
+                base_byte_offset=ctx.kv_batch_byte_off,
+            )
         self.NUM_DMA_V = (traits.BLOCK_N * traits.V_STRIDE * 2) // self.DMA_BATCH_BYTES
         self.LANES_PER_V_ROW = traits.HEAD_DIM * 2 // self.DMA_BYTES
         self.ROWS_PER_DMA_BATCH_V = self.DMA_BATCH_BYTES // (traits.HEAD_DIM * 2)
@@ -3278,9 +3303,21 @@ class GenericKvGmemToLdsLoader:
         rows_per_batch,
         tile_start,
         xor_and,
+        paged_base=None,
     ):
         ctx = self.ctx
         traits = ctx.traits
+        if const_expr(paged_base is not None):
+            # One tile is one page. Clamped: an empty split's prologue reads past
+            # the last page.
+            pid = self.page_ids._bt_load(tile_start // fx.Index(traits.PAGE_SIZE))
+            rsrc = buffer_ops.create_buffer_resource_from_addr(
+                as_mlir_value(paged_base + fx.Int64(pid) * self._dma_page_bytes),
+                num_records_bytes=as_mlir_value(self._dma_page_bytes),
+            )
+            row_base = fx.Index(0)
+        else:
+            row_base = tile_start  # 0-based: batch base folded into k/v_rsrc
         for d in range_constexpr(num_dma):
             lds_addr = (
                 lds_byte_base
@@ -3293,9 +3330,7 @@ class GenericKvGmemToLdsLoader:
             swiz_col_f16 = (ctx.tid % lanes_per_row) * (self.DMA_BYTES // 2)
             xor_mask = (row_in_tile & fx.Index(xor_and)) << fx.Index(4)
             col_byte = (swiz_col_f16 ^ xor_mask) * 2
-            global_row = (
-                tile_start + row_in_tile
-            )  # 0-based: batch base folded into k/v_rsrc
+            global_row = row_base + row_in_tile
             global_byte = (
                 global_row * fx.Index(traits.STRIDE_TOKEN_KV * 2)
                 + ctx.kv_head_idx * fx.Index(traits.HEAD_DIM * 2)
@@ -3358,7 +3393,8 @@ class GenericKvGmemToLdsLoader:
                 self.LANES_PER_K_ROW,
                 self.ROWS_PER_DMA_BATCH,
                 tile_start,
-                0x7,
+                traits.K_SWZ_ROWMASK,
+                paged_base=self._k_dma_base_i64 if traits.PAGED else None,
             )
 
     def coop_dma_v(self, tile_start, buf_id=0):
@@ -3375,6 +3411,7 @@ class GenericKvGmemToLdsLoader:
             self.ROWS_PER_DMA_BATCH_V,
             tile_start,
             0x3,
+            paged_base=self._v_dma_base_i64 if traits.PAGED else None,
         )
 
 
