@@ -86,6 +86,7 @@ def build_flash_attn_func_module_primary(
     q_pack_qlen=0,
     q_pack_group=0,
     kv_lens=False,
+    paged_kv_dma=False,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
@@ -235,10 +236,8 @@ def build_flash_attn_func_module_primary(
         raise NotImplementedError(
             f"generic paged kernel supports linear/vectorized kv_cache_layout, got {kv_cache_layout!r}"
         )
-    if paged and _validate_enable_dma:
-        raise NotImplementedError(
-            "generic paged kernel requires the non-DMA path (build with path_tag='N32')"
-        )
+    if paged and _validate_enable_dma and _validate_path == "N128":
+        raise NotImplementedError("generic paged kernel builds with path_tag='N32'")
 
     traits = _make_flash_attn_generic_traits(
         num_heads,
@@ -270,6 +269,7 @@ def build_flash_attn_func_module_primary(
         q_pack_qlen=q_pack_qlen,
         q_pack_group=q_pack_group,
         kv_lens=kv_lens,
+        paged_kv_dma=paged_kv_dma,
     )
     _flash_attn_generic_cache_tag = (traits.cache_tag, COMBINE_PREFETCH)
 
