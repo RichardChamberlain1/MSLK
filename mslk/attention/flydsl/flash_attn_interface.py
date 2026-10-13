@@ -773,6 +773,30 @@ def _paged_kv_dma(
     return -(-tiles // max(num_kv_splits, 1)) >= _PAGED_KV_DMA_MIN_ITERS
 
 
+# Minimum KV tiles per workgroup for the paged K register prefetch. D=128 holds
+# twice the prefetched K in registers and needs a longer walk to pay for it.
+_PAGED_K_PREFETCH_MIN_ITERS_D64 = int(
+    os.getenv("FLYDSL_PAGED_K_PREFETCH_MIN_ITERS_D64", "3")
+)
+_PAGED_K_PREFETCH_MIN_ITERS_D128 = int(
+    os.getenv("FLYDSL_PAGED_K_PREFETCH_MIN_ITERS_D128", "16")
+)
+
+
+def _paged_k_prefetch(
+    head_dim: int, window_left: int, q_len: int, kv_len: int, num_kv_splits: int
+) -> bool:
+    """Prefetch the next K tile into registers when each workgroup walks enough tiles."""
+    span = min(kv_len, window_left + q_len) if window_left >= 0 else kv_len
+    tiles = -(-max(span, 1) // _PAGED_BLOCK_N_OUT)
+    need = (
+        _PAGED_K_PREFETCH_MIN_ITERS_D64
+        if head_dim == 64
+        else _PAGED_K_PREFETCH_MIN_ITERS_D128
+    )
+    return -(-tiles // max(num_kv_splits, 1)) >= need
+
+
 # Streaming tile of the head-packed decode kernel
 # (TILE_N in decode/pa_decode_gfx950.py).
 # A page must be a whole number of tiles so a tile never straddles two pages.
@@ -1388,6 +1412,13 @@ def _flydsl_flash_attn_paged(
                         skv,
                         num_kv_splits,
                     ),
+                    k_prefetch=_paged_k_prefetch(
+                        D,
+                        window_left,
+                        _gqa_qlen if _gqa_packed else Sq,
+                        skv,
+                        num_kv_splits,
+                    ),
                     window_left=window_left,
                     num_kv_splits=int(num_kv_splits),
                 )
@@ -1521,6 +1552,7 @@ def _build_paged_light(
     block_m: int = 0,
     window_left: int = -1,
     kv_dma: bool = False,
+    k_prefetch: bool = False,
 ):
     """Build a lightweight paged-varlen launcher for short attention.
 
@@ -1556,6 +1588,7 @@ def _build_paged_light(
         kv_lens=kv_lens,
         num_kv_splits=num_kv_splits,
         paged_kv_dma=kv_dma,
+        paged_k_prefetch=k_prefetch,
     )
 
 
