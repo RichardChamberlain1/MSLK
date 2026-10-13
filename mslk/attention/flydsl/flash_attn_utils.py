@@ -1321,6 +1321,8 @@ class FlashAttnGenericTraits:
     N_SUBTILES: int
     ENABLE_PREFETCH_3BUF: bool
     ENABLE_DMA: bool
+    # Paged KV: carry the next K tile in registers across the softmax.
+    PAGED_K_PREFETCH: bool
     ENABLE_LDS_VEC16: bool
     REDUCE_MODE: str
     NUM_PREFETCH_K: int
@@ -1428,6 +1430,7 @@ class FlashAttnGenericTraits:
             self.N_SUBTILES,
             self.ENABLE_PREFETCH_3BUF,
             self.ENABLE_DMA,
+            self.PAGED_K_PREFETCH,
             self.ENABLE_LDS_VEC16,
             self.REDUCE_MODE,
             self.NUM_PREFETCH_K,
@@ -1518,6 +1521,7 @@ def _make_flash_attn_generic_traits(
     q_pack_group=0,
     kv_lens=False,
     paged_kv_dma=False,
+    paged_k_prefetch=False,
 ):
     """Build compile-time traits for ``flash_attn_generic``."""
     block_n = 64
@@ -1575,6 +1579,11 @@ def _make_flash_attn_generic_traits(
         forced = os.getenv("FLYDSL_PAGED_KV_DMA", "")
         want = forced == "1" if forced in ("0", "1") else (enable_dma or paged_kv_dma)
         enable_dma = paged_dma_ok and want
+    # FLYDSL_PAGED_K_PREFETCH=0/1 overrides the caller's choice.
+    forced_pf = os.getenv("FLYDSL_PAGED_K_PREFETCH", "")
+    if forced_pf in ("0", "1"):
+        paged_k_prefetch = forced_pf == "1"
+    paged_k_prefetch = paged and paged_k_prefetch and not enable_dma
     enable_gfx942_kv_gpfetch = (
         gpu_arch.startswith("gfx942")
         and not enable_prefetch_3buf
@@ -1732,6 +1741,7 @@ def _make_flash_attn_generic_traits(
         N_SUBTILES=n_subtiles,
         ENABLE_PREFETCH_3BUF=enable_prefetch_3buf,
         ENABLE_DMA=enable_dma,
+        PAGED_K_PREFETCH=paged_k_prefetch,
         ENABLE_LDS_VEC16=enable_lds_vec16,
         REDUCE_MODE=reduce_mode,
         NUM_PREFETCH_K=num_prefetch_k,
@@ -2822,16 +2832,32 @@ class GenericPageIdLoader:
             )
             self.bt_stride_v = fx.Index(block_table_stride)
 
-    def page_id(self, tile_start):
+    def issue_page_id(self, tile_start):
+        """Issue the block-table load and return the raw vector.
+
+        Converting that vector to an index waits for the load. Callers that
+        want the latency covered by later math must hold this vector and call
+        ``consume_page_id`` at the use.
+        """
         ctx = self.ctx
         tile_idx = tile_start // fx.Index(ctx.traits.PAGE_SIZE)
         bt_off = ctx.batch_idx * self.bt_stride_v + tile_idx
-        v = fly.copy_atom_call_ssa(
+        return fly.copy_atom_call_ssa(
             [ctx.v1i32_type],
             ctx.load_atom_32,
             fx.slice(self.bt_div, (None, fx.Int32(bt_off))),
         )
-        return fx.Index(Vec(v, (1,), fx.Int32)[0])
+
+    def consume_page_id(self, loaded):
+        """Index of a page id previously issued by ``issue_page_id``."""
+        return fx.Index(Vec(loaded, (1,), fx.Int32)[0])
+
+    def zero_page_id_raw(self):
+        """Placeholder raw page id for the untaken prefetch arm."""
+        return as_mlir_value(Vec.filled(1, 0, fx.Int32))
+
+    def page_id(self, tile_start):
+        return self.consume_page_id(self.issue_page_id(tile_start))
 
     def _bt_load(self, tile_idx):
         # Load block_table[batch, tile_idx], clamped to the row width so prefetch /
@@ -3000,11 +3026,22 @@ class GenericKvGmemToLdsLoader:
                     vec = self.load_f16xN(ctx.k_ptr, self.global_idx(row_idx, col))
                 Vec(vec).store(lds_kv, [lds_idx])
 
-    def coop_load_k_global(self, tile_start):
+    def zero_k_global_vecs(self):
+        """One zero K vector per global-load batch, matching ``coop_load_k_global``."""
+        ctx = self.ctx
+        traits = ctx.traits
+        zero_elem = fx.Float32(0.0).to(ctx.elem_dtype)
+        zero = as_mlir_value(Vec.filled(traits.VEC_WIDTH, zero_elem, ctx.elem_dtype))
+        vecs = []
+        for _kb in range_constexpr(traits.NUM_BATCHES_KV):
+            vecs.append(zero)
+        return vecs
+
+    def coop_load_k_global(self, tile_start, pid=None):
         ctx = self.ctx
         traits = ctx.traits
         vecs = []
-        if const_expr(traits.PAGED):
+        if const_expr(traits.PAGED and pid is None):
             pid = self._tile_page_id(tile_start)
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD

@@ -87,6 +87,7 @@ def build_flash_attn_func_module_primary(
     q_pack_group=0,
     kv_lens=False,
     paged_kv_dma=False,
+    paged_k_prefetch=False,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
@@ -270,6 +271,7 @@ def build_flash_attn_func_module_primary(
         q_pack_group=q_pack_group,
         kv_lens=kv_lens,
         paged_kv_dma=paged_kv_dma,
+        paged_k_prefetch=paged_k_prefetch,
     )
     _flash_attn_generic_cache_tag = traits.cache_tag
 
@@ -384,7 +386,8 @@ def build_flash_attn_func_module_primary(
         kv_upper = ctx.kv_upper
         kv_lower = ctx.kv_lower
 
-        # Loop-carried: [m_old, l_old, o_acc_chunks..., (buf_id if DMA dbuf)]
+        # Loop-carried: [m_old, l_old, o_acc_chunks..., (buf_id if DMA dbuf),
+        # (K vecs if pipelined), (page id if paged K prefetch)]
         _use_dma_dbuf = traits.ENABLE_DMA and not traits.ENABLE_PREFETCH_3BUF
         _pipe_k = (
             traits.ENABLE_GFX942_KV_GPFETCH
@@ -392,6 +395,21 @@ def build_flash_attn_func_module_primary(
             and not traits.ENABLE_PREFETCH_3BUF
             and traits.N_SUBTILES == 1
         )
+        # Next K tile is loaded into registers during the softmax, then lands in
+        # the single LDS K buffer. No second K buffer. Not the DMA double-buffer
+        # path: that copy is issued while the current tile is still live.
+        _pipe_paged_k = (
+            traits.PAGED_K_PREFETCH
+            and not traits.GAPPY_KV
+            and not traits.KV_NEEDS_GUARD
+            and not traits.KV_VECTORIZED
+            and not traits.ENABLE_DMA
+            and not traits.ENABLE_PREFETCH_3BUF
+            and traits.N_SUBTILES == 1
+            and not _pipe_k
+        )
+        # 16-byte global loads per K tile (VEC_WIDTH bf16 / 8): the V wait's count.
+        _k_prefetch_inflight = traits.NUM_BATCHES_KV * (traits.VEC_WIDTH // 8)
         init_args = [ctx.c_neg_inf, ctx.c_zero_f]
         for _ in range_constexpr(traits.D_CHUNKS):
             init_args.append(ctx.c_zero_v16f32)
@@ -403,6 +421,32 @@ def build_flash_attn_func_module_primary(
             _k0_vecs = kv_gmem_to_lds.coop_load_k_global(kv_lower)
             for _kb in range_constexpr(traits.NUM_BATCHES_KV):
                 init_args.append(_k0_vecs[_kb])
+        if const_expr(_pipe_paged_k):
+            _k0_names = []
+            _k0_zeros = kv_gmem_to_lds.zero_k_global_vecs()
+            for _kb in range_constexpr(traits.NUM_BATCHES_KV):
+                _k0_names.append("_pk0_%d" % _kb)
+            _k0_names.append("_pk0_pid")
+            _k0_zeros.append(fx.Index(0))
+
+            def _load_first_k(_names, *_st):
+                _pid0 = kv_gmem_to_lds._tile_page_id(kv_lower)
+                _vecs0 = kv_gmem_to_lds.coop_load_k_global(kv_lower, pid=_pid0)
+                _out0 = []
+                for _kb in range_constexpr(traits.NUM_BATCHES_KV):
+                    _out0.append(_vecs0[_kb])
+                _out0.append(_pid0)
+                return _out0
+
+            _k0_state = scf_if_dispatch(
+                kv_lower < kv_upper,
+                _load_first_k,
+                state_names=tuple(_k0_names),
+                state_values=_k0_zeros,
+            )
+            for _kb in range_constexpr(traits.NUM_BATCHES_KV):
+                init_args.append(_k0_state[_kb])
+            init_args.append(_k0_state[traits.NUM_BATCHES_KV])
 
         loop_results = init_args
         for kv_block_start, inner_iter_args in range(
@@ -419,7 +463,12 @@ def build_flash_attn_func_module_primary(
                     inner_iter_args[2 + traits.D_CHUNKS + _kb]
                     for _kb in range_constexpr(traits.NUM_BATCHES_KV)
                 ]
-                if _pipe_k
+                if (_pipe_k or _pipe_paged_k)
+                else None
+            )
+            _carried_k_pid = (
+                inner_iter_args[2 + traits.D_CHUNKS + traits.NUM_BATCHES_KV]
+                if _pipe_paged_k
                 else None
             )
             preload_k_count = (
@@ -486,6 +535,11 @@ def build_flash_attn_func_module_primary(
                         rocdl.sched_group_barrier(rocdl.mask_dswr, 1, 0)
                         _next_kv_start = kv_block_start + fx.Index(traits.BLOCK_N_OUT)
                         _next_k_vecs = kv_gmem_to_lds.coop_load_k_global(_next_kv_start)
+                    elif const_expr(_pipe_paged_k):
+                        _waitcnt_vm_n(0)
+                        kv_gmem_to_lds.coop_store_k_lds(_carried_k_vecs, k_slot)
+                        rocdl.sched_group_barrier(rocdl.mask_dswr, 1, 0)
+                        _tile_pid = _carried_k_pid
                     elif const_expr(traits.ENABLE_GFX942_KV_GPFETCH):
                         _kv_k_vecs = kv_gmem_to_lds.coop_load_k_global(kv_start)
                         kv_gmem_to_lds.coop_store_k_lds(_kv_k_vecs, k_slot)
@@ -500,6 +554,23 @@ def build_flash_attn_func_module_primary(
                     gpu.barrier()
                 if const_expr(not _use_dma_dbuf):
                     k_base = kv_gmem_to_lds.k_buf_base(k_slot)
+
+                if const_expr(_pipe_paged_k):
+                    _next_kv = kv_start + fx.Index(traits.BLOCK_N_OUT)
+                    _has_next = _next_kv < kv_upper
+
+                    def _issue_next_pid(_names, *_st):
+                        return [kv_gmem_to_lds.page_ids.issue_page_id(_next_kv)]
+
+                    _next_pid_raw = scf_if_dispatch(
+                        _has_next,
+                        _issue_next_pid,
+                        state_names=("_npid",),
+                        state_values=[kv_gmem_to_lds.page_ids.zero_page_id_raw()],
+                    )
+                    # Keep the load ahead of GEMM1; the index conversion below is
+                    # what waits for it.
+                    rocdl.sched_barrier(0)
 
                 if const_expr(traits.KV_VECTORIZED and traits.V_NOMAJOR_DMA):
                     kv_gmem_to_lds.coop_dma_v_nomajor(kv_start, 0)
@@ -560,6 +631,31 @@ def build_flash_attn_func_module_primary(
                         kv_gmem_to_lds,
                         kv_start,
                     )
+
+                if const_expr(_pipe_paged_k):
+                    _next_pid = kv_gmem_to_lds.page_ids.consume_page_id(_next_pid_raw)
+                    _nk_names = []
+                    for _kb in range_constexpr(traits.NUM_BATCHES_KV):
+                        _nk_names.append("_nk%d" % _kb)
+
+                    def _issue_next_k(_names, *_st):
+                        return kv_gmem_to_lds.coop_load_k_global(
+                            _next_kv, pid=_next_pid
+                        )
+
+                    _next_k_state = scf_if_dispatch(
+                        _has_next,
+                        _issue_next_k,
+                        state_names=tuple(_nk_names),
+                        state_values=kv_gmem_to_lds.zero_k_global_vecs(),
+                    )
+                    if const_expr(traits.NUM_BATCHES_KV == 1):
+                        _next_k_state = [_next_k_state]
+                    _next_k_vecs = []
+                    for _kb in range_constexpr(traits.NUM_BATCHES_KV):
+                        _next_k_vecs.append(_next_k_state[_kb])
+                    _yield_k_pid = _next_pid
+                    rocdl.sched_barrier(0)
 
                 # ==== Online softmax over 64 KV positions ====
                 s_raw_lo, s_raw_hi = softmax_helper.split_scores(s_acc_lo, s_acc_hi)
@@ -632,7 +728,20 @@ def build_flash_attn_func_module_primary(
                 else:
                     v_slot = 0
                     v_base = kv_gmem_to_lds.v_buf_base(v_slot)
-                    _waitcnt_vm_n(0)
+                    if const_expr(_pipe_paged_k):
+                        # vmcnt(N) completes the older V loads but not the N
+                        # prefetched K loads. The compiler still drains them at
+                        # the V store, as this point joins the path without a
+                        # prefetch (the last tile), which drains everything.
+                        def _wait_v_keep_k():
+                            _waitcnt_vm_n(_k_prefetch_inflight)
+
+                        def _wait_v_all():
+                            _waitcnt_vm_n(0)
+
+                        scf_if_dispatch(_has_next, _wait_v_keep_k, _wait_v_all)
+                    else:
+                        _waitcnt_vm_n(0)
                     if const_expr(traits.V_PERM_TR):
                         kv_gmem_to_lds.coop_store_v_lds_perm(_v_vecs_prefetch, v_slot)
                     else:
@@ -675,9 +784,11 @@ def build_flash_attn_func_module_primary(
                     _yield_args.append(fx.Index(1) - _cur_buf_id)
                 else:
                     _yield_args.append(_cur_buf_id)
-            if const_expr(_pipe_k):
+            if const_expr(_pipe_k or _pipe_paged_k):
                 for _kb in range_constexpr(traits.NUM_BATCHES_KV):
                     _yield_args.append(_next_k_vecs[_kb])
+            if const_expr(_pipe_paged_k):
+                _yield_args.append(_yield_k_pid)
             loop_results = yield _yield_args
 
         # ---- Store O ----
