@@ -88,6 +88,7 @@ def build_flash_attn_func_module_primary(
     kv_lens=False,
     paged_kv_dma=False,
     paged_k_prefetch=False,
+    high_concurrency=False,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
@@ -272,6 +273,7 @@ def build_flash_attn_func_module_primary(
         kv_lens=kv_lens,
         paged_kv_dma=paged_kv_dma,
         paged_k_prefetch=paged_k_prefetch,
+        high_concurrency=high_concurrency,
     )
     _flash_attn_generic_cache_tag = (traits.cache_tag, COMBINE_PREFETCH)
 
@@ -770,7 +772,12 @@ def build_flash_attn_func_module_primary(
                     )
                 else:
                     p_packs_lo = softmax_helper.build_p_packs(p_vals_lo)
-                    p_packs_hi = softmax_helper.build_p_packs(p_vals_hi)
+                    # Wave-split-K leaves the hi half to the other wave.
+                    p_packs_hi = (
+                        None
+                        if const_expr(traits.ENABLE_WAVE_SPLITK)
+                        else softmax_helper.build_p_packs(p_vals_hi)
+                    )
                     o_accs = gemm_helper.gemm2_pv(
                         kv_lds_to_vgpr, o_accs, p_packs_lo, p_packs_hi, v_base, corr_vec
                     )
@@ -793,6 +800,9 @@ def build_flash_attn_func_module_primary(
 
         # ---- Store O ----
         if const_expr(traits.SPLITK):
+            # Fold the waves' KV halves into one (m, l, acc) before storing.
+            if const_expr(traits.ENABLE_WAVE_SPLITK):
+                loop_results = softmax_helper.merge_wave_splitk(loop_results)
             # Split-K writes an unnormalized-then-reweighted partial to the workspace;
             # the combine kernel merges splits into the final O + LSE.
             store_helper.store_splitk_partial(loop_results, ctx.q_row)
