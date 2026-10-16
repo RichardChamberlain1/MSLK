@@ -855,6 +855,36 @@ def _paged_occupancy_topup(
     return max(splits, want)
 
 
+# FLYDSL_PAGED_WIDE_SPLIT_CAP=0 disables the cap below.
+_PAGED_WIDE_SPLIT_CAP = os.getenv("FLYDSL_PAGED_WIDE_SPLIT_CAP", "1") == "1"
+
+
+def _paged_wide_tile_split_cap(
+    splits: int,
+    num_batches: int,
+    num_heads: int,
+    seqlen_q: int,
+    kv_tiles: int,
+    head_dim: int,
+    gqa_packed: bool,
+) -> int:
+    """Cap the split count for multi-token (> 32 row) full-attention tiles.
+
+    Targets ~512 workgroups in flight at D=128 and ~2048 at D=64, with >= 4 KV
+    tiles per split. Only ever lowers the chain-length sizing.
+    """
+    rows = seqlen_q
+    if not _PAGED_WIDE_SPLIT_CAP or rows <= 32:
+        return splits
+    grid = num_batches * num_heads * -(-rows // _paged_block_m(gqa_packed, rows))
+    target = 512 if head_dim >= 128 else 2048
+    want = max(target / max(grid, 1), 1)
+    lo = 1 << (int(want).bit_length() - 1)
+    by_grid = lo * 2 if want / lo > 1.414 else lo
+    by_chain = 1 << (max(kv_tiles // 4, 1).bit_length() - 1)
+    return min(splits, max(8, min(by_grid, by_chain)))
+
+
 _UNIFORM_CU_SEQLENS: dict = {}
 
 
@@ -1333,6 +1363,16 @@ def _flydsl_flash_attn_paged(
         num_kv_splits = _paged_occupancy_topup(
             num_kv_splits, B, H, Sq, _span, D, _gqa_packed
         )
+        if not _paged_window:
+            num_kv_splits = _paged_wide_tile_split_cap(
+                num_kv_splits,
+                B,
+                H,
+                Sq,
+                -(-_kv_tiles // _PAGED_BLOCK_N_OUT),  # _kv_tiles counts tokens
+                D,
+                _gqa_packed,
+            )
         _auto_sized = True
 
     splitk = num_kv_splits > 1
