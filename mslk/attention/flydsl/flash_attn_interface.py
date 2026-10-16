@@ -816,6 +816,70 @@ def _paged_k_prefetch(
     return -(-tiles // max(num_kv_splits, 1)) >= need
 
 
+# FLYDSL_PAGED_SWA_KERNEL=0/1 overrides the choice below.
+_PAGED_SWA_KERNEL = os.getenv("FLYDSL_PAGED_SWA_KERNEL", "")
+
+
+def _paged_swa_kernel_config(
+    q,
+    k,
+    causal,
+    window_left,
+    return_lse,
+    varlen,
+    vectorized,
+    kv_seqstart,
+    seqlen_k,
+    block_table,
+    out,
+):
+    """(num_waves, num_splits) to run a windowed decode on pa_decode_swa, or None.
+
+    Each CTA streams its slice of the window through one CU, so this is used when
+    the batch fills the GPU (or D=64 at a moderate batch with 4 splits); other
+    shapes stay on the generic split-K kernel.
+    """
+    if (
+        _PAGED_SWA_KERNEL == "0"
+        or varlen
+        or vectorized
+        or not causal
+        or window_left < 0
+        or return_lse
+        or kv_seqstart is not None
+        or seqlen_k is None
+        or q.dim() != 4
+        or seqlen_k.dtype != torch.int32
+        or not seqlen_k.is_contiguous()
+        or block_table.dtype != torch.int32
+        or not block_table.is_contiguous()
+        or (out is not None and out.stride() != q.stride())
+    ):
+        return None
+    from .decode.pa_decode_swa import pa_decode_swa_supported
+
+    B, Sq, H, D = q.shape
+    H_kv = k.shape[2]
+    if not pa_decode_swa_supported(
+        head_dim=D,
+        num_heads=H,
+        num_kv_heads=H_kv,
+        seqlen_q=Sq,
+        page_size=k.shape[1],
+        window_left=window_left,
+        dtype=q.dtype,
+    ):
+        return None
+    if _PAGED_SWA_KERNEL == "1":
+        return (8, 1)
+    groups = B * H_kv
+    if D == 128 and Sq in (1, 4) and groups >= 256:
+        return (4, 1)
+    if D == 64 and Sq == 1 and 32 <= groups <= 64:
+        return (8, 4)
+    return None
+
+
 # FLYDSL_PAGED_PID_REGS=0/1 overrides the choice below.
 _PAGED_PID_REGS = os.getenv("FLYDSL_PAGED_PID_REGS", "")
 
@@ -1063,6 +1127,37 @@ def _flydsl_flash_attn_paged(
             )
 
     varlen = cu_seqlens_q is not None
+    _swa_cfg = _paged_swa_kernel_config(
+        q,
+        k,
+        causal,
+        window_left,
+        return_lse,
+        varlen,
+        vectorized,
+        kv_seqstart,
+        seqlen_k,
+        block_table,
+        out,
+    )
+    if _swa_cfg is not None:
+        from .decode.pa_decode_swa import pa_decode_swa_launch
+
+        if out is None:
+            out = torch.empty_like(q)
+        with torch.cuda.device(q.device.index):
+            return pa_decode_swa_launch(
+                q,
+                k,
+                v,
+                block_table,
+                seqlen_k,
+                window_left,
+                sm_scale if sm_scale is not None else q.shape[-1] ** -0.5,
+                out,
+                num_waves=_swa_cfg[0],
+                num_splits=_swa_cfg[1],
+            )
     # Dense paged callers hand us a per-request `seqlen_k` but the launch only
     # ever forwarded the batch maximum, so every request was masked to that
     # maximum and any shorter one read stale cache. Feed the kernel the real
