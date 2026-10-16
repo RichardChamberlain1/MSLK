@@ -806,18 +806,28 @@ _PAGED_NARROW_TILE = os.getenv("FLYDSL_PAGED_NARROW_TILE", "")
 
 
 def _paged_narrow_tile(
-    rows: int, window_left: int, q_len: int, kv_len: int, num_kv_splits: int
+    rows: int,
+    window_left: int,
+    q_len: int,
+    kv_len: int,
+    num_kv_splits: int,
+    head_dim: int,
+    groups: int,
 ) -> bool:
     """Use a 32-row, single-wave Q tile instead of the 64-row default.
 
     With <= 32 packed rows the 64-row tile's second wave is all padding; halving
     the tile lets more workgroups share a CU. Only used for long KV walks, since
-    a single wave issues each tile's loads alone.
+    a single wave issues each tile's loads alone. A single-token D=128 decode of
+    one request (``groups`` = batch x KV heads) keeps the 64-row tile for wave
+    split-K over KV columns.
     """
     if rows > 32:
         return False
     if _PAGED_NARROW_TILE in ("0", "1"):
         return _PAGED_NARROW_TILE == "1"
+    if window_left < 0 and q_len == 1 and head_dim >= 128 and groups <= 4:
+        return False
     span = min(kv_len, window_left + q_len) if window_left >= 0 else kv_len
     tiles = -(-max(span, 1) // _PAGED_BLOCK_N_OUT)
     return -(-tiles // max(num_kv_splits, 1)) >= 16
@@ -1612,7 +1622,13 @@ def _flydsl_flash_attn_paged(
                 )
             _paged_bm = _paged_block_m(_gqa_packed, Sq)
             if _paged_narrow_tile(
-                Sq, window_left, _gqa_qlen if _gqa_packed else Sq, skv, num_kv_splits
+                Sq,
+                window_left,
+                _gqa_qlen if _gqa_packed else Sq,
+                skv,
+                num_kv_splits,
+                D,
+                B * H,
             ):
                 _paged_bm = 32
             fused_combine = _paged_light_ok and _paged_fused_combine(
