@@ -25,9 +25,10 @@ from flydsl._mlir.dialects import (
     llvm as _llvm,
     scf as _scf,
 )
-from flydsl.expr import arith as _expr_arith, buffer_ops, const_expr
+from flydsl.expr import arith as _expr_arith, const_expr
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
+from mslk.flydsl import buffer_ops
 
 
 def get_llvm_ptr(ptr, offset, dtype_bytes, ptr_type=None):
