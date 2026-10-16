@@ -875,9 +875,9 @@ def _paged_swa_kernel_config(
 ):
     """(num_waves, num_splits) to run a windowed decode on pa_decode_swa, or None.
 
-    Each CTA streams its slice of the window through one CU, so this is used when
-    the batch fills the GPU (or D=64 at a moderate batch with 4 splits); other
-    shapes stay on the generic split-K kernel.
+    Each CTA streams its slice of the window through one CU, so this is used once
+    the (request, KV head) groups, split as needed, fill the GPU; smaller
+    batches stay on the generic split-K kernel.
     """
     if (
         _PAGED_SWA_KERNEL == "0"
@@ -911,12 +911,21 @@ def _paged_swa_kernel_config(
     ):
         return None
     if _PAGED_SWA_KERNEL == "1":
-        return (8, 1)
-    groups = B * H_kv
-    if D == 128 and Sq in (1, 4) and groups >= 256:
         return (4, 1)
-    if D == 64 and Sq == 1 and 32 <= groups <= 64:
-        return (8, 4)
+    groups = B * H_kv
+    m_tiles = -(-Sq // (16 // (H // H_kv)))
+    # Splits bring the grid to about one CTA per CU.
+    splits = max(1, min(8, 256 // groups))
+    if m_tiles == 1:
+        if D == 128 and groups >= 64:
+            return (4, 1) if groups >= 256 else (2, splits)
+        if D == 64 and groups >= 32:
+            if groups >= 256:
+                return (2, 1)
+            return (4, 1) if groups >= 128 else (4, splits)
+        return None
+    if groups >= (32 if D == 64 else 128):
+        return (4, splits)
     return None
 
 
