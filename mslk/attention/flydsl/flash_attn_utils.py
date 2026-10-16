@@ -1629,6 +1629,9 @@ def _make_flash_attn_generic_traits(
         and q_pack_group > 0
         and q_pack_qlen == 1
         and q_pack_group * q_pack_qlen <= rows_per_wave
+        # Each wave owns one K_SUB_N column slice, so the waves must cover a
+        # tile exactly; a single-wave (narrow) tile would drop half its keys.
+        and num_waves * k_sub_n == block_n
         and window_left < 0
         and (head_dim >= _wsk_min_d or high_concurrency)
         and not enable_gfx942_kv_gpfetch
