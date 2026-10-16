@@ -887,22 +887,24 @@ def _paged_swa_kernel_config(
     seqlen_k,
     block_table,
     out,
+    num_kv_splits=0,
 ):
-    """(num_waves, num_splits) to run a windowed decode on pa_decode_swa, or None.
+    """(num_waves, num_splits) to run a paged decode on pa_decode_swa, or None.
 
-    Each CTA streams its slice of the window through one CU, so this is used once
-    the (request, KV head) groups, split as needed, fill the GPU; smaller
-    batches stay on the generic split-K kernel.
+    Each CTA streams its slice of the keys through one CU. Windowed decodes use
+    it once the (request, KV head) groups, split as needed, fill the GPU;
+    full-attention decodes over a few groups split each group across the GPU.
+    Other shapes stay on the generic split-K kernel.
     """
     if (
         _PAGED_SWA_KERNEL == "0"
         or varlen
         or vectorized
         or not causal
-        or window_left < 0
         or return_lse
         or kv_seqstart is not None
         or seqlen_k is None
+        or block_table is None
         or q.dim() != 4
         or seqlen_k.dtype != torch.int32
         or not seqlen_k.is_contiguous()
@@ -915,7 +917,37 @@ def _paged_swa_kernel_config(
 
     B, Sq, H, D = q.shape
     H_kv = k.shape[2]
-    if not pa_decode_swa_supported(
+    if H_kv == 0 or H % H_kv or 16 % (H // H_kv):
+        return None
+    groups = B * H_kv
+    m_tiles = -(-Sq // (16 // (H // H_kv)))
+    # Splits bring the grid to about one CTA per CU.
+    splits = max(1, min(8, 256 // groups))
+    cfg = None
+    if _PAGED_SWA_KERNEL == "1":
+        cfg = (4, 1)
+    elif window_left < 0:
+        # Full attention over a few requests and moderate contexts (left to
+        # the generic kernel when the caller sets the split count): the CTAs
+        # of a (request, KV head) split its keys, merged by the reduce kernel.
+        keys = block_table.shape[1] * k.shape[1]
+        if num_kv_splits > 1 or groups * keys > 1 << 18:
+            cfg = None
+        elif m_tiles == 1:
+            cfg = (2, 256 // groups)
+        elif m_tiles == 2 and D == 64:
+            cfg = (4, 256 // groups)
+    elif m_tiles == 1:
+        if D == 128 and groups >= 64:
+            cfg = (4, 1) if groups >= 256 else (2, splits)
+        elif D == 64 and groups >= 32:
+            if groups >= 256:
+                cfg = (2, 1)
+            else:
+                cfg = (4, 1) if groups >= 128 else (4, splits)
+    elif groups >= (32 if D == 64 else 128):
+        cfg = (4, splits)
+    if cfg is None or not pa_decode_swa_supported(
         head_dim=D,
         num_heads=H,
         num_kv_heads=H_kv,
@@ -923,25 +955,12 @@ def _paged_swa_kernel_config(
         page_size=k.shape[1],
         window_left=window_left,
         dtype=q.dtype,
+        kv_capacity=block_table.shape[1] * k.shape[1],
+        num_waves=cfg[0],
+        num_splits=cfg[1],
     ):
         return None
-    if _PAGED_SWA_KERNEL == "1":
-        return (4, 1)
-    groups = B * H_kv
-    m_tiles = -(-Sq // (16 // (H // H_kv)))
-    # Splits bring the grid to about one CTA per CU.
-    splits = max(1, min(8, 256 // groups))
-    if m_tiles == 1:
-        if D == 128 and groups >= 64:
-            return (4, 1) if groups >= 256 else (2, splits)
-        if D == 64 and groups >= 32:
-            if groups >= 256:
-                return (2, 1)
-            return (4, 1) if groups >= 128 else (4, splits)
-        return None
-    if groups >= (32 if D == 64 else 128):
-        return (4, splits)
-    return None
+    return cfg
 
 
 # FLYDSL_PAGED_PID_REGS=0/1 overrides the choice below.
@@ -1203,6 +1222,7 @@ def _flydsl_flash_attn_paged(
         seqlen_k,
         block_table,
         out,
+        num_kv_splits,
     )
     if _swa_cfg is not None:
         from .decode.pa_decode_swa import pa_decode_swa_launch
