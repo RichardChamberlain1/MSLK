@@ -1660,6 +1660,8 @@ def _flydsl_flash_attn_paged(
                 if seqlen_k.dtype == torch.int32 and seqlen_k.is_contiguous()
                 else seqlen_k.to(torch.int32).contiguous()
             )
+        # Stride-packed builds compile the row count (q_len * group) in.
+        assert not (_gqa_stride_packed and causal) or Sq == _gqa_qlen * _gqa_group
         exe(q_flat, k_flat, v_flat, o_flat, B, Sq, **kwargs)
         if o_flat.data_ptr() != out.data_ptr():
             out.copy_(o_flat.view_as(out))
