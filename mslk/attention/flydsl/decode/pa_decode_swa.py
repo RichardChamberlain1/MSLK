@@ -9,9 +9,9 @@
 """FlyDSL sliding-window paged decode (gfx950), single launch.
 
 Each (request, KV head) is handled by num_splits CTAs whose waves each walk a
-contiguous slice of the window, using the head-packed MFMA layout of
-pa_decode_gfx950 (16 M rows hold the GQA group's (query token, head) pairs) and
-a private LDS region, so the KV loop needs no CTA barrier. The waves merge
+contiguous slice of the window, with the GQA group's (query token, head) pairs
+packed on 16 MFMA rows and a private LDS region, so the KV loop needs no CTA
+barrier. The waves merge
 through LDS; with num_splits > 1 the CTAs then merge in-kernel via a workspace.
 
 Query row i (bottom-right causal) attends keys in (pos - window_left, pos],
@@ -40,7 +40,6 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr  # pyre-ignore[21
 from mslk.flydsl import buffer_ops, vector_ops as vector
 
 from .utils import (
-    dpp_xor_f32,
     exp2_f32 as _exp2_fast,
     maxnumf as _mxf,
     rcp_f32,
@@ -88,20 +87,18 @@ def compile_pa_decode_swa(
     _FX_KV = _FX_DTYPE[kv_dtype_str]
     _QK_GRP = _HEAD // MFMA_K_QK
     _DN = _HEAD // MFMA_N
-    _N_ACC = _DN * 4
     _mfma = (
         rocdl.mfma_f32_16x16x32_bf16
         if kv_dtype_str == "bf16"
         else rocdl.mfma_f32_16x16x32_f16
     )
 
-    # Per-wave LDS region: the loop's P planes + V tile, later reused by that
-    # wave for its merge partials (acc rows, then max and sum).
+    # Per-wave LDS region: the loop's K and V tiles, later reused by that wave
+    # for its merge partials (acc rows, then max and sum).
     _NUM_LD_V = (TILE_N * _HEAD // 8) // WARP_SIZE  # vec8 V loads per lane
-    _P_F32 = _M_TILES * MFMA_M * TILE_N
     _V_F16 = TILE_N * _HEAD
     _K_F16 = TILE_N * _HEAD  # K tile, row-major with a 16B-chunk XOR swizzle
-    _LOOP_BYTES = _P_F32 * 4 + (_V_F16 + _K_F16) * 2
+    _LOOP_BYTES = (_V_F16 + _K_F16) * 2
     _C8 = _HEAD // 8  # 16-byte chunks per K/V row
     _ACC_F32 = _M_TILES * MFMA_M * _HEAD
     _MERGE_BYTES = (_ACC_F32 + 2 * _M_TILES * MFMA_M) * 4
@@ -161,7 +158,6 @@ def compile_pa_decode_swa(
         c_one = arith.constant(1.0, type=T.f32)
         c_neginf = arith.constant(float("-inf"), type=T.f32)
         zero_v4 = arith.constant_vector(0.0, T.vec(4, T.f32))
-        zero_v8h = arith.constant_vector(0.0, T.vec(8, _FX_KV.ir_type))
 
         q_rsrc = buffer_ops.create_buffer_resource(q_ptr, max_size=True)
         k_rsrc = buffer_ops.create_buffer_resource(k_ptr, max_size=True)
@@ -194,7 +190,7 @@ def compile_pa_decode_swa(
         lds_f32 = SmemPtr(smem, 0, T.f32, shape=(_LDS_TOTAL // 4,)).get()
         lds_base = buffer_ops.extract_base_index(smem, address_space=3)
         my_f32 = fx.Int32(wave) * fx.Int32(_R_F32)  # this wave's region, f32 units
-        v_lds_f16 = lds_base + fx.Index(my_f32 * fx.Int32(2) + fx.Int32(_P_F32 * 2))
+        v_lds_f16 = lds_base + fx.Index(my_f32 * fx.Int32(2))
         k_lds_f16 = v_lds_f16 + fx.Index(_V_F16)
 
         # Q fragments, loop-invariant. M slot m = qtok * ratio + head.
@@ -221,7 +217,6 @@ def compile_pa_decode_swa(
             q_frags.append(frags)
 
         kv_base = hkv_abs * stride_kh
-        _TILE_STATE = 8 + _N_ACC
 
         def _load_tile(tile_start):
             """Issue one tile's K and V loads, coalesced: a lane loads one 16B
@@ -255,25 +250,55 @@ def compile_pa_decode_swa(
 
         # Register double buffer: the next tile's K/V loads are issued before
         # this tile's math. A wave's last tile re-issues itself (harmless).
+        #
+        # The MFMAs compute S^T = K Q^T and O^T = V^T P^T, so a lane owns one
+        # query row (its MFMA column) and the S^T accumulator feeds the P^T
+        # operand directly: the PV reduction runs over the tile's tokens in
+        # the order this lane holds them, (st, grp, e) -> st*16 + grp*4 + e,
+        # and V is read in that same order. Per lane the state is that row's
+        # running max, a partial sum over the lane's own tokens (reduced
+        # across the row's lanes after the loop) and O^T rows grp*4 + e of
+        # each 16-wide head-dim slice.
         _k0, _v0 = _load_tile(w_start)
-        _init = (
-            ([c_neginf] * 4 + [c_zero] * 4 + [c_zero] * _N_ACC) * _M_TILES + _k0 + _v0
-        )
+        _TILE_STATE = 2 + _DN
+        _init = ([c_neginf, c_zero] + [zero_v4] * _DN) * _M_TILES + _k0 + _v0
         _KV_OFF = _TILE_STATE * _M_TILES
+        _c_log2 = fx.Float32(
+            arith.mulf(arith.unwrap(softmax_scale), arith.constant(LOG2E, type=T.f32))
+        )
+        _v8h = T.vec(8, _FX_KV.ir_type)
+        _v4h = T.vec(4, _FX_KV.ir_type)
+
+        def _row_bounds(t):
+            """[begin, end) of keys this lane's query row may attend."""
+            qtok = fx.Int32(t * _T_PACK) + tok_lane // fx.Int32(_RATIO)
+            end_q = t_full - fx.Int32(_SQ) + qtok + fx.Int32(1)
+            begin = end_q - window_left
+            end = fx.Int32(arith.select(w_end < end_q, w_end, end_q))
+            return begin, end
+
+        bounds = [_row_bounds(t) for t in range_constexpr(_M_TILES)]
+
+        def _xor_hi(val, op):
+            """op(val, val of lane ^ 16), then with lane ^ 32: a reduction over
+            the four lanes holding one query row."""
+            for swap in (rocdl.permlane16_swap, rocdl.permlane32_swap):
+                src = arith.bitcast(T.i32, arith.unwrap(val))
+                pair = swap(
+                    _llvm.StructType.get_literal([T.i32, T.i32]), src, src, False, False
+                )
+                lhs = arith.bitcast(T.f32, _llvm.extractvalue(T.i32, pair, [0]))
+                rhs = arith.bitcast(T.f32, _llvm.extractvalue(T.i32, pair, [1]))
+                val = op(fx.Float32(lhs), fx.Float32(rhs))
+            return val
 
         for _tile_i, state in range(
             fx.Index(w_start), fx.Index(w_end), arith.index(TILE_N), init=_init
         ):
-            rmax = [
-                [fx.Float32(state[t * _TILE_STATE + i]) for i in range(4)]
-                for t in range(_M_TILES)
-            ]
-            rsum = [
-                [fx.Float32(state[t * _TILE_STATE + 4 + i]) for i in range(4)]
-                for t in range(_M_TILES)
-            ]
+            rmax = [fx.Float32(state[t * _TILE_STATE]) for t in range(_M_TILES)]
+            rsum = [fx.Float32(state[t * _TILE_STATE + 1]) for t in range(_M_TILES)]
             acc = [
-                [fx.Float32(state[t * _TILE_STATE + 8 + i]) for i in range(_N_ACC)]
+                [state[t * _TILE_STATE + 2 + i] for i in range(_DN)]
                 for t in range(_M_TILES)
             ]
             tile_start = fx.Int32(arith.index_cast(T.i32, _tile_i))
@@ -283,19 +308,13 @@ def compile_pa_decode_swa(
             nxt = fx.Int32(arith.select(nxt < w_end, nxt, tile_start))
             nxt_k, nxt_v = _load_tile(nxt)
 
-            # Park this tile's K (swizzled rows) and V (transpose layout) in LDS.
-            _v8s = cur_v
-            _v8dst = []
+            # Park this tile's K (swizzled rows) and V (transpose layout) in
+            # LDS. This wave alone reads them, and a wavefront's LDS operations
+            # complete in order: only the compiler needs fencing.
             for _r in range_constexpr(_NUM_LD_V):
                 _lin = lane + fx.Int32(_r * WARP_SIZE)
                 _tok = _lin // fx.Int32(_C8)
                 _c8 = _lin % fx.Int32(_C8)
-                _v8dst.append(
-                    v_lds_f16
-                    + fx.Index(_c8 // fx.Int32(2)) * fx.Index(TILE_N * 16)
-                    + fx.Index(_tok) * fx.Index(16)
-                    + fx.Index(_c8 % fx.Int32(2)) * fx.Index(8)
-                )
                 _kdst = k_lds_f16 + fx.Index(
                     _tok * fx.Int32(_HEAD)
                     + (_c8 ^ (_tok % fx.Int32(_C8))) * fx.Int32(8)
@@ -307,11 +326,24 @@ def compile_pa_decode_swa(
                     ),
                     alignment=16,
                 )
+                _vdst = (
+                    v_lds_f16
+                    + fx.Index(_c8 // fx.Int32(2)) * fx.Index(TILE_N * 16)
+                    + fx.Index(_tok) * fx.Index(16)
+                    + fx.Index(_c8 % fx.Int32(2)) * fx.Index(8)
+                )
+                _llvm.StoreOp(
+                    cur_v[_r],
+                    buffer_ops.create_llvm_ptr(
+                        fx.Int64(_vdst * fx.Index(2)), address_space=3
+                    ),
+                    alignment=16,
+                )
             fx.llvm.memory_fence(
                 syncscope=rocdl.SyncScope.Wavefront, ordering=fx.AtomicOrdering.AcqRel
             )
 
-            qk_st = [[zero_v4 for _ in range(N_SUBTILE)] for _ in range(_M_TILES)]
+            s_t = [[zero_v4 for _ in range(N_SUBTILE)] for _ in range(_M_TILES)]
             for st in range_constexpr(N_SUBTILE):
                 _row = fx.Int32(st * MFMA_N) + tok_lane
                 for g in range_constexpr(_QK_GRP):
@@ -321,187 +353,100 @@ def compile_pa_decode_swa(
                         + (_c ^ (_row % fx.Int32(_C8))) * fx.Int32(8)
                     )
                     k8 = _llvm.LoadOp(
-                        T.vec(8, _FX_KV.ir_type),
+                        _v8h,
                         buffer_ops.create_llvm_ptr(
                             fx.Int64(_ksrc * fx.Index(2)), address_space=3
                         ),
                         alignment=16,
                     ).result
                     for t in range_constexpr(_M_TILES):
-                        qk_st[t][st] = _mfma(
-                            T.vec(4, T.f32), [q_frags[t][g], k8, qk_st[t][st], 0, 0, 0]
+                        s_t[t][st] = _mfma(
+                            T.vec(4, T.f32), [k8, q_frags[t][g], s_t[t][st], 0, 0, 0]
                         )
 
-            new_max = [[] for _ in range(_M_TILES)]
-            alpha = [[] for _ in range(_M_TILES)]
-            for t in range_constexpr(_M_TILES):
-                for e in range_constexpr(4):
-                    m_idx = grp * fx.Int32(4) + fx.Int32(e)
-                    qtok = fx.Int32(t * _T_PACK) + m_idx // fx.Int32(_RATIO)
-                    end_m = t_full - fx.Int32(_SQ) + qtok + fx.Int32(1)
-                    end_m = fx.Int32(arith.select(w_end < end_m, w_end, end_m))
-                    begin_m = t_full - fx.Int32(_SQ) + qtok + fx.Int32(1) - window_left
-                    loc = fx.Float32(c_neginf)
-                    for st in range_constexpr(N_SUBTILE):
-                        s = fx.Float32(
-                            vector.extract(
-                                qk_st[t][st], static_position=[e], dynamic_position=[]
-                            )
-                        )
-                        s = fx.Float32(
-                            arith.mulf(arith.unwrap(s), arith.unwrap(softmax_scale))
-                        )
-                        tok_abs = tile_start + fx.Int32(st * MFMA_N) + tok_lane
-                        ok = (tok_abs < end_m) & (tok_abs >= begin_m)
-                        s = fx.Float32(
-                            arith.select(arith.unwrap(ok), arith.unwrap(s), c_neginf)
-                        )
-                        loc = _mxf(loc, s)
-                        qk_st[t][st] = vector.insert(
-                            arith.unwrap(s),
-                            qk_st[t][st],
-                            static_position=[e],
-                            dynamic_position=[],
-                        )
-                    for sh in (1, 2, 4, 8):
-                        loc = _mxf(loc, dpp_xor_f32(loc, sh))
-                    nm = _mxf(rmax[t][e], loc)
-                    new_max[t].append(nm)
-                    a = _exp2_fast(
-                        fx.Float32(
-                            arith.mulf(
-                                arith.subf(arith.unwrap(rmax[t][e]), arith.unwrap(nm)),
-                                arith.constant(LOG2E, type=T.f32),
-                            )
-                        )
-                    )
-                    # A row with nothing seen yet has rmax = nm = -inf: exp2(NaN).
-                    a = fx.Float32(
-                        arith.select(
-                            arith.unwrap(nm) > c_neginf, arith.unwrap(a), c_one
-                        )
-                    )
-                    alpha[t].append(a)
-
-            for t in range_constexpr(_M_TILES):
-                tile_sum = [fx.Float32(c_zero) for _ in range(4)]
-                for e in range_constexpr(4):
-                    m_idx = grp * fx.Int32(4) + fx.Int32(e)
-                    for st in range_constexpr(N_SUBTILE):
-                        s = fx.Float32(
-                            vector.extract(
-                                qk_st[t][st], static_position=[e], dynamic_position=[]
-                            )
-                        )
-                        p = _exp2_fast(
-                            fx.Float32(
-                                arith.mulf(
-                                    arith.subf(
-                                        arith.unwrap(s), arith.unwrap(new_max[t][e])
-                                    ),
-                                    arith.constant(LOG2E, type=T.f32),
-                                )
-                            )
-                        )
-                        p = fx.Float32(
-                            arith.select(
-                                arith.unwrap(new_max[t][e]) > c_neginf,
-                                arith.unwrap(p),
-                                c_zero,
-                            )
-                        )
-                        tile_sum[e] = fx.Float32(
-                            arith.addf(arith.unwrap(tile_sum[e]), arith.unwrap(p))
-                        )
-                        tok = fx.Int32(st * MFMA_N) + tok_lane
-                        vector.store(
-                            fx.Vector.from_elements(
-                                [arith.unwrap(p)], dtype=fx.Float32
-                            ),
-                            lds_f32,
-                            [
-                                fx.Index(
-                                    my_f32
-                                    + fx.Int32(t * MFMA_M * TILE_N)
-                                    + m_idx * fx.Int32(TILE_N)
-                                    + tok
-                                )
-                            ],
-                        )
-                for e in range_constexpr(4):
-                    for sh in (1, 2, 4, 8):
-                        tile_sum[e] = fx.Float32(
-                            arith.addf(
-                                arith.unwrap(tile_sum[e]),
-                                arith.unwrap(dpp_xor_f32(tile_sum[e], sh)),
-                            )
-                        )
-                    rsum[t][e] = fx.Float32(
-                        arith.addf(
-                            arith.mulf(
-                                arith.unwrap(alpha[t][e]), arith.unwrap(rsum[t][e])
-                            ),
-                            arith.unwrap(tile_sum[e]),
-                        )
-                    )
-                    rmax[t][e] = new_max[t][e]
-
-            for _r in range_constexpr(_NUM_LD_V):
-                _sp = buffer_ops.create_llvm_ptr(
-                    fx.Int64(_v8dst[_r] * fx.Index(2)), address_space=3
-                )
-                _llvm.StoreOp(_v8s[_r], _sp, alignment=16)
-            # This wave alone reads what it just wrote, and a wavefront's LDS
-            # operations complete in order: only the compiler needs fencing.
-            fx.llvm.memory_fence(
-                syncscope=rocdl.SyncScope.Wavefront, ordering=fx.AtomicOrdering.AcqRel
-            )
-
-            for t in range_constexpr(_M_TILES):
-                for dpass in range_constexpr(_DN):
-                    for e in range_constexpr(4):
-                        acc[t][dpass * 4 + e] = fx.Float32(
-                            arith.mulf(
-                                arith.unwrap(acc[t][dpass * 4 + e]),
-                                arith.unwrap(alpha[t][e]),
-                            )
-                        )
             p_frags = []
+            alphas = []
             for t in range_constexpr(_M_TILES):
-                p_frag = zero_v8h
-                for j in range_constexpr(8):
-                    pv = fx.Vector.load(
-                        T.vec(1, T.f32),
-                        lds_f32,
-                        [
-                            fx.Index(
-                                my_f32
-                                + fx.Int32(t * MFMA_M * TILE_N)
-                                + tok_lane * fx.Int32(TILE_N)
-                                + grp * fx.Int32(8)
-                                + fx.Int32(j)
+                begin, end = bounds[t]
+                # Key st*16 + grp*4 + e is visible iff it lies in [begin, end).
+                rel = tile_start + grp * fx.Int32(4) - begin
+                span = end - begin
+                span = fx.Int32(arith.select(span > fx.Int32(0), span, fx.Int32(0)))
+                s_vals = []
+                loc = fx.Float32(c_neginf)
+                for st in range_constexpr(N_SUBTILE):
+                    for e in range_constexpr(4):
+                        s = fx.Float32(
+                            vector.extract(
+                                s_t[t][st], static_position=[e], dynamic_position=[]
                             )
-                        ],
-                    )[0]
-                    p_frag = vector.insert(
-                        arith.truncf(_FX_KV.ir_type, arith.unwrap(fx.Float32(pv))),
-                        p_frag,
-                        static_position=[j],
-                        dynamic_position=[],
+                        )
+                        ok = arith.cmpi(
+                            arith.CmpIPredicate.ult,
+                            arith.unwrap(rel + fx.Int32(st * MFMA_N + e)),
+                            arith.unwrap(span),
+                        )
+                        s = fx.Float32(arith.select(ok, arith.unwrap(s), c_neginf))
+                        loc = _mxf(loc, s)
+                        s_vals.append(s)
+                loc = _xor_hi(loc, _mxf)
+                nm = _mxf(rmax[t], loc)
+                # A row with nothing visible yet keeps nm = -inf; offsetting by
+                # 0 then sends every exp2 to 0 instead of NaN.
+                nm_c = fx.Float32(
+                    arith.select(
+                        arith.unwrap(nm) > c_neginf,
+                        arith.mulf(arith.unwrap(nm), arith.unwrap(_c_log2)),
+                        c_zero,
                     )
-                p_frags.append(p_frag)
+                )
 
-            _v4h = T.vec(4, _FX_KV.ir_type)
+                def _p(x):
+                    return _exp2_fast(
+                        fx.Float32(
+                            arith.subf(
+                                arith.mulf(arith.unwrap(x), arith.unwrap(_c_log2)),
+                                arith.unwrap(nm_c),
+                            )
+                        )
+                    )
+
+                alpha = _p(rmax[t])
+                ps = [_p(s) for s in s_vals]
+                tile_sum = ps[0]
+                for p in ps[1:]:
+                    tile_sum = fx.Float32(
+                        arith.addf(arith.unwrap(tile_sum), arith.unwrap(p))
+                    )
+                rsum[t] = fx.Float32(
+                    arith.addf(
+                        arith.mulf(arith.unwrap(alpha), arith.unwrap(rsum[t])),
+                        arith.unwrap(tile_sum),
+                    )
+                )
+                rmax[t] = nm
+                alphas.append(alpha)
+                p_frags.append(
+                    fx.Vector.from_elements(
+                        [arith.truncf(_FX_KV.ir_type, arith.unwrap(p)) for p in ps],
+                        dtype=_FX_KV,
+                    )
+                )
+
             for dpass in range_constexpr(_DN):
-                _gb = fx.Int32(dpass * (TILE_N * 16)) + grp * fx.Int32(8 * 16)
-                _off_lo = v_lds_f16 + fx.Index(_gb) + fx.Index(tok_lane) * fx.Index(4)
+                _blk = v_lds_f16 + fx.Index(dpass * (TILE_N * 16))
+                _off_lo = (
+                    _blk
+                    + fx.Index(grp * fx.Int32(4 * 16))
+                    + fx.Index(tok_lane) * fx.Index(4)
+                )
                 _vlo = rocdl.ds_read_tr16_b64(
                     _v4h,
                     buffer_ops.create_llvm_ptr(
                         fx.Int64(_off_lo * fx.Index(2)), address_space=3
                     ),
                 ).result
-                _off_hi = _off_lo + fx.Index(4 * 16)
+                _off_hi = _off_lo + fx.Index(MFMA_N * 16)
                 _vhi = rocdl.ds_read_tr16_b64(
                     _v4h,
                     buffer_ops.create_llvm_ptr(
@@ -510,21 +455,12 @@ def compile_pa_decode_swa(
                 ).result
                 v_frag = vector.shuffle(_vlo, _vhi, [0, 1, 2, 3, 4, 5, 6, 7])
                 for t in range_constexpr(_M_TILES):
-                    c_in = zero_v4
-                    for e in range_constexpr(4):
-                        c_in = vector.insert(
-                            arith.unwrap(acc[t][dpass * 4 + e]),
-                            c_in,
-                            static_position=[e],
-                            dynamic_position=[],
-                        )
-                    c_out = _mfma(T.vec(4, T.f32), [p_frags[t], v_frag, c_in, 0, 0, 0])
-                    for e in range_constexpr(4):
-                        acc[t][dpass * 4 + e] = fx.Float32(
-                            vector.extract(
-                                c_out, static_position=[e], dynamic_position=[]
-                            )
-                        )
+                    a4 = vector.broadcast(T.vec(4, T.f32), arith.unwrap(alphas[t]))
+                    c_in = arith.mulf(acc[t][dpass], a4)
+                    acc[t][dpass] = _mfma(
+                        T.vec(4, T.f32),
+                        [v_frag, arith.unwrap(p_frags[t]), c_in, 0, 0, 0],
+                    )
             fx.llvm.memory_fence(
                 syncscope=rocdl.SyncScope.Wavefront, ordering=fx.AtomicOrdering.AcqRel
             )
@@ -534,9 +470,8 @@ def compile_pa_decode_swa(
                     x
                     for t in range(_M_TILES)
                     for x in (
-                        [arith.unwrap(rmax[t][i]) for i in range(4)]
-                        + [arith.unwrap(rsum[t][i]) for i in range(4)]
-                        + [arith.unwrap(acc[t][i]) for i in range(_N_ACC)]
+                        [arith.unwrap(rmax[t]), arith.unwrap(rsum[t])]
+                        + [arith.unwrap(acc[t][i]) for i in range(_DN)]
                     )
                 ]
                 + list(nxt_k)
@@ -545,107 +480,119 @@ def compile_pa_decode_swa(
             results = yield state_out
 
         # ── Merge: each wave parks its partial in its own region, then the CTA
-        # combines the waves per output element. ──
+        # combines the waves; a thread owns 8 consecutive head-dim values of one
+        # row, so each row's weights are computed once per thread. ──
         _M_OFF = _ACC_F32  # max rows, then sum rows, after the acc rows
+        _M16 = _M_TILES * MFMA_M
         for t in range_constexpr(_M_TILES):
-            for e in range_constexpr(4):
-                m_idx = grp * fx.Int32(4) + fx.Int32(e)
-                row = fx.Int32(t * MFMA_M) + m_idx
-                for dpass in range_constexpr(_DN):
-                    vector.store(
-                        fx.Vector.from_elements(
-                            [results[t * _TILE_STATE + 8 + dpass * 4 + e]],
-                            dtype=fx.Float32,
-                        ),
-                        lds_f32,
-                        [
-                            fx.Index(
-                                my_f32
-                                + row * fx.Int32(_HEAD)
-                                + fx.Int32(dpass * MFMA_N)
-                                + tok_lane
-                            )
-                        ],
-                    )
-                if tok_lane == fx.Int32(0):
-                    vector.store(
-                        fx.Vector.from_elements(
-                            [results[t * _TILE_STATE + e]], dtype=fx.Float32
-                        ),
-                        lds_f32,
-                        [fx.Index(my_f32 + fx.Int32(_M_OFF) + row)],
-                    )
-                    vector.store(
-                        fx.Vector.from_elements(
-                            [results[t * _TILE_STATE + 4 + e]], dtype=fx.Float32
-                        ),
-                        lds_f32,
-                        [fx.Index(my_f32 + fx.Int32(_M_OFF + _M_TILES * MFMA_M) + row)],
-                    )
+            row = fx.Int32(t * MFMA_M) + tok_lane
+            for dpass in range_constexpr(_DN):
+                vector.store(
+                    fx.Vector(results[t * _TILE_STATE + 2 + dpass]),
+                    lds_f32,
+                    [
+                        fx.Index(
+                            my_f32
+                            + row * fx.Int32(_HEAD)
+                            + fx.Int32(dpass * MFMA_N)
+                            + grp * fx.Int32(4)
+                        )
+                    ],
+                )
+            row_sum = _xor_hi(
+                fx.Float32(results[t * _TILE_STATE + 1]),
+                lambda a, b: fx.Float32(arith.addf(arith.unwrap(a), arith.unwrap(b))),
+            )
+            # The running max is kept unscaled; the merge works in scaled units.
+            row_max = arith.mulf(results[t * _TILE_STATE], arith.unwrap(softmax_scale))
+            if grp == fx.Int32(0):
+                vector.store(
+                    fx.Vector.from_elements([row_max], dtype=fx.Float32),
+                    lds_f32,
+                    [fx.Index(my_f32 + fx.Int32(_M_OFF) + row)],
+                )
+                vector.store(
+                    fx.Vector.from_elements([arith.unwrap(row_sum)], dtype=fx.Float32),
+                    lds_f32,
+                    [fx.Index(my_f32 + fx.Int32(_M_OFF + _M16) + row)],
+                )
         gpu.barrier()
 
-        _OUTS = _M_TILES * MFMA_M * _HEAD
-        _M16 = _M_TILES * MFMA_M
-        _NPASS = (_OUTS + _BLOCK - 1) // _BLOCK
-        _FX_OUT = _FX_KV
+        _V = 8  # head-dim values per thread
+        _SLOTS = _M16 * (_HEAD // _V)
+        _NPASS = (_SLOTS + _BLOCK - 1) // _BLOCK
+        _v4f = T.vec(4, T.f32)
 
         def _out_coords(i):
             idx = tid + fx.Int32(i * _BLOCK)
-            row = idx // fx.Int32(_HEAD)
-            d = idx % fx.Int32(_HEAD)
+            row = idx // fx.Int32(_HEAD // _V)
+            d0 = (idx % fx.Int32(_HEAD // _V)) * fx.Int32(_V)
             m = row % fx.Int32(MFMA_M)
             qtok = (row // fx.Int32(MFMA_M)) * fx.Int32(_T_PACK) + m // fx.Int32(_RATIO)
             head_abs = hq_base + m % fx.Int32(_RATIO)
-            ok = (idx < fx.Int32(_OUTS)) & (qtok < fx.Int32(_SQ)) & (head_abs < num_hq)
-            return row, d, qtok, head_abs, ok
+            ok = (idx < fx.Int32(_SLOTS)) & (qtok < fx.Int32(_SQ)) & (head_abs < num_hq)
+            return row, d0, qtok, head_abs, ok
+
+        def _f(x):
+            return fx.Float32(x)
 
         def _lse_merge(parts):
-            """(max, sum, numerator) parts -> merged; a part with max -inf is empty."""
+            """(max, sum, [numerator vec4] ) parts -> merged; max -inf is empty."""
             mx = parts[0][0]
             for pm, _, _ in parts[1:]:
                 mx = _mxf(mx, pm)
-            den = fx.Float32(c_zero)
-            num = fx.Float32(c_zero)
+            den = _f(c_zero)
+            num = [zero_v4 for _ in parts[0][2]]
             for pm, pl, pn in parts:
                 sc = _exp2_fast(
-                    fx.Float32(
+                    _f(
                         arith.mulf(
                             arith.subf(arith.unwrap(pm), arith.unwrap(mx)),
                             arith.constant(LOG2E, type=T.f32),
                         )
                     )
                 )
-                sc = fx.Float32(
+                sc = _f(
                     arith.select(arith.unwrap(pm) > c_neginf, arith.unwrap(sc), c_zero)
                 )
-                den = fx.Float32(
+                den = _f(
                     arith.addf(
                         arith.unwrap(den),
                         arith.mulf(arith.unwrap(sc), arith.unwrap(pl)),
                     )
                 )
-                num = fx.Float32(
-                    arith.addf(
-                        arith.unwrap(num),
-                        arith.mulf(arith.unwrap(sc), arith.unwrap(pn)),
-                    )
-                )
+                sc4 = vector.broadcast(_v4f, arith.unwrap(sc))
+                num = [
+                    arith.addf(n, arith.mulf(sc4, arith.unwrap(p)))
+                    for n, p in zip(num, pn)
+                ]
             return mx, den, num
 
         def _lds_f(idx):
-            return fx.Float32(
-                fx.Vector.load(T.vec(1, T.f32), lds_f32, [fx.Index(idx)])[0]
-            )
+            return _f(fx.Vector.load(T.vec(1, T.f32), lds_f32, [fx.Index(idx)])[0])
 
-        def _store_out(row, d, qtok, head_abs, den, num):
-            safe = fx.Float32(
+        def _lds_v4(idx):
+            return fx.Vector.load(_v4f, lds_f32, [fx.Index(idx)])
+
+        def _store_out(d0, qtok, head_abs, den, num):
+            safe = _f(
                 arith.select(arith.unwrap(den) > c_zero, arith.unwrap(den), c_one)
             )
-            val = fx.Float32(arith.mulf(arith.unwrap(num), arith.unwrap(rcp_f32(safe))))
+            inv = vector.broadcast(_v4f, arith.unwrap(rcp_f32(safe)))
+            vals = []
+            for n in num:
+                o = arith.mulf(n, inv)
+                for e in range_constexpr(4):
+                    vals.append(
+                        arith.truncf(
+                            _FX_KV.ir_type,
+                            vector.extract(o, static_position=[e], dynamic_position=[]),
+                        )
+                    )
             buffer_ops.buffer_store(
-                arith.unwrap(_FX_OUT(arith.unwrap(val))),
+                fx.Vector.from_elements(vals, dtype=_FX_KV).ir_value(),
                 out_rsrc,
-                b_idx * stride_qb + qtok * stride_qs + head_abs * stride_qh + d,
+                b_idx * stride_qb + qtok * stride_qs + head_abs * stride_qh + d0,
             )
 
         if const_expr(_S > 1):
@@ -660,29 +607,31 @@ def compile_pa_decode_swa(
             my_part = part0 + split * fx.Int32(_PART)
 
         for i in range_constexpr(_NPASS):
-            row, d, qtok, head_abs, ok = _out_coords(i)
+            row, d0, qtok, head_abs, ok = _out_coords(i)
             if ok:
                 parts = []
                 for w in range_constexpr(_NW):
                     base = fx.Int32(w * _R_F32 + _M_OFF) + row
+                    nb = fx.Int32(w * _R_F32) + row * fx.Int32(_HEAD) + d0
                     parts.append(
                         (
                             _lds_f(base),
                             _lds_f(base + fx.Int32(_M16)),
-                            _lds_f(fx.Int32(w * _R_F32) + row * fx.Int32(_HEAD) + d),
+                            [_lds_v4(nb + fx.Int32(4 * j)) for j in range(_V // 4)],
                         )
                     )
                 mx, den, num = _lse_merge(parts)
                 if const_expr(_S == 1):
-                    _store_out(row, d, qtok, head_abs, den, num)
+                    _store_out(d0, qtok, head_abs, den, num)
                 else:
-                    buffer_ops.buffer_store(
-                        arith.unwrap(num),
-                        ws_rsrc,
-                        my_part + row * fx.Int32(_HEAD) + d,
-                        cache_modifier=_CPOL_SC1,
-                    )
-                    if d == fx.Int32(0):
+                    for j in range_constexpr(_V // 4):
+                        buffer_ops.buffer_store(
+                            num[j],
+                            ws_rsrc,
+                            my_part + row * fx.Int32(_HEAD) + d0 + fx.Int32(4 * j),
+                            cache_modifier=_CPOL_SC1,
+                        )
+                    if d0 == fx.Int32(0):
                         _mo = my_part + fx.Int32(_M16 * _HEAD) + row
                         buffer_ops.buffer_store(
                             arith.unwrap(mx), ws_rsrc, _mo, cache_modifier=_CPOL_SC1
@@ -719,32 +668,40 @@ def compile_pa_decode_swa(
             )
             if is_last != fx.Int32(0):
                 for i in range_constexpr(_NPASS):
-                    row, d, qtok, head_abs, ok = _out_coords(i)
+                    row, d0, qtok, head_abs, ok = _out_coords(i)
                     if ok:
                         parts = []
                         for sp in range_constexpr(_S):
                             pb = part0 + fx.Int32(sp * _PART)
                             _mo = pb + fx.Int32(_M16 * _HEAD) + row
+
+                            def _ld(off, width):
+                                return buffer_ops.buffer_load(
+                                    ws_rsrc,
+                                    off,
+                                    vec_width=width,
+                                    dtype=T.f32,
+                                    cache_modifier=_CPOL_SC1,
+                                )
+
                             parts.append(
-                                tuple(
-                                    fx.Float32(
-                                        buffer_ops.buffer_load(
-                                            ws_rsrc,
-                                            off,
-                                            vec_width=1,
-                                            dtype=T.f32,
-                                            cache_modifier=_CPOL_SC1,
+                                (
+                                    _f(_ld(_mo, 1)),
+                                    _f(_ld(_mo + fx.Int32(_M16), 1)),
+                                    [
+                                        _ld(
+                                            pb
+                                            + row * fx.Int32(_HEAD)
+                                            + d0
+                                            + fx.Int32(4 * j),
+                                            4,
                                         )
-                                    )
-                                    for off in (
-                                        _mo,
-                                        _mo + fx.Int32(_M16),
-                                        pb + row * fx.Int32(_HEAD) + d,
-                                    )
+                                        for j in range(_V // 4)
+                                    ],
                                 )
                             )
                         mx, den, num = _lse_merge(parts)
-                        _store_out(row, d, qtok, head_abs, den, num)
+                        _store_out(d0, qtok, head_abs, den, num)
                 if tid == fx.Int32(0):
                     _llvm.StoreOp(arith.unwrap(fx.Int32(0)), counter_ptr)
 
