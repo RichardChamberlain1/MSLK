@@ -45,7 +45,7 @@ import torch
 import torch.nn.functional as F  # noqa: F401  (imported for callers' convenience)
 
 # Re-export so callers only need to import from this module.
-from .flash_attn_utils import dualwave_splitk_workspace_elems
+from .flash_attn_utils import dualwave_splitk_workspace_elems, FUSED_COMBINE_COUNTERS
 
 __all__ = ["flydsl_flash_attn_func", "dualwave_splitk_workspace_elems"]
 
@@ -630,6 +630,38 @@ def _paged_block_m(gqa_packed: bool, seqlen_q: int) -> int:
     return 128 if (gqa_packed and seqlen_q > 64) else _PAGED_LIGHT_BLOCK_M
 
 
+# FLYDSL_PAGED_NARROW_TILE=0/1 overrides the choice below.
+_PAGED_NARROW_TILE = os.getenv("FLYDSL_PAGED_NARROW_TILE", "")
+
+
+def _paged_narrow_tile(
+    rows: int,
+    window_left: int,
+    q_len: int,
+    kv_len: int,
+    num_kv_splits: int,
+    head_dim: int,
+    groups: int,
+) -> bool:
+    """Use a 32-row, single-wave Q tile instead of the 64-row default.
+
+    With <= 32 packed rows the 64-row tile's second wave is all padding; halving
+    the tile lets more workgroups share a CU. Only used for long KV walks, since
+    a single wave issues each tile's loads alone. A single-token D=128 decode of
+    one request (``groups`` = batch x KV heads) keeps the 64-row tile for wave
+    split-K over KV columns.
+    """
+    if rows > 32:
+        return False
+    if _PAGED_NARROW_TILE in ("0", "1"):
+        return _PAGED_NARROW_TILE == "1"
+    if window_left < 0 and q_len == 1 and head_dim >= 128 and groups <= 4:
+        return False
+    span = min(kv_len, window_left + q_len) if window_left >= 0 else kv_len
+    tiles = -(-max(span, 1) // _PAGED_BLOCK_N_OUT)
+    return -(-tiles // max(num_kv_splits, 1)) >= 16
+
+
 # Minimum KV tiles per workgroup for paged K double buffering.
 _PAGED_KV_DMA_MIN_ITERS = int(os.getenv("FLYDSL_PAGED_KV_DMA_MIN_ITERS", "63"))
 
@@ -666,6 +698,129 @@ def _paged_k_prefetch(
         else _PAGED_K_PREFETCH_MIN_ITERS_D128
     )
     return -(-tiles // max(num_kv_splits, 1)) >= need
+
+
+# FLYDSL_PAGED_SWA_KERNEL=0/1 overrides the choice below.
+_PAGED_SWA_KERNEL = os.getenv("FLYDSL_PAGED_SWA_KERNEL", "")
+
+
+def _paged_swa_kernel_config(
+    q,
+    k,
+    causal,
+    window_left,
+    return_lse,
+    varlen,
+    vectorized,
+    kv_seqstart,
+    seqlen_k,
+    block_table,
+    out,
+):
+    """(num_waves, num_splits) to run a windowed decode on pa_decode_swa, or None.
+
+    Each CTA streams its slice of the window through one CU, so this is used when
+    the batch fills the GPU (or D=64 at a moderate batch with 4 splits); other
+    shapes stay on the generic split-K kernel.
+    """
+    if (
+        _PAGED_SWA_KERNEL == "0"
+        or varlen
+        or vectorized
+        or not causal
+        or window_left < 0
+        or return_lse
+        or kv_seqstart is not None
+        or seqlen_k is None
+        or q.dim() != 4
+        or seqlen_k.dtype != torch.int32
+        or not seqlen_k.is_contiguous()
+        or block_table.dtype != torch.int32
+        or not block_table.is_contiguous()
+        or (out is not None and out.stride() != q.stride())
+    ):
+        return None
+    from .decode.pa_decode_swa import pa_decode_swa_supported
+
+    B, Sq, H, D = q.shape
+    H_kv = k.shape[2]
+    if not pa_decode_swa_supported(
+        head_dim=D,
+        num_heads=H,
+        num_kv_heads=H_kv,
+        seqlen_q=Sq,
+        page_size=k.shape[1],
+        window_left=window_left,
+        dtype=q.dtype,
+    ):
+        return None
+    if _PAGED_SWA_KERNEL == "1":
+        return (8, 1)
+    groups = B * H_kv
+    if D == 128 and Sq in (1, 4) and groups >= 256:
+        return (4, 1)
+    if D == 64 and Sq == 1 and 32 <= groups <= 64:
+        return (8, 4)
+    return None
+
+
+# FLYDSL_PAGED_PID_REGS=0/1 overrides the choice below.
+_PAGED_PID_REGS = os.getenv("FLYDSL_PAGED_PID_REGS", "")
+
+
+def _paged_pid_regs(max_pages_per_split: int) -> bool:
+    """Hold a split's page ids in registers, one tile per lane, when they fit.
+
+    Not used with K prefetch, which already loads each page id a tile early.
+    """
+    if _PAGED_PID_REGS in ("0", "1"):
+        return _PAGED_PID_REGS == "1" and max_pages_per_split + 1 <= 64
+    return max_pages_per_split + 1 <= 64
+
+
+# FLYDSL_PAGED_FUSED_COMBINE=0/1 overrides the choice below.
+_PAGED_FUSED_COMBINE = os.getenv("FLYDSL_PAGED_FUSED_COMBINE", "")
+
+
+def _paged_fused_combine(
+    splitk: bool,
+    return_lse: bool,
+    workgroups_x: int,
+    num_kv_splits: int,
+    head_dim: int,
+    tile_rows: int,
+) -> bool:
+    """Merge split-K partials in the attention kernel instead of a combine kernel.
+
+    The merge runs in the last workgroup to finish, so it is only used when there
+    are many tiles and few splits per tile to merge.
+    """
+    if not splitk or return_lse or workgroups_x > FUSED_COMBINE_COUNTERS:
+        return False
+    if _PAGED_FUSED_COMBINE in ("0", "1"):
+        return _PAGED_FUSED_COMBINE == "1"
+    return (
+        num_kv_splits <= 8 and workgroups_x >= 64 and (head_dim <= 64 or tile_rows <= 8)
+    )
+
+
+# (device, stream) -> persistent fused split-K workspace; see _fused_workspace.
+_FUSED_WORKSPACES: dict = {}
+
+
+def _fused_workspace(elems: int, device: torch.device, stream) -> torch.Tensor:
+    """Workspace whose leading arrival counters are zero between calls.
+
+    The kernel resets each counter it uses; buffers are per stream so concurrent
+    streams never share counters.
+    """
+    key = (device, stream.cuda_stream)
+    need = FUSED_COMBINE_COUNTERS + elems
+    buf = _FUSED_WORKSPACES.get(key)
+    if buf is None or buf.numel() < need:
+        buf = torch.zeros(need, dtype=torch.float32, device=device)
+        _FUSED_WORKSPACES[key] = buf
+    return buf
 
 
 def _paged_combine_cap(head_dim: int) -> int:
@@ -708,6 +863,36 @@ def _paged_occupancy_topup(
     # Compiled into the kernel, so keep it a power of two.
     want = 1 << (want.bit_length() - 1) if want > 0 else 1
     return max(splits, want)
+
+
+# FLYDSL_PAGED_WIDE_SPLIT_CAP=0 disables the cap below.
+_PAGED_WIDE_SPLIT_CAP = os.getenv("FLYDSL_PAGED_WIDE_SPLIT_CAP", "1") == "1"
+
+
+def _paged_wide_tile_split_cap(
+    splits: int,
+    num_batches: int,
+    num_heads: int,
+    seqlen_q: int,
+    kv_tiles: int,
+    head_dim: int,
+    gqa_packed: bool,
+) -> int:
+    """Cap the split count for multi-token (> 32 row) full-attention tiles.
+
+    Targets ~512 workgroups in flight at D=128 and ~2048 at D=64, with >= 4 KV
+    tiles per split. Only ever lowers the chain-length sizing.
+    """
+    rows = seqlen_q
+    if not _PAGED_WIDE_SPLIT_CAP or rows <= 32:
+        return splits
+    grid = num_batches * num_heads * -(-rows // _paged_block_m(gqa_packed, rows))
+    target = 512 if head_dim >= 128 else 2048
+    want = max(target / max(grid, 1), 1)
+    lo = 1 << (int(want).bit_length() - 1)
+    by_grid = lo * 2 if want / lo > 1.414 else lo
+    by_chain = 1 << (max(kv_tiles // 4, 1).bit_length() - 1)
+    return min(splits, max(8, min(by_grid, by_chain)))
 
 
 _UNIFORM_CU_SEQLENS: dict = {}
@@ -911,6 +1096,37 @@ def _flydsl_flash_attn_paged(
         )
 
     varlen = cu_seqlens_q is not None
+    _swa_cfg = _paged_swa_kernel_config(
+        q,
+        k,
+        causal,
+        window_left,
+        return_lse,
+        varlen,
+        vectorized,
+        kv_seqstart,
+        seqlen_k,
+        block_table,
+        out,
+    )
+    if _swa_cfg is not None:
+        from .decode.pa_decode_swa import pa_decode_swa_launch
+
+        if out is None:
+            out = torch.empty_like(q)
+        with torch.cuda.device(q.device.index):
+            return pa_decode_swa_launch(
+                q,
+                k,
+                v,
+                block_table,
+                seqlen_k,
+                window_left,
+                sm_scale if sm_scale is not None else q.shape[-1] ** -0.5,
+                out,
+                num_waves=_swa_cfg[0],
+                num_splits=_swa_cfg[1],
+            )
     # Dense paged callers hand us a per-request `seqlen_k` but the launch only
     # ever forwarded the batch maximum, so every request was masked to that
     # maximum and any shorter one read stale cache. Feed the kernel the real
@@ -1157,6 +1373,16 @@ def _flydsl_flash_attn_paged(
         num_kv_splits = _paged_occupancy_topup(
             num_kv_splits, B, H, Sq, _span, D, _gqa_packed
         )
+        if not _paged_window:
+            num_kv_splits = _paged_wide_tile_split_cap(
+                num_kv_splits,
+                B,
+                H,
+                Sq,
+                -(-_kv_tiles // _PAGED_BLOCK_N_OUT),  # _kv_tiles counts tokens
+                D,
+                _gqa_packed,
+            )
         _auto_sized = True
 
     splitk = num_kv_splits > 1
@@ -1304,6 +1530,28 @@ def _flydsl_flash_attn_paged(
                 "flydsl_flash_attn_func: return_lse for native paged KV is only "
                 "supported on the generic (short-seq / gfx942) path"
             )
+        _paged_bm = _paged_block_m(_gqa_packed, Sq)
+        if _paged_narrow_tile(
+            Sq,
+            window_left,
+            _gqa_qlen if _gqa_packed else Sq,
+            skv,
+            num_kv_splits,
+            D,
+            B * H,
+        ):
+            _paged_bm = 32
+        fused_combine = _paged_light_ok and _paged_fused_combine(
+            splitk,
+            return_lse,
+            B * H * (-(-Sq // _paged_bm)),
+            int(num_kv_splits),
+            D,
+            min(Sq, _paged_bm),
+        )
+        _k_prefetch = _paged_k_prefetch(
+            D, window_left, _gqa_qlen if _gqa_packed else Sq, skv, num_kv_splits
+        )
         if _paged_light_ok:
             exe = _build_paged_light(
                 num_heads=H,
@@ -1339,17 +1587,11 @@ def _flydsl_flash_attn_paged(
                 # re-reads the whole KV range -- measured 4.08 -> 2.72 TB/s going
                 # from 64 rows to 88. Widen the tile instead. The reverse costs
                 # 19% when the rows do fit, so only widen when they do not.
-                block_m=_paged_block_m(_gqa_packed, Sq),
-                kv_dma=_paged_kv_dma(
-                    _paged_block_m(_gqa_packed, Sq), D, window_left, skv, num_kv_splits
-                ),
-                k_prefetch=_paged_k_prefetch(
-                    D,
-                    window_left,
-                    _gqa_qlen if _gqa_packed else Sq,
-                    skv,
-                    num_kv_splits,
-                ),
+                block_m=_paged_bm,
+                kv_dma=_paged_kv_dma(_paged_bm, D, window_left, skv, num_kv_splits),
+                k_prefetch=_k_prefetch,
+                fused_combine=fused_combine,
+                pid_regs=_paged_pid_regs(max_pages_per_split) and not _k_prefetch,
             )
         else:
             exe = _build_paged(
@@ -1402,7 +1644,10 @@ def _flydsl_flash_attn_paged(
             ws_elems = dualwave_splitk_workspace_elems(
                 B, H, Sq, int(num_kv_splits), head_dim=D
             )
-            _ws = torch.empty(ws_elems, dtype=torch.float32, device=q.device)
+            if fused_combine:
+                _ws = _fused_workspace(ws_elems, q.device, launch_stream)
+            else:
+                _ws = torch.empty(ws_elems, dtype=torch.float32, device=q.device)
             kwargs["workspace"] = _ws
         if _dw_kv_lens:
             # Dualwave's varlen variant reads lengths as cumulative deltas.
@@ -1462,6 +1707,8 @@ def _build_paged_light(
     kv_dma: bool = False,
     k_prefetch: bool = False,
     high_concurrency: bool = False,
+    fused_combine: bool = False,
+    pid_regs: bool = False,
 ):
     """Build a lightweight paged-varlen launcher for short attention.
 
@@ -1499,6 +1746,8 @@ def _build_paged_light(
         kv_lens=kv_lens,
         paged_kv_dma=kv_dma,
         paged_k_prefetch=k_prefetch,
+        fused_combine=fused_combine,
+        paged_pid_regs=pid_regs,
     )
 
 

@@ -28,18 +28,11 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm, vector
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace as _TargetAddressSpace
 from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
-from flydsl.expr import (
-    arith,
-    buffer_ops,
-    const_expr,
-    gpu,
-    math as fmath,
-    range_constexpr,
-    rocdl,
-)
+from flydsl.expr import arith, const_expr, gpu, math as fmath, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from flydsl.utils.smem_allocator import SmemPtr
+from mslk.flydsl import buffer_ops
 
 from ._common import dtype_to_elem_type
 
@@ -592,7 +585,7 @@ def _bf16_buffer_load_f32(ctx, rsrc, voff_bytes_i32):
     """
     c0 = buffer_ops._create_i32_constant(0)
     raw = rocdl.raw_ptr_buffer_load(
-        ctx.elem_type, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, c0
+        ctx.elem_type, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, 0
     )
     return llvm.FPExtOp(fx.Float32.ir_type, as_mlir_value(raw)).result
 
@@ -607,7 +600,7 @@ def _u8_buffer_load_f32(ctx, rsrc, voff_bytes_i32):
     """
     c0 = buffer_ops._create_i32_constant(0)
     raw = rocdl.raw_ptr_buffer_load(
-        T.i8, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, c0
+        T.i8, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, 0
     )
     return llvm.UIToFPOp(fx.Float32.ir_type, as_mlir_value(raw)).result
 
@@ -754,16 +747,26 @@ def _load_k_pack_aligned(traits, lds_kv_base_ptr, elem_idx, buf_id, kv_mfma_pack
     ).result
 
 
-def _ws_store_f32(f32_val, local_elem_index, rsrc):
+def _ws_store_f32(f32_val, local_elem_index, rsrc, cache_modifier=0):
     """32-bit f32 store into a per-split-z workspace region via raw buffer descriptor."""
     f32_ir = as_mlir_value(fx.Float32(f32_val))
-    buffer_ops.buffer_store(f32_ir, rsrc, as_mlir_value(fx.Int32(local_elem_index)))
+    buffer_ops.buffer_store(
+        f32_ir,
+        rsrc,
+        as_mlir_value(fx.Int32(local_elem_index)),
+        cache_modifier=cache_modifier,
+    )
 
 
-def _ws_store_quad_i32(dwords, local_elem_index, rsrc):
+def _ws_store_quad_i32(dwords, local_elem_index, rsrc, cache_modifier=0):
     """128-bit i32x4 store (buffer_store_dwordx4) into a per-split-z workspace region."""
     vec_ir = Vec.from_elements([fx.Int32(v) for v in dwords], fx.Int32).ir_value()
-    buffer_ops.buffer_store(vec_ir, rsrc, as_mlir_value(fx.Int32(local_elem_index)))
+    buffer_ops.buffer_store(
+        vec_ir,
+        rsrc,
+        as_mlir_value(fx.Int32(local_elem_index)),
+        cache_modifier=cache_modifier,
+    )
 
 
 def _buffer_load_128(elem_index, _load_atom_128, q_div, q_load_i32x4_type):
@@ -898,7 +901,7 @@ def _buffer_load_to_lds(rsrc, lds_ptr, size, voffset, soffset, offset, aux):
     """Issue one global->LDS copy, async when enabled (see ASYNC_LDS)."""
     if ASYNC_LDS:
         return rocdl.raw_ptr_buffer_load_async_lds(
-            rsrc, lds_ptr, size, voffset, soffset, offset, aux
+            rsrc, lds_ptr, size, voffset, soffset, offset, aux=aux
         )
     return rocdl.raw_ptr_buffer_load_lds(
         rsrc, lds_ptr, size, voffset, soffset, offset, aux
@@ -1209,9 +1212,11 @@ def _store_empty_splitk_o_partial_row(
             )
 
 
-def _store_splitk_ml_row(m_row, l_row, local_ml_idx, mrow_rsrc, lrow_rsrc):
-    _ws_store_f32(m_row, local_ml_idx, mrow_rsrc)
-    _ws_store_f32(l_row, local_ml_idx, lrow_rsrc)
+def _store_splitk_ml_row(
+    m_row, l_row, local_ml_idx, mrow_rsrc, lrow_rsrc, cache_modifier=0
+):
+    _ws_store_f32(m_row, local_ml_idx, mrow_rsrc, cache_modifier)
+    _ws_store_f32(l_row, local_ml_idx, lrow_rsrc, cache_modifier)
 
 
 def _init_dualwave_thread_mapping(ctx):
@@ -1306,6 +1311,9 @@ class FlashAttnGenericTraits:
     # GPU on short-q / low-occupancy shapes. SPLITK == (NUM_KV_SPLITS > 1).
     NUM_KV_SPLITS: int
     SPLITK: bool
+    # Split-K without the combine kernel: the last split to finish a tile merges
+    # every split's partial itself (see GenericFusedSplitKCombine).
+    FUSED_COMBINE: bool
     PAGED: bool
     KV_CACHE_LAYOUT: str
     KV_VECTORIZED: bool
@@ -1323,6 +1331,9 @@ class FlashAttnGenericTraits:
     ENABLE_DMA: bool
     # Paged KV: carry the next K tile in registers across the softmax.
     PAGED_K_PREFETCH: bool
+    # Paged: each split spans <= 64 tiles, so a lane per tile holds its page id
+    # from one load at the start and a tile reads it with v_readlane.
+    PAGED_PID_REGS: bool
     ENABLE_LDS_VEC16: bool
     REDUCE_MODE: str
     NUM_PREFETCH_K: int
@@ -1419,6 +1430,7 @@ class FlashAttnGenericTraits:
             self.KV_VECTORIZED,
             self.SPLITK,
             self.NUM_KV_SPLITS,
+            self.FUSED_COMBINE,
             self.BLOCK_M,
             self.BLOCK_N,
             self.BLOCK_N_OUT,
@@ -1432,6 +1444,7 @@ class FlashAttnGenericTraits:
             self.ENABLE_PREFETCH_3BUF,
             self.ENABLE_DMA,
             self.PAGED_K_PREFETCH,
+            self.PAGED_PID_REGS,
             self.ENABLE_LDS_VEC16,
             self.REDUCE_MODE,
             self.NUM_PREFETCH_K,
@@ -1525,6 +1538,8 @@ def _make_flash_attn_generic_traits(
     paged_kv_dma=False,
     paged_k_prefetch=False,
     high_concurrency=False,
+    fused_combine=False,
+    paged_pid_regs=False,
 ):
     """Build compile-time traits for ``flash_attn_generic``."""
     block_n = 64
@@ -1614,6 +1629,9 @@ def _make_flash_attn_generic_traits(
         and q_pack_group > 0
         and q_pack_qlen == 1
         and q_pack_group * q_pack_qlen <= rows_per_wave
+        # Each wave owns one K_SUB_N column slice, so the waves must cover a
+        # tile exactly; a single-wave (narrow) tile would drop half its keys.
+        and num_waves * k_sub_n == block_n
         and window_left < 0
         and (head_dim >= _wsk_min_d or high_concurrency)
         and not enable_gfx942_kv_gpfetch
@@ -1763,6 +1781,7 @@ def _make_flash_attn_generic_traits(
         GAPPY_KV=bool(gappy_kv),
         NUM_KV_SPLITS=int(num_kv_splits),
         SPLITK=int(num_kv_splits) > 1,
+        FUSED_COMBINE=bool(fused_combine) and int(num_kv_splits) > 1,
         PAGED=paged,
         KV_CACHE_LAYOUT=kv_cache_layout,
         KV_VECTORIZED=kv_vectorized,
@@ -1779,6 +1798,7 @@ def _make_flash_attn_generic_traits(
         ENABLE_PREFETCH_3BUF=enable_prefetch_3buf,
         ENABLE_DMA=enable_dma,
         PAGED_K_PREFETCH=paged_k_prefetch,
+        PAGED_PID_REGS=bool(paged and paged_pid_regs and not gappy_kv),
         ENABLE_LDS_VEC16=enable_lds_vec16,
         REDUCE_MODE=reduce_mode,
         NUM_PREFETCH_K=num_prefetch_k,
@@ -2530,6 +2550,13 @@ class GenericFlashAttnContext:
         traits = self.traits
         if const_expr(traits.SPLITK):
             self.ws_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(Workspace)))
+            if const_expr(traits.FUSED_COMBINE):
+                # Fused split-K: the arrival counters lead the workspace and the
+                # partials follow them (see GenericFusedSplitKCombine).
+                self.ws_counter_base_i64 = self.ws_base_i64
+                self.ws_base_i64 = self.ws_base_i64 + fx.Int64(
+                    FUSED_COMBINE_COUNTERS * 4
+                )
             self.ws_opart_per_split_elems = (
                 fx.Index(traits.NUM_HEADS_Q)
                 * self.seq_len_v
@@ -2877,6 +2904,22 @@ class GenericPageIdLoader:
             )
             self.bt_stride_v = fx.Index(block_table_stride)
 
+    def preload(self, kv_lower):
+        """Load this split's page ids, one tile per lane (PAGED_PID_REGS).
+
+        Every later lookup is then a v_readlane instead of a block-table load
+        whose latency each tile would otherwise wait out before loading K.
+        """
+        ctx = self.ctx
+        self.pid_tile0 = kv_lower // fx.Index(ctx.traits.PAGE_SIZE)
+        self.pid_regs = fx.Int32(self._bt_load(self.pid_tile0 + ctx.lane))
+
+    def _pid_from_regs(self, tile_start):
+        local = tile_start // fx.Index(self.ctx.traits.PAGE_SIZE) - self.pid_tile0
+        return rocdl.readlane(
+            T.i32, as_mlir_value(self.pid_regs), as_mlir_value(fx.Int32(local))
+        )
+
     def issue_page_id(self, tile_start):
         """Issue the block-table load and return the raw vector.
 
@@ -2885,6 +2928,10 @@ class GenericPageIdLoader:
         ``consume_page_id`` at the use.
         """
         ctx = self.ctx
+        if const_expr(ctx.traits.PAGED_PID_REGS):
+            return as_mlir_value(
+                Vec.from_elements([fx.Int32(self._pid_from_regs(tile_start))], fx.Int32)
+            )
         tile_idx = tile_start // fx.Index(ctx.traits.PAGE_SIZE)
         bt_off = ctx.batch_idx * self.bt_stride_v + tile_idx
         return fly.copy_atom_call_ssa(
@@ -2902,6 +2949,8 @@ class GenericPageIdLoader:
         return as_mlir_value(Vec.filled(1, 0, fx.Int32))
 
     def page_id(self, tile_start):
+        if const_expr(self.ctx.traits.PAGED_PID_REGS):
+            return fx.Index(fx.Int32(self._pid_from_regs(tile_start)))
         return self.consume_page_id(self.issue_page_id(tile_start))
 
     def _bt_load(self, tile_idx):
@@ -3309,7 +3358,7 @@ class GenericKvGmemToLdsLoader:
         )
         self._v_dma_sz = fx.Int32(16)
         self._v_dma_z = fx.Int32(0)
-        self._v_dma_aux = fx.Int32(1)
+        self._v_dma_aux = 1
         self._v_dma_no = ctx.lane // fx.Index(8)
         self._v_dma_dloc = ctx.lane % fx.Index(8)
 
@@ -3368,7 +3417,7 @@ class GenericKvGmemToLdsLoader:
         self._dma_size = fx.Int32(self.DMA_BYTES)
         self._dma_soff = fx.Int32(0)
         self._dma_off = fx.Int32(0)
-        self._dma_aux = fx.Int32(1)
+        self._dma_aux = 1
         self.NUM_DMA_K = (traits.BLOCK_N * traits.K_STRIDE * 2) // self.DMA_BATCH_BYTES
         self.LANES_PER_K_ROW = traits.HEAD_DIM * 2 // self.DMA_BYTES
         self.ROWS_PER_DMA_BATCH = self.DMA_BATCH_BYTES // (traits.HEAD_DIM * 2)
@@ -4308,6 +4357,7 @@ class GenericStoreHelper:
                     local_opart_row_base
                     + _splitk_o_partial_dword_col(traits, dc, g, ctx.lane_div_32),
                     opart_rsrc,
+                    _splitk_store_cpol(traits),
                 )
 
     def store_splitk_partial(self, loop_results, q_row):
@@ -4353,7 +4403,12 @@ class GenericStoreHelper:
                 self._store_splitk_partial_o_row(v_o, local_opart_base, opart_rsrc)
                 if lane < fx.Index(32):
                     _store_splitk_ml_row(
-                        m_log2, l_final, local_ml_idx, mrow_rsrc, lrow_rsrc
+                        m_log2,
+                        l_final,
+                        local_ml_idx,
+                        mrow_rsrc,
+                        lrow_rsrc,
+                        _splitk_store_cpol(traits),
                     )
 
         _store_splitk_partial_if_qrow()
@@ -7089,6 +7144,205 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         _ws_store_f32(lse_val, store_idx, lse_rsrc)
 
 
+# Arrival counters at the head of a fused split-K workspace; bounds grid.x.
+FUSED_COMBINE_COUNTERS = 1 << 16
+# gfx94x/gfx950 SC1 cache-policy bit: an agent-scope coherent access. Stores
+# write through the per-XCD L2 and loads do not hit a stale L2 line, so the
+# fused split-K hands partials across XCDs without agent-scope fences (which
+# would write back / invalidate the whole L2 per workgroup).
+_CPOL_SC1 = 16
+
+
+def _splitk_store_cpol(traits):
+    """Cache policy for split-K partial stores (agent-coherent when fused)."""
+    return _CPOL_SC1 if traits.FUSED_COMBINE else 0
+
+
+class GenericFusedSplitKCombine:
+    """Split-K merge done inside the attention kernel by the last split to finish.
+
+    Every split publishes its partial and counts itself in on a per-tile counter
+    at the head of the workspace; the split that completes the count merges all
+    partials in split order (deterministic, one online log-sum-exp pass), writes
+    O and resets the counter to zero for the next call.
+    """
+
+    # Splits whose loads are issued together before being consumed.
+    PREFETCH = 16
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+
+    def _counter_ptr(self):
+        ctx = self.ctx
+        addr = ctx.ws_counter_base_i64 + fx.Int64(ctx.block_id * fx.Index(4))
+        return buffer_ops.create_llvm_ptr(addr, address_space=1)
+
+    def run(self):
+        ctx = self.ctx
+        traits = ctx.traits
+        counter_ptr = self._counter_ptr()
+        # The KV tiles are consumed, so the start of their LDS can carry the flag.
+        flag_ptr = buffer_ops.create_llvm_ptr(
+            fx.Int64(ctx.lds_kv_offset), address_space=3
+        )
+        # The partials were stored agent-coherent (SC1); once every thread's
+        # stores have completed, the split may count itself in.
+        rocdl.s_waitcnt(0)
+        gpu.barrier()
+        tid = ctx.tid
+
+        @flyc.jit
+        def _arrive():
+            if tid == fx.Index(0):
+                old = fx.llvm.atomic_add(
+                    counter_ptr,
+                    fx.Int32(1),
+                    syncscope=rocdl.SyncScope.Agent,
+                    ordering=fx.AtomicOrdering.Monotonic,
+                )
+                last = (fx.Int32(old) == fx.Int32(traits.NUM_KV_SPLITS - 1)).select(
+                    fx.Int32(1), fx.Int32(0)
+                )
+                llvm.StoreOp(as_mlir_value(last), flag_ptr)
+
+        _arrive()
+        gpu.barrier()
+        is_last = fx.Int32(
+            rocdl.readfirstlane(T.i32, llvm.LoadOp(T.i32, flag_ptr).result)
+        )
+
+        @flyc.jit
+        def _merge_if_last():
+            if is_last != fx.Int32(0):
+                self._merge()
+                if tid == fx.Index(0):
+                    llvm.StoreOp(as_mlir_value(fx.Int32(0)), counter_ptr)
+
+        _merge_if_last()
+
+    def _merge(self):
+        ctx = self.ctx
+        traits = ctx.traits
+        lanes_per_row = combine_lanes_per_row(traits.HEAD_DIM)
+        rows_per_pass = traits.BLOCK_SIZE // lanes_per_row
+        col = (ctx.tid % fx.Index(lanes_per_row)) * fx.Index(
+            combine_chunk(traits.HEAD_DIM)
+        )
+        slot = ctx.tid // fx.Index(lanes_per_row)
+        ml_bytes = ctx.ws_lrow_abs_bytes - ctx.ws_mrow_abs_bytes
+        rsrcs = (
+            _make_ws_rsrc(ctx.ws_base_i64, fx.Index(0), ctx.ws_mrow_abs_bytes),
+            _make_ws_rsrc(ctx.ws_base_i64, ctx.ws_mrow_abs_bytes, ml_bytes),
+            _make_ws_rsrc(ctx.ws_base_i64, ctx.ws_lrow_abs_bytes, ml_bytes),
+        )
+        seq_len_v = ctx.seq_len_v
+        # Packed GQA tiles hold q_len * group rows, known here; others a full tile.
+        rows = traits.BLOCK_M
+        if const_expr(traits.Q_PACK_QLEN > 0 and _q_pack_group(traits) > 0):
+            rows = min(rows, traits.Q_PACK_QLEN * _q_pack_group(traits))
+        for p in range_constexpr((rows + rows_per_pass - 1) // rows_per_pass):
+            row = ctx.q_start + fx.Index(p * rows_per_pass) + slot
+
+            @flyc.jit
+            def _merge_row_if_valid():
+                if row < seq_len_v:
+                    self._merge_row(row, col, rsrcs)
+
+            _merge_row_if_valid()
+
+    def _merge_row(self, row, col, rsrcs):
+        ctx = self.ctx
+        traits = ctx.traits
+        opart_rsrc, mrow_rsrc, lrow_rsrc = rsrcs
+        n = combine_chunk(traits.HEAD_DIM)
+        num_splits = traits.NUM_KV_SPLITS
+        fm = ctx.fm_fast
+        local_ml = ctx.q_head_idx * ctx.seq_len_v + row
+        local_o = local_ml * fx.Index(traits.HEAD_DIM // 2) + col // fx.Index(2)
+        split_z0 = ctx.batch_idx * fx.Index(num_splits)
+        zero = fx.Float32(0.0)
+        zeros = Vec.filled(n, 0.0, fx.Float32)
+        m_empty = fx.Float32(-3.0e38)
+
+        m_run = m_empty
+        den = zero
+        acc = zeros
+        for b in range_constexpr((num_splits + self.PREFETCH - 1) // self.PREFETCH):
+            splits = [
+                b * self.PREFETCH + j
+                for j in range(self.PREFETCH)
+                if b * self.PREFETCH + j < num_splits
+            ]
+            loaded = []
+            for s in splits:
+                z = split_z0 + fx.Index(s)
+                ml_idx = as_mlir_value(
+                    fx.Int32(z * ctx.ws_ml_per_split_elems + local_ml)
+                )
+                m_i = buffer_ops.buffer_load(
+                    mrow_rsrc,
+                    ml_idx,
+                    vec_width=1,
+                    dtype=T.f32,
+                    cache_modifier=_CPOL_SC1,
+                )
+                l_i = buffer_ops.buffer_load(
+                    lrow_rsrc,
+                    ml_idx,
+                    vec_width=1,
+                    dtype=T.f32,
+                    cache_modifier=_CPOL_SC1,
+                )
+                o_raw = buffer_ops.buffer_load(
+                    opart_rsrc,
+                    as_mlir_value(fx.Int32(z * ctx.ws_opart_per_split_elems + local_o)),
+                    vec_width=n // 2,
+                    dtype=T.i32,
+                    cache_modifier=_CPOL_SC1,
+                )
+                loaded.append((m_i, l_i, o_raw))
+            for m_i, l_i, o_raw in loaded:
+                o_i = (
+                    Vec(ir.Value(o_raw), (n // 2,), fx.Int32)
+                    .bitcast(ctx.elem_dtype)
+                    .to(fx.Float32)
+                )
+                # An empty split has l == 0 and an untouched O slot: give it no
+                # weight and zero its operand so stale bits cannot be NaN.
+                live = fx.Float32(l_i) > zero
+                m_i = live.select(fx.Float32(m_i), m_empty)
+                m_new = _fmax(m_run, m_i, fm)
+                a = rocdl.exp2(T.f32, as_mlir_value(_fsub(m_run, m_new, fm)))
+                w = rocdl.exp2(T.f32, as_mlir_value(_fsub(m_i, m_new, fm)))
+                wl = live.select(fx.Float32(_fmul(w, l_i, fm)), zero)
+                den = _fadd(_fmul(den, a, fm), wl, fm)
+                o_i = Vec(live.select(o_i, zeros), (n,), fx.Float32)
+                a_n = Vec.from_elements([fx.Float32(a)], fx.Float32).broadcast_to(n)
+                wl_n = Vec.from_elements([fx.Float32(wl)], fx.Float32).broadcast_to(n)
+                acc = _fadd(_fmul(acc, a_n, fm), _fmul(o_i, wl_n, fm), fm)
+                m_run = m_new
+
+        inv = (fx.Float32(den) > zero).select(fx.Float32(rocdl.rcp(T.f32, den)), zero)
+        inv_n = Vec.from_elements([inv], fx.Float32).broadcast_to(n)
+        out = Vec(_fmul(acc, inv_n, fm), (n,), fx.Float32)
+        if const_expr(traits.DTYPE_STR == "bf16"):
+            words = [
+                fx.Int32(rocdl.cvt_pk_bf16_f32(out[2 * i], out[2 * i + 1]))
+                for i in range_constexpr(n // 2)
+            ]
+        else:
+            halves = [fx.Float32(out[i]).to(ctx.elem_dtype) for i in range_constexpr(n)]
+            pack = Vec.from_elements(halves, ctx.elem_dtype).bitcast(fx.Int32)
+            words = [fx.Int32(as_mlir_value(pack[i])) for i in range_constexpr(n // 2)]
+        buffer_ops.buffer_store(
+            Vec.from_elements(words, fx.Int32).ir_value(),
+            ctx.o_rsrc,
+            as_mlir_value(fx.Int32(ctx.global_idx_q(row, col) * fx.Index(2))),
+            offset_is_bytes=True,
+        )
+
+
 # Misc debug and public helpers
 
 
@@ -7132,12 +7386,12 @@ def _stagger_extra_barrier_if_one(stagger_i32):
 
 
 def _debug_atomic_inc_lazy_count(byte_offset, debug_counts_rsrc):
-    rocdl.raw_buffer_atomic_fadd(
+    rocdl.raw_ptr_buffer_atomic_fadd(
         as_mlir_value(fx.Float32(1.0)),
         debug_counts_rsrc,
         as_mlir_value(fx.Int32(byte_offset)),
         as_mlir_value(fx.Int32(0)),
-        as_mlir_value(fx.Int32(0)),
+        aux=0,
     )
 
 
