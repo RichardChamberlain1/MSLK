@@ -50,11 +50,12 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, math as math_dialect, memref as memref_dialect
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from mslk.flydsl import buffer_ops
 from mslk.flydsl.kernels.mma.mfma_preshuffle_pipeline import swizzle_xor16
 
 # MFMA geometry: one issue is a 32x32 output tile contracting 64 of K.
@@ -366,7 +367,7 @@ def compile_groupwise_wide_gemm(
                         fx.Int32(byte_off),
                         fx.Int32(0),
                         fx.Int32(0),
-                        fx.Int32(1),
+                        1,
                     ),
                     _SCOPE_DMA,
                 )

@@ -28,9 +28,10 @@ from collections import namedtuple
 
 import flydsl.expr as fx
 from flydsl._mlir.dialects import math as math_dialect
-from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl, vector
+from flydsl.expr import arith, gpu, range_constexpr, rocdl
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T, Vector
+from mslk.flydsl import buffer_ops, vector_ops as vector
 from mslk.flydsl.common import lds_capacity_bytes
 from mslk.flydsl.kernels.mma.mfma_preshuffle_pipeline import (
     crd2idx,
