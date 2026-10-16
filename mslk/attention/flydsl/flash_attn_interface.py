@@ -771,6 +771,28 @@ def _paged_occupancy_topup(
     return max(splits, want)
 
 
+# FLYDSL_PAGED_NARROW_TILE=0/1 overrides the choice below.
+_PAGED_NARROW_TILE = os.getenv("FLYDSL_PAGED_NARROW_TILE", "")
+
+
+def _paged_narrow_tile(
+    rows: int, window_left: int, q_len: int, kv_len: int, num_kv_splits: int
+) -> bool:
+    """Use a 32-row, single-wave Q tile instead of the 64-row default.
+
+    With <= 32 packed rows the 64-row tile's second wave is all padding; halving
+    the tile lets more workgroups share a CU. Only used for long KV walks, since
+    a single wave issues each tile's loads alone.
+    """
+    if rows > 32:
+        return False
+    if _PAGED_NARROW_TILE in ("0", "1"):
+        return _PAGED_NARROW_TILE == "1"
+    span = min(kv_len, window_left + q_len) if window_left >= 0 else kv_len
+    tiles = -(-max(span, 1) // _PAGED_BLOCK_N_OUT)
+    return -(-tiles // max(num_kv_splits, 1)) >= 16
+
+
 # Minimum KV tiles per workgroup for paged K double buffering.
 _PAGED_KV_DMA_MIN_ITERS = int(os.getenv("FLYDSL_PAGED_KV_DMA_MIN_ITERS", "63"))
 
@@ -807,6 +829,20 @@ def _paged_k_prefetch(
         else _PAGED_K_PREFETCH_MIN_ITERS_D128
     )
     return -(-tiles // max(num_kv_splits, 1)) >= need
+
+
+# FLYDSL_PAGED_PID_REGS=0/1 overrides the choice below.
+_PAGED_PID_REGS = os.getenv("FLYDSL_PAGED_PID_REGS", "")
+
+
+def _paged_pid_regs(max_pages_per_split: int) -> bool:
+    """Hold a split's page ids in registers, one tile per lane, when they fit.
+
+    Not used with K prefetch, which already loads each page id a tile early.
+    """
+    if _PAGED_PID_REGS in ("0", "1"):
+        return _PAGED_PID_REGS == "1" and max_pages_per_split + 1 <= 64
+    return max_pages_per_split + 1 <= 64
 
 
 # FLYDSL_PAGED_FUSED_COMBINE=0/1 overrides the choice below.
@@ -1440,6 +1476,10 @@ def _flydsl_flash_attn_paged(
                     "supported on the generic (short-seq / gfx942) path"
                 )
             _paged_bm = _paged_block_m(_gqa_packed, Sq)
+            if _paged_narrow_tile(
+                Sq, window_left, _gqa_qlen if _gqa_packed else Sq, skv, num_kv_splits
+            ):
+                _paged_bm = 32
             fused_combine = _paged_light_ok and _paged_fused_combine(
                 splitk,
                 return_lse,
@@ -1447,6 +1487,9 @@ def _flydsl_flash_attn_paged(
                 int(num_kv_splits),
                 D,
                 min(Sq, _paged_bm),
+            )
+            _k_prefetch = _paged_k_prefetch(
+                D, window_left, _gqa_qlen if _gqa_packed else Sq, skv, num_kv_splits
             )
             if _paged_light_ok:
                 exe = _build_paged_light(
@@ -1476,24 +1519,13 @@ def _flydsl_flash_attn_paged(
                         _WAVE_SPLITK_MIN_BATCH > 0 and B >= _WAVE_SPLITK_MIN_BATCH
                     ),
                     kv_lens=_dense_kv_lens,
-                    block_m=_paged_block_m(_gqa_packed, Sq),
-                    kv_dma=_paged_kv_dma(
-                        _paged_block_m(_gqa_packed, Sq),
-                        D,
-                        window_left,
-                        skv,
-                        num_kv_splits,
-                    ),
-                    k_prefetch=_paged_k_prefetch(
-                        D,
-                        window_left,
-                        _gqa_qlen if _gqa_packed else Sq,
-                        skv,
-                        num_kv_splits,
-                    ),
+                    block_m=_paged_bm,
+                    kv_dma=_paged_kv_dma(_paged_bm, D, window_left, skv, num_kv_splits),
+                    k_prefetch=_k_prefetch,
                     window_left=window_left,
                     num_kv_splits=int(num_kv_splits),
                     fused_combine=fused_combine,
+                    pid_regs=_paged_pid_regs(max_pages_per_split) and not _k_prefetch,
                 )
             else:
                 exe = _build_paged(
@@ -1633,6 +1665,7 @@ def _build_paged_light(
     k_prefetch: bool = False,
     high_concurrency: bool = False,
     fused_combine: bool = False,
+    pid_regs: bool = False,
 ):
     """Build a lightweight paged-varlen launcher for short attention.
 
@@ -1671,6 +1704,7 @@ def _build_paged_light(
         paged_kv_dma=kv_dma,
         paged_k_prefetch=k_prefetch,
         fused_combine=fused_combine,
+        paged_pid_regs=pid_regs,
     )
 
 

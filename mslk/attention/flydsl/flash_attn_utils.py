@@ -1337,6 +1337,9 @@ class FlashAttnGenericTraits:
     ENABLE_DMA: bool
     # Paged KV: carry the next K tile in registers across the softmax.
     PAGED_K_PREFETCH: bool
+    # Paged: each split spans <= 64 tiles, so a lane per tile holds its page id
+    # from one load at the start and a tile reads it with v_readlane.
+    PAGED_PID_REGS: bool
     ENABLE_LDS_VEC16: bool
     REDUCE_MODE: str
     NUM_PREFETCH_K: int
@@ -1447,6 +1450,7 @@ class FlashAttnGenericTraits:
             self.ENABLE_PREFETCH_3BUF,
             self.ENABLE_DMA,
             self.PAGED_K_PREFETCH,
+            self.PAGED_PID_REGS,
             self.ENABLE_LDS_VEC16,
             self.REDUCE_MODE,
             self.NUM_PREFETCH_K,
@@ -1541,6 +1545,7 @@ def _make_flash_attn_generic_traits(
     paged_k_prefetch=False,
     high_concurrency=False,
     fused_combine=False,
+    paged_pid_regs=False,
 ):
     """Build compile-time traits for ``flash_attn_generic``."""
     block_n = 64
@@ -1796,6 +1801,7 @@ def _make_flash_attn_generic_traits(
         ENABLE_PREFETCH_3BUF=enable_prefetch_3buf,
         ENABLE_DMA=enable_dma,
         PAGED_K_PREFETCH=paged_k_prefetch,
+        PAGED_PID_REGS=bool(paged and paged_pid_regs and not gappy_kv),
         ENABLE_LDS_VEC16=enable_lds_vec16,
         REDUCE_MODE=reduce_mode,
         NUM_PREFETCH_K=num_prefetch_k,
@@ -2907,6 +2913,22 @@ class GenericPageIdLoader:
             )
             self.bt_stride_v = fx.Index(block_table_stride)
 
+    def preload(self, kv_lower):
+        """Load this split's page ids, one tile per lane (PAGED_PID_REGS).
+
+        Every later lookup is then a v_readlane instead of a block-table load
+        whose latency each tile would otherwise wait out before loading K.
+        """
+        ctx = self.ctx
+        self.pid_tile0 = kv_lower // fx.Index(ctx.traits.PAGE_SIZE)
+        self.pid_regs = fx.Int32(self._bt_load(self.pid_tile0 + ctx.lane))
+
+    def _pid_from_regs(self, tile_start):
+        local = tile_start // fx.Index(self.ctx.traits.PAGE_SIZE) - self.pid_tile0
+        return rocdl.readlane(
+            T.i32, as_mlir_value(self.pid_regs), as_mlir_value(fx.Int32(local))
+        )
+
     def issue_page_id(self, tile_start):
         """Issue the block-table load and return the raw vector.
 
@@ -2915,6 +2937,10 @@ class GenericPageIdLoader:
         ``consume_page_id`` at the use.
         """
         ctx = self.ctx
+        if const_expr(ctx.traits.PAGED_PID_REGS):
+            return as_mlir_value(
+                Vec.from_elements([fx.Int32(self._pid_from_regs(tile_start))], fx.Int32)
+            )
         tile_idx = tile_start // fx.Index(ctx.traits.PAGE_SIZE)
         bt_off = ctx.batch_idx * self.bt_stride_v + tile_idx
         return fly.copy_atom_call_ssa(
@@ -2932,6 +2958,8 @@ class GenericPageIdLoader:
         return as_mlir_value(Vec.filled(1, 0, fx.Int32))
 
     def page_id(self, tile_start):
+        if const_expr(self.ctx.traits.PAGED_PID_REGS):
+            return fx.Index(fx.Int32(self._pid_from_regs(tile_start)))
         return self.consume_page_id(self.issue_page_id(tile_start))
 
     def _bt_load(self, tile_idx):

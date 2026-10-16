@@ -91,6 +91,7 @@ def build_flash_attn_func_module_primary(
     paged_k_prefetch=False,
     high_concurrency=False,
     fused_combine=False,
+    paged_pid_regs=False,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
@@ -277,6 +278,7 @@ def build_flash_attn_func_module_primary(
         paged_k_prefetch=paged_k_prefetch,
         high_concurrency=high_concurrency,
         fused_combine=fused_combine,
+        paged_pid_regs=paged_pid_regs,
     )
     _flash_attn_generic_cache_tag = (traits.cache_tag, COMBINE_PREFETCH)
 
@@ -390,6 +392,8 @@ def build_flash_attn_func_module_primary(
         ctx.init_kv_bounds()
         kv_upper = ctx.kv_upper
         kv_lower = ctx.kv_lower
+        if const_expr(traits.PAGED_PID_REGS):
+            kv_gmem_to_lds.page_ids.preload(kv_lower)
 
         # Loop-carried: [m_old, l_old, o_acc_chunks..., (buf_id if DMA dbuf),
         # (K vecs if pipelined), (page id if paged K prefetch)]
