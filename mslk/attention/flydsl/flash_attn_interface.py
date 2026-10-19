@@ -923,14 +923,15 @@ def _paged_swa_kernel_config(
         elif m_tiles == 2 and D == 64:
             cfg = (4, 256 // groups)
     elif m_tiles == 1:
-        if D == 128 and groups >= 64:
-            cfg = (4, 1) if groups >= 256 else (2, splits)
+        if D == 128:
+            # Below 64 groups, 16 splits each merged by the reduce kernel.
+            cfg = (4, 1) if groups >= 256 else (2, splits if groups >= 64 else 16)
         elif D == 64 and groups >= 32:
             if groups >= 256:
                 cfg = (2, 1)
             else:
                 cfg = (4, 1) if groups >= 128 else (4, splits)
-    elif groups >= (32 if D == 64 else 128):
+    elif groups >= (32 if D == 64 else 64):
         cfg = (4, splits)
     if cfg is None or not pa_decode_swa_supported(
         head_dim=D,
