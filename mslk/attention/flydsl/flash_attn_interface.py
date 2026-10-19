@@ -818,6 +818,49 @@ def _paged_narrow_tile(
     return -(-tiles // max(num_kv_splits, 1)) >= 16
 
 
+# FLYDSL_PAGED_NARROW_CHAIN=0 keeps the chain-length split count below.
+_PAGED_NARROW_CHAIN = os.getenv("FLYDSL_PAGED_NARROW_CHAIN", "1") == "1"
+# Workgroups for one full round of single-wave tiles: 4 per CU (LDS-bound).
+_PAGED_NARROW_MIN_WG = int(os.getenv("FLYDSL_PAGED_NARROW_MIN_WG", "1024"))
+
+
+def _paged_narrow_chain_splits(
+    splits: int,
+    groups: int,
+    rows: int,
+    window_left: int,
+    q_len: int,
+    kv_len: int,
+    head_dim: int,
+    page_size: int,
+) -> int:
+    """Trade splits for chain length when that earns the single-wave tile.
+
+    Packed rows that fit 32 run on one wave, with the next K tile prefetched,
+    once a split walks >= 16 tiles. Chain-length sizing stops near 8, which
+    keeps the 64-row tile whose second wave is all padding. Halve the split
+    count until the narrow tile applies, while the grid (``groups`` workgroups
+    per split at <= 32 rows) still fills a round of workgroups.
+    """
+    if not _PAGED_NARROW_CHAIN or rows > 32:
+        return splits
+
+    def narrow(s: int) -> bool:
+        return _paged_narrow_tile(rows, window_left, q_len, kv_len, s, head_dim, groups)
+
+    s = splits
+    pages = -(-max(kv_len, 1) // page_size)
+    while s > 1 and not narrow(s):
+        half = s // 2
+        if (
+            groups * half < _PAGED_NARROW_MIN_WG
+            or -(-pages // half) > _PAGED_BT_LDS_SIZE
+        ):
+            break
+        s = half
+    return s if narrow(s) else splits
+
+
 # Minimum KV tiles per workgroup for paged K double buffering.
 _PAGED_KV_DMA_MIN_ITERS = int(os.getenv("FLYDSL_PAGED_KV_DMA_MIN_ITERS", "63"))
 
@@ -1506,6 +1549,16 @@ def _flydsl_flash_attn_paged(
                 D,
                 _gqa_packed,
             )
+        num_kv_splits = _paged_narrow_chain_splits(
+            num_kv_splits,
+            B * H,
+            Sq,
+            window_left,
+            _gqa_qlen if _gqa_packed else Sq,
+            skv,
+            D,
+            page_size,
+        )
     elif requested_num_kv_splits <= 1:
         num_kv_splits = 1
     else:
