@@ -478,10 +478,10 @@ def test_cuda_graph_sees_updated_seqlen_k(Sq):
 
 
 def _windowed_reference(q, k, v, ctx, window, num_kv_heads):
-    """Bottom-right causal attention restricted to the last ``window`` keys.
+    """Bottom-right causal attention restricted to a ``window_left`` window.
 
-    ``window`` is the kernel's ``window_left``: it keeps ``kv > q_pos - window``,
-    so exactly ``window`` keys including the query's own position.
+    As in flash-attention, it keeps ``kv >= q_pos - window``: ``window`` keys
+    before the query's own position plus that position.
     """
     B, Sq, H, D = q.shape
     flat_k = k.reshape(-1, num_kv_heads, D).float()[:ctx]
@@ -493,7 +493,7 @@ def _windowed_reference(q, k, v, ctx, window, num_kv_heads):
         for t in range(Sq):
             q_abs = ctx - Sq + t
             scores = (q.float()[0, t, h] @ flat_k[:, kv].T) / math.sqrt(D)
-            keep = (col <= q_abs) & (col > q_abs - window)
+            keep = (col <= q_abs) & (col >= q_abs - window)
             out[t, h] = (
                 torch.softmax(scores.masked_fill(~keep, float("-inf")), -1)
                 @ flat_v[:, kv]
@@ -591,7 +591,8 @@ def test_paged_window_keeps_gqa_packing(monkeypatch):
         max_seqlen_kv=2048,
         window_left=255,
     )
-    assert seen[-1]["window_left"] == 255, "window must reach the light builder"
+    # The builder takes the exclusive bound, window_left + 1.
+    assert seen[-1]["window_left"] == 256, "window must reach the light builder"
     assert seen[-1]["q_pack_qlen"] == 4, "causal windowed shapes should pack"
 
 
