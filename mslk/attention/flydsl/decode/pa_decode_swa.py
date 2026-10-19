@@ -67,6 +67,7 @@ def compile_pa_decode_swa(
     num_waves: int,
     num_splits: int = 1,
     merge_kernel: bool = False,
+    num_kv_heads: int = 0,
     arch: str = "",
 ) -> Any:  # pyre-ignore[3]
     if not arch:
@@ -82,6 +83,7 @@ def compile_pa_decode_swa(
     _SQ = seqlen_q
     _NW = num_waves
     _S = num_splits  # CTAs per (request, KV head); > 1 merges through `ws`
+    _HKV = num_kv_heads  # 0: taken from the kernel argument
     # With merge_kernel the split partials are merged by the reduce kernel
     # instead of the last CTA to finish.
     _SEP = merge_kernel and num_splits > 1
@@ -104,7 +106,10 @@ def compile_pa_decode_swa(
     _K_F16 = TILE_N * _HEAD  # K tile, row-major with a 16B-chunk XOR swizzle
     _LOOP_BYTES = (_V_F16 + _K_F16) * 2
     _C8 = _HEAD // 8  # 16-byte chunks per K/V row
-    _ACC_F32 = _M_TILES * MFMA_M * _HEAD
+    # Merge rows in LDS are padded by 4 floats: a wave's 16 lanes store 16
+    # different rows at once, which an unpadded 2^k stride puts on one bank.
+    _ROW_F32 = _HEAD + 4
+    _ACC_F32 = _M_TILES * MFMA_M * _ROW_F32
     _MERGE_BYTES = (_ACC_F32 + 2 * _M_TILES * MFMA_M) * 4
     _REGION = max(_LOOP_BYTES, _MERGE_BYTES)
     _REGION = (_REGION + 15) // 16 * 16
@@ -154,8 +159,11 @@ def compile_pa_decode_swa(
         flat = fx.Int32(gpu.block_idx.x)
         split = flat % fx.Int32(_S)
         head_flat = flat // fx.Int32(_S)
-        hkv_abs = head_flat % num_hkv
-        b_idx = head_flat // num_hkv
+        # A build-time KV head count makes these shifts / multiplies rather
+        # than a division waiting on the kernel arguments.
+        _nkv = fx.Int32(_HKV) if const_expr(_HKV > 0) else num_hkv
+        hkv_abs = head_flat % _nkv
+        b_idx = head_flat // _nkv
         hq_base = hkv_abs * fx.Int32(_RATIO)
 
         c_zero = arith.constant(0.0, type=T.f32)
@@ -503,7 +511,7 @@ def compile_pa_decode_swa(
                     [
                         fx.Index(
                             my_f32
-                            + row * fx.Int32(_HEAD)
+                            + row * fx.Int32(_ROW_F32)
                             + fx.Int32(dpass * MFMA_N)
                             + grp * fx.Int32(4)
                         )
@@ -623,7 +631,7 @@ def compile_pa_decode_swa(
                 parts = []
                 for w in range_constexpr(_NW):
                     base = fx.Int32(w * _R_F32 + _M_OFF) + row
-                    nb = fx.Int32(w * _R_F32) + row * fx.Int32(_HEAD) + d0
+                    nb = fx.Int32(w * _R_F32) + row * fx.Int32(_ROW_F32) + d0
                     parts.append(
                         (
                             _lds_f(base),
@@ -727,6 +735,7 @@ def compile_pa_decode_swa_reduce(
     gqa_ratio: int,
     seqlen_q: int,
     num_splits: int,
+    num_kv_heads: int = 0,
 ) -> Any:  # pyre-ignore[3]
     """Merge the num_splits partials that pa_decode_swa wrote with
     merge_kernel=True. One wave per (request, KV head, row): a lane owns 8
@@ -736,6 +745,7 @@ def compile_pa_decode_swa_reduce(
     _RATIO = gqa_ratio
     _SQ = seqlen_q
     _S = num_splits
+    _HKV = num_kv_heads
     _T_PACK = MFMA_M // _RATIO
     _M16 = (_SQ + _T_PACK - 1) // _T_PACK * MFMA_M
     _V = 8
@@ -761,10 +771,11 @@ def compile_pa_decode_swa_reduce(
         blk = fx.Int32(gpu.block_idx.x)
         row = blk % fx.Int32(_M16)
         head_flat = blk // fx.Int32(_M16)
-        b_idx = head_flat // num_hkv
+        _nkv = fx.Int32(_HKV) if const_expr(_HKV > 0) else num_hkv
+        b_idx = head_flat // _nkv
         m = row % fx.Int32(MFMA_M)
         qtok = (row // fx.Int32(MFMA_M)) * fx.Int32(_T_PACK) + m // fx.Int32(_RATIO)
-        head_abs = (head_flat % num_hkv) * fx.Int32(_RATIO) + m % fx.Int32(_RATIO)
+        head_abs = (head_flat % _nkv) * fx.Int32(_RATIO) + m % fx.Int32(_RATIO)
         d0 = (lane % fx.Int32(_LANES)) * fx.Int32(_V)
         grp = lane // fx.Int32(_LANES)
         c_zero = arith.constant(0.0, type=T.f32)
@@ -909,6 +920,7 @@ def _make_swa_launcher(
     num_waves,
     num_splits,
     merge_kernel,
+    num_kv_heads,
 ):
     kernel, _alloc = compile_pa_decode_swa(
         head_size=head_size,
@@ -919,6 +931,7 @@ def _make_swa_launcher(
         num_waves=num_waves,
         num_splits=num_splits,
         merge_kernel=merge_kernel,
+        num_kv_heads=num_kv_heads,
     )
     reduce = (
         compile_pa_decode_swa_reduce(
@@ -927,6 +940,7 @@ def _make_swa_launcher(
             gqa_ratio=gqa_ratio,
             seqlen_q=seqlen_q,
             num_splits=num_splits,
+            num_kv_heads=num_kv_heads,
         )
         if merge_kernel and num_splits > 1
         else None
@@ -1077,7 +1091,15 @@ def pa_decode_swa_launch(
     if merge_kernel is None:
         merge_kernel = num_splits > 8
     launcher = _make_swa_launcher(
-        D, kv_str, page_size, H_q // H_kv, Sq, num_waves, num_splits, merge_kernel
+        D,
+        kv_str,
+        page_size,
+        H_q // H_kv,
+        Sq,
+        num_waves,
+        num_splits,
+        merge_kernel,
+        H_kv,
     )
     if num_splits > 1:
         assert B * H_kv <= 1 << 16

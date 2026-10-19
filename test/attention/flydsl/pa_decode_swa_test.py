@@ -54,7 +54,9 @@ def _reference(q, k, v, block_table, seqlen_k, window_left):
     [
         (1, 1, 128, 32768, -1),  # full, reduce-kernel merge
         (1, 4, 64, 32768, -1),
+        (4, 1, 128, 4096, 2047),  # windowed, reduce-kernel merge
         (16, 1, 128, 4096, 2047),  # windowed, in-kernel merge
+        (16, 4, 128, 4096, 2047),
         (8, 4, 64, 4096, 2047),
         (64, 4, 128, 4096, 2047),  # windowed, no split
         (64, 1, 64, 4096, 1023),
