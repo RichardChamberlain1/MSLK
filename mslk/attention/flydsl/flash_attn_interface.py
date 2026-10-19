@@ -1490,6 +1490,12 @@ def _flydsl_flash_attn_paged(
 
     splitk = num_kv_splits > 1
     max_pages_per_split = (max_kv_pages + int(num_kv_splits) - 1) // int(num_kv_splits)
+    # A windowed split walks only the window's pages, not the whole context's, so
+    # size the register page-id gate by those (+2: an unaligned window edge).
+    _pid_pages = max_pages_per_split
+    if window_left >= 0:
+        _win_pages = -(-(window_left + Sq) // page_size) + 2
+        _pid_pages = min(_pid_pages, -(-_win_pages // int(num_kv_splits)))
     if max_pages_per_split > _PAGED_BT_LDS_SIZE:
         max_supported_kv = _PAGED_BT_LDS_SIZE * int(num_kv_splits) * page_size
         raise NotImplementedError(
@@ -1591,7 +1597,7 @@ def _flydsl_flash_attn_paged(
                 kv_dma=_paged_kv_dma(_paged_bm, D, window_left, skv, num_kv_splits),
                 k_prefetch=_k_prefetch,
                 fused_combine=fused_combine,
-                pid_regs=_paged_pid_regs(max_pages_per_split) and not _k_prefetch,
+                pid_regs=_paged_pid_regs(_pid_pages) and not _k_prefetch,
             )
         else:
             exe = _build_paged(
