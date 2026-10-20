@@ -31,6 +31,7 @@ import torch._utils_internal  # noqa: E402
 torch._utils_internal.REQUIRES_SET_PYTHON_MODULE = False
 
 import torch  # noqa: E402
+from mslk.utils.device import gfx_arch_in  # noqa: E402
 
 from . import _meta  # noqa: F401, E402
 
@@ -241,18 +242,15 @@ if torch.version.hip is not None:
             )
 
     if hasattr(torch.ops, "mslk") and hasattr(torch.ops.mslk, "f8f8bf16_blockwise"):
-        # ROCm blockwise FP8 GEMM (CK retired, C++ op is CUDA-only): FlyDSL impl,
-        # resolved on first call so registration never imports FlyDSL.
-        @functools.lru_cache(maxsize=1)
-        def _blockwise_module() -> ModuleType:
-            from mslk.flydsl.common import is_flydsl_available
 
-            if not is_flydsl_available():
-                raise RuntimeError(
-                    "mslk::f8f8bf16_blockwise on ROCm requires the FlyDSL backend. "
-                    "Add //mslk/mslk/gemm:flydsl_ops to your target's deps."
-                )
-            return importlib.import_module("mslk.gemm.flydsl.fp8_blockwise_gemm")
+        @functools.lru_cache(maxsize=1)
+        def _blockwise_impl() -> Callable[..., torch.Tensor]:
+            mod = _flydsl_gemm_module("fp8_blockwise_gemm")
+            if mod is not None and mod.is_supported():
+                return mod.matmul_f8f8bf16_blockwise
+            from .triton.fp8_gemm import matmul_fp8_block as _impl
+
+            return _impl
 
         try:
 
@@ -266,7 +264,7 @@ if torch.version.hip is not None:
                 block_n: int = 128,
                 block_k: int = 128,
             ) -> torch.Tensor:
-                return _blockwise_module().matmul_f8f8bf16_blockwise(
+                return _blockwise_impl()(
                     XQ, WQ, x_scale, w_scale, block_m, block_n, block_k
                 )
 
@@ -286,7 +284,15 @@ if torch.version.hip is not None:
                     block_n: int = 128,
                     block_k: int = 128,
                 ) -> torch.Tensor:
-                    return _blockwise_module().matmul_f8f8bf16_blockwise_preshuffle(
+                    mod = _flydsl_gemm_module("fp8_blockwise_gemm")
+                    if mod is None or not mod.is_supported():
+                        raise RuntimeError(
+                            "mslk::f8f8bf16_blockwise_preshuffle requires the "
+                            "FlyDSL backend on a gfx942 or gfx950 device and has "
+                            "no Triton fallback. Add //mslk/mslk/gemm:flydsl_ops "
+                            "to your target's deps."
+                        )
+                    return mod.matmul_f8f8bf16_blockwise_preshuffle(
                         XQ, WQ, x_scale, w_scale, block_m, block_n, block_k
                     )
 
@@ -348,6 +354,8 @@ if torch.version.hip is not None:
             "matmul_f8f8bf16_rowwise_grouped_mm_preshuffle",
         ),
     ):
+        if gfx_arch_in(("gfx1250",)) and _op == "f8f8bf16_rowwise_grouped_mm":
+            continue
         if not hasattr(torch.ops.mslk, _op):
             continue  # schema absent, as in a python-only build
         try:

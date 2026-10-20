@@ -105,16 +105,31 @@ def test_backward(  # noqa: C901
     scale = None
     if op_bw.SUPPORTS_CUSTOM_SCALE and query.shape[-1] < 32:
         scale = (1 / 32) ** 0.5
-    op_fw = (
-        sample_random_supported_fw(
-            fmha.Inputs(query=query, key=key, value=value, attn_bias=attn_bias),
-            ALL_FW_OPS,
-            seed=q_len * kv + kv_len * k,
-            op_bw=op_bw,
+    if op_bw == fmha.flydsl.BwOp and dtype == torch.bfloat16:
+        # Hoisted above the forward-op selection: that selection raises rather than
+        # skips, and must not fail a case unconditionally skipped two lines later.
+        pytest.skip(
+            "FlyDSL Fmha backward for bfloat16 has a known precision tail "
+            "(same root cause as CK's own bf16 backward skip below)!"
         )
-        if op_bw != fmha.cutlass.BwOp
-        else fmha.cutlass.FwOp
-    )
+
+    try:
+        op_fw = (
+            sample_random_supported_fw(
+                fmha.Inputs(query=query, key=key, value=value, attn_bias=attn_bias),
+                ALL_FW_OPS,
+                seed=q_len * kv + kv_len * k,
+                op_bw=op_bw,
+            )
+            if op_bw != fmha.cutlass.BwOp
+            else fmha.cutlass.FwOp
+        )
+    except NotImplementedError:
+        if op_bw != fmha.flydsl.BwOp:
+            raise
+        # flydsl.BwOp has no forward of its own and is paired with ck.FwOp, so a gap
+        # in that forward's coverage is not a backward bug -- skip instead of failing.
+        pytest.skip("No forward operator supports these inputs for flydsl.BwOp")
 
     if op_bw == fmha.flydsl.BwOp:
         # op_fw is already pinned to fmha.ck.FwOp by sample_random_supported_fw's
@@ -411,3 +426,63 @@ def test_backward_gqa_flydsl():
         atol=op[1].ERROR_ATOL[dtype],
         rtol=op[1].ERROR_RTOL[dtype],
     )
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("head_dim", [64, 256])
+def test_backward_flydsl_block_diagonal_causal_local_and_unwindowed(head_dim):
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+
+    device = torch._C._get_accelerator().type
+    dtype = torch.float16
+    seqlens = [17, 73, 41]
+    total_tokens = sum(seqlens)
+    generator = torch.Generator(device=device).manual_seed(0)
+    query_base = torch.randn(
+        1, total_tokens, 2, head_dim, device=device, dtype=dtype, generator=generator
+    )
+    key_base = torch.randn_like(query_base)
+    value_base = torch.randn_like(query_base)
+    grad_out = torch.randn_like(query_base)
+
+    for window_size in [None, 37, 128, 37]:
+        block_diagonal_bias = fmha.BlockDiagonalMask.from_seqlens(
+            seqlens, device=torch.device(device)
+        )
+        attn_bias = (
+            block_diagonal_bias.make_causal()
+            if window_size is None
+            else block_diagonal_bias.make_local_attention(window_size)
+        )
+        query = query_base.clone().requires_grad_(True)
+        key = key_base.clone().requires_grad_(True)
+        value = value_base.clone().requires_grad_(True)
+        out = fmha.memory_efficient_attention(
+            query,
+            key,
+            value,
+            attn_bias,
+            op=(fmha.ck.FwOp, fmha.flydsl.BwOp),
+        )
+        out.backward(grad_out)
+        grads = [query.grad, key.grad, value.grad]
+
+        query_ref = query_base.clone().requires_grad_(True)
+        key_ref = key_base.clone().requires_grad_(True)
+        value_ref = value_base.clone().requires_grad_(True)
+        out_ref = ref_attention_for_test(query_ref, key_ref, value_ref, attn_bias)
+        out_ref.backward(grad_out)
+
+        for name, grad, grad_ref in zip(
+            ["query", "key", "value"],
+            grads,
+            [query_ref.grad, key_ref.grad, value_ref.grad],
+        ):
+            assert_allclose(
+                grad,
+                grad_ref,
+                msg=f"flydslB:window={window_size or 'unwindowed'}:{name}",
+                atol=fmha.flydsl.BwOp.ERROR_ATOL[dtype],
+                rtol=fmha.flydsl.BwOp.ERROR_RTOL[dtype],
+            )

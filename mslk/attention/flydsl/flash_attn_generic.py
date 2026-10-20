@@ -38,8 +38,8 @@ from .flash_attn_utils import (
     _make_flash_attn_generic_traits,
     _waitcnt_vm_n,
     combine_lanes_per_row,
+    COMBINE_PREFETCH,
     combine_rows_per_block,
-    combine_split_groups,
     DualwaveSplitKCombineContext,
     DualwaveSplitKCombineHelper,
     GenericFlashAttnContext,
@@ -271,7 +271,7 @@ def build_flash_attn_func_module_primary(
         q_pack_group=q_pack_group,
         kv_lens=kv_lens,
     )
-    _flash_attn_generic_cache_tag = traits.cache_tag
+    _flash_attn_generic_cache_tag = (traits.cache_tag, COMBINE_PREFETCH)
 
     def _extract_seq_len(args, kwargs):
         """Return the launch-time seq_len as int, or None if not statically known."""
@@ -395,7 +395,7 @@ def build_flash_attn_func_module_primary(
         if const_expr(_use_dma_dbuf):
             init_args.append(fx.Index(0))
             kv_gmem_to_lds.coop_dma_k(kv_lower, buf_id=0)
-            rocdl.s_waitcnt(0)
+            wait_lds_copies(0)
         if const_expr(_pipe_k):
             _k0_vecs = kv_gmem_to_lds.coop_load_k_global(kv_lower)
             for _kb in range_constexpr(traits.NUM_BATCHES_KV):
@@ -690,9 +690,9 @@ def build_flash_attn_func_module_primary(
     # and the remaining lanes divide the split dimension between them, merged
     # by an in-wave butterfly. A partial wave would drop split groups, so the
     # block must be whole waves.
-    if combine_split_groups(traits.HEAD_DIM) > 1:
-        COMBINE_BLOCK = max(64, COMBINE_BLOCK // 64 * 64)
-    COMBINE_ROWS_PER_BLOCK = combine_rows_per_block(traits.HEAD_DIM, COMBINE_BLOCK)
+    COMBINE_ROWS_PER_BLOCK = (
+        combine_rows_per_block(traits.HEAD_DIM, COMBINE_BLOCK) if traits.SPLITK else 1
+    )
 
     @flyc.kernel(known_block_size=[COMBINE_BLOCK, 1, 1])
     def flash_attn_generic_combine_kernel(
@@ -731,10 +731,13 @@ def build_flash_attn_func_module_primary(
         # Each split group reduces its own share against its own max, then the
         # groups are merged across the wave.
         m_max = combine.reduce_m_max()
+        m_max = combine.merge_m_max(m_max)
         acc, den = combine.accumulate_splits(m_max)
-        m_max, den, acc = combine.merge_split_groups(m_max, den, acc)
+        den, acc = combine.merge_split_groups(den, acc)
         o_pack = combine.pack_output(acc, den)
         # Every group ends up with the merged result; one of them stores it.
+        # seq_len is the exact packed-row count, so row_in_bounds also excludes
+        # every ceil-div padding row before stride-packed output addressing.
         _owns_store = c_ctx.row_in_bounds & (c_ctx.sgrp == fx.Index(0))
 
         def _store_in_bounds():

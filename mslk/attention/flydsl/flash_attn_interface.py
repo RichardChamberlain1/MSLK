@@ -56,6 +56,21 @@ _VARLEN_LIGHT_MAX_SEQ = 256
 _DENSE_LIGHT_CU_FALLBACK = 256
 _DENSE_DUALWAVE_MIN_SEQ = 256
 _DENSE_DUALWAVE_LARGE_BATCH = 8
+_RAW_BUFFER_MAX_BYTES = (1 << 32) - 1
+
+
+def _validate_splitk_workspace_descriptor(
+    num_heads: int, seq_len: int, head_dim: int, num_splits: int
+) -> None:
+    opart_batch_bytes = num_heads * seq_len * (head_dim // 2) * num_splits * 4
+    if opart_batch_bytes > _RAW_BUFFER_MAX_BYTES:
+        raise ValueError(
+            "flydsl_flash_attn_func: split-K O-partial workspace per batch "
+            f"({opart_batch_bytes} bytes) exceeds the raw-buffer descriptor limit "
+            f"({_RAW_BUFFER_MAX_BYTES} bytes)"
+        )
+
+
 _DENSE_DUALWAVE_MIN_SEQ_LARGE_BATCH = 192
 _DENSE_M256_MIN_TOKENS = 4096
 
@@ -457,6 +472,13 @@ def _build_paged(
 # gfx950 dualwave paged-KV currently supports exactly one configuration.
 _PAGED_PAGE_SIZE = 64
 _PAGED_BT_LDS_SIZE = 2048
+_PAGED_METADATA_DTYPES = {
+    torch.uint8,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+}
 
 # Paged split-K sizing. `_num_kv_splits_heuristic` (CK's) stops as soon as the
 # workgroup count covers the CUs once, because it assumes a workgroup that has
@@ -485,6 +507,7 @@ _PAGED_MAX_WG = int(os.getenv("FLYDSL_PAGED_MAX_WG", "8192"))
 _PAGED_WS_BUDGET_MB = int(os.getenv("FLYDSL_PAGED_WS_BUDGET_MB", "512"))
 # Debug/tuning override: force an exact split count (0 = use the heuristic).
 _PAGED_FORCE_SPLITS = int(os.getenv("FLYDSL_PAGED_FORCE_SPLITS", "0"))
+
 # Fold GQA query heads into the M dimension at q_len==1 (see the pack block in
 # _flydsl_flash_attn_paged). Set to 0 to fall back to one workgroup per query head.
 _PAGED_GQA_STRIDE = os.getenv("FLYDSL_PAGED_GQA_STRIDE", "1") == "1"
@@ -492,56 +515,77 @@ _PAGED_GQA_PACK = os.getenv("FLYDSL_PAGED_GQA_PACK", "1") == "1"
 _PAGED_LIGHT_BLOCK_M = int(os.getenv("FLYDSL_PAGED_BLOCK_M", "64"))
 
 
-_UNIFORM_CU_SEQLENS: dict = {}
-
-
 def _uniform_cu_seqlens(count: int, step: int, device: str) -> torch.Tensor:
-    """Cached prefix sums for uniform sequence lengths.
-
-    Pure function of (count, step, device), so caching is safe. Saves an arange
-    dispatch per call; decode replays the same shape indefinitely. Nothing is
-    stored while a CUDA graph is being captured: a tensor first built there
-    lives in the graph's pool and holds nothing until the graph replays.
-    Entries are never evicted, since a captured graph may still point at one;
-    they are a few bytes each and keyed by batch shape.
-    """
-    key = (count, step, device)
-    cached = _UNIFORM_CU_SEQLENS.get(key)
-    if cached is not None:
-        return cached
-    cu = torch.arange(0, (count + 1) * step, step, dtype=torch.int32, device=device)
-    if not torch.cuda.is_current_stream_capturing():
-        _UNIFORM_CU_SEQLENS[key] = cu
-    return cu
+    """Prefix sums for uniform sequence lengths on the current stream."""
+    return torch.arange(0, (count + 1) * step, step, dtype=torch.int32, device=device)
 
 
 def _paged_kv_cumsum(seqlen_k: torch.Tensor) -> torch.Tensor:
-    """Exclusive scan of the per-request KV lengths, memoised on the tensor.
-
-    For the dualwave varlen route, which reads lengths as cumulative deltas even
-    though paged KV takes its base from the block table. Cached because this sits
-    on the launch path and `seqlen_k` is typically reused across steps; the scan
-    itself is a device op, so it stays capturable.
-
-    Bypassed while a CUDA graph is being captured, so the graph records the scan:
-    a cache hit there would bake in the lengths of the eager warm-up call and
-    ignore every later in-place update of `seqlen_k` between replays.
-    """
-    capturing = torch.cuda.is_current_stream_capturing()
-    key = (seqlen_k.data_ptr(), seqlen_k._version, int(seqlen_k.numel()))
-    cached = getattr(seqlen_k, "_flydsl_kv_cum", None)
-    if not capturing and cached is not None and cached[0] == key:
-        return cached[1]
-    cum = torch.nn.functional.pad(
+    """Exclusive scan of per-request KV lengths on the current stream."""
+    return torch.nn.functional.pad(
         seqlen_k.to(torch.int32).cumsum(0, dtype=torch.int32), (1, 0)
     )
-    if capturing:
-        return cum
-    try:
-        seqlen_k._flydsl_kv_cum = (key, cum)
-    except AttributeError:  # tensor subclasses may reject attributes
-        pass
-    return cum
+
+
+def _normalize_paged_lengths(
+    lengths: torch.Tensor,
+    *,
+    launch_kv_bound: int,
+    block_table_capacity: int,
+    kv_seqstart: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Bound paged metadata using tensor operations on the consuming stream."""
+    bounded = lengths.to(torch.int64).clamp(0, launch_kv_bound)
+    normalized_start = None
+    if kv_seqstart is not None:
+        normalized_start = kv_seqstart.to(torch.int64).clamp(0, block_table_capacity)
+        bounded = torch.minimum(bounded, block_table_capacity - normalized_start)
+    return bounded.to(torch.int32).contiguous(), (
+        normalized_start.to(torch.int32).contiguous()
+        if normalized_start is not None
+        else None
+    )
+
+
+def _normalize_paged_cumulative_lengths(
+    cu_seqlens_kv: torch.Tensor,
+    *,
+    launch_kv_bound: int,
+    block_table_capacity: int,
+    kv_seqstart: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    cu_seqlens_kv_i64 = cu_seqlens_kv.to(torch.int64)
+    lengths = cu_seqlens_kv_i64[1:] - cu_seqlens_kv_i64[:-1]
+    bounded, normalized_start = _normalize_paged_lengths(
+        lengths,
+        launch_kv_bound=launch_kv_bound,
+        block_table_capacity=block_table_capacity,
+        kv_seqstart=kv_seqstart,
+    )
+    return _paged_kv_cumsum(bounded), normalized_start
+
+
+def _validate_paged_metadata(
+    name: str,
+    tensor: torch.Tensor,
+    device: torch.device,
+    rank: int,
+    first_dim: int,
+) -> None:
+    if tensor.device != device:
+        raise ValueError(
+            f"flydsl_flash_attn_func: {name} must be on {device}, got {tensor.device}"
+        )
+    if tensor.dim() != rank or int(tensor.shape[0]) != first_dim:
+        raise ValueError(
+            f"flydsl_flash_attn_func: {name} must have rank {rank} and first "
+            f"dimension {first_dim}, got shape {tuple(tensor.shape)}"
+        )
+    if tensor.dtype not in _PAGED_METADATA_DTYPES:
+        raise ValueError(
+            f"flydsl_flash_attn_func: {name} must have an integral dtype, "
+            f"got {tensor.dtype}"
+        )
 
 
 def _paged_num_kv_splits(
@@ -663,8 +707,9 @@ def _flydsl_flash_attn_paged(
     Supported config ONLY (anything else raises): linear/vectorized cache layout
     [NumBlocks, PageSize=64, NumKVHeads, HeadDim], vLLM lookup (block_table +
     seqlen_k), causal, D=64/128, dtype bf16/f16.
-    - Dense 4D Q ``[B, Sq, H, D]``: split-K supported at any Sq. ``num_kv_splits=0``
-      selects a count from occupancy; ``1`` disables; ``>1`` forces.
+    - Dense 4D Q ``[B, Sq, H, D]``: split-K supported at any Sq on the light
+      route (seq_len>=384 on dualwave). ``num_kv_splits=0`` sizes the count from
+      KV-chain length; ``1`` disables; ``>1`` forces.
     - Varlen packed Q ``[total_q, H, D]`` (cu_seqlens_q given): paged K/V looked up
       per kv-tile via block_table; split-K not supported (matches dense varlen).
     """
@@ -710,6 +755,10 @@ def _flydsl_flash_attn_paged(
             raise ValueError(
                 "flydsl_flash_attn_func: varlen paged KV requires max_seqlen_q"
             )
+        if num_kv_splits > 1:
+            raise NotImplementedError(
+                "flydsl_flash_attn_func: varlen paged KV does not support split-K"
+            )
         if q.dim() != 3:
             raise ValueError(
                 f"flydsl_flash_attn_func: varlen paged q must be 3D [total_q,H,D], got {q.dim()}D"
@@ -717,18 +766,7 @@ def _flydsl_flash_attn_paged(
         _total_q, H, D = q.shape
         B = cu_seqlens_q.numel() - 1
         Sq = int(max_seqlen_q)
-        # Split-K's combine pass addresses O as a dense [B, max_seqlen_q, H, D]
-        # block (it is handed batch_size/seq_len, not cu_seqlens), which matches
-        # the packed varlen layout only when every sequence has the same length.
-        # sum(q_seqlens) == B*max_seqlen_q iff they are all equal, so this is an
-        # exact test and needs no host sync. Ragged q with split-K silently
-        # returns garbage (measured rel_err ~1.0), hence the hard error.
         _varlen_uniform_q = _total_q == B * Sq
-        if num_kv_splits > 1 and not _varlen_uniform_q:
-            raise NotImplementedError(
-                "flydsl_flash_attn_func: varlen paged split-K requires uniform "
-                f"q_seqlens; got total_q={_total_q} for B={B}, max_seqlen_q={Sq}"
-            )
     else:
         _varlen_uniform_q = True
         if q.dim() != 4:
@@ -736,6 +774,30 @@ def _flydsl_flash_attn_paged(
                 f"flydsl_flash_attn_func: paged dense q must be 4D [B,Sq,H,D], got {q.dim()}D"
             )
         B, Sq, H, D = q.shape
+
+    _validate_paged_metadata("block_table", block_table, q.device, 2, B)
+    if seqlen_k is not None:
+        _validate_paged_metadata("seqlen_k", seqlen_k, q.device, 1, B)
+    if cu_seqlens_q is not None:
+        _validate_paged_metadata("cu_seqlens_q", cu_seqlens_q, q.device, 1, B + 1)
+    if cu_seqlens_kv is not None:
+        _validate_paged_metadata("cu_seqlens_kv", cu_seqlens_kv, q.device, 1, B + 1)
+    if kv_seqstart is not None:
+        _validate_paged_metadata("kv_seqstart", kv_seqstart, q.device, 1, B)
+    if B > 0 and int(block_table.shape[1]) == 0:
+        raise ValueError(
+            "flydsl_flash_attn_func: block_table must contain at least one page column"
+        )
+
+    with torch.cuda.device(q.device.index):
+        launch_stream = (
+            torch.cuda.current_stream(q.device) if stream is None else stream
+        )
+        if torch.device(launch_stream.device) != q.device:
+            raise ValueError(
+                "flydsl_flash_attn_func: stream must be on "
+                f"{q.device}, got {launch_stream.device}"
+            )
 
     # ── GQA head packing ────────────────────────────────────────────────────
     # The grid is one workgroup per (request, QUERY head), so the group_size
@@ -753,10 +815,8 @@ def _flydsl_flash_attn_paged(
     # A sliding window is only expressible on the generic (light) paged kernel,
     # whose N32 mask path carries WINDOW_LEFT. GQA packing stays on that kernel
     # and its window bound uses the same per-row position t as the causal bound,
-    # so causal windowed shapes may pack. Every other paged route -- MTP
-    # two-pass, the head-packed decode kernel, dualwave -- either masks by its
-    # own rules or rewrites the KV range, and would drop the window *silently*
-    # rather than failing. Each of those gates gets `not _paged_window`;
+    # so causal windowed shapes may pack. The dualwave kernel masks by its own
+    # rules and would drop the window *silently* rather than failing, so
     # `_paged_light_ok` is forced True below.
     _paged_window = window_left >= 0
 
@@ -772,6 +832,7 @@ def _flydsl_flash_attn_paged(
     _gqa_varlen = varlen
     _gqa_user_out = None
     _gqa_stride_packed = False
+    _gqa_rebuild_cu_q = False
     if (
         _PAGED_GQA_PACK
         # The kernel applies the window only under its causal mask, where packed
@@ -812,18 +873,19 @@ def _flydsl_flash_attn_paged(
         # [.., q_len, Hkv, group, D] -> [.., group, q_len, Hkv, D]; the flat M
         # index is h * q_len + t, matching Q_PACK_QLEN's row % q_len.
         if not _gqa_stride_packed:
-            q = (
-                q.view(B, Sq, num_kv_heads, _gqa_group, D)
-                .permute(0, 3, 1, 2, 4)
-                .reshape(
-                    (B * rows, num_kv_heads, D)
-                    if varlen
-                    else (B, rows, num_kv_heads, D)
+            with torch.cuda.stream(launch_stream):
+                q = (
+                    q.view(B, Sq, num_kv_heads, _gqa_group, D)
+                    .permute(0, 3, 1, 2, 4)
+                    .reshape(
+                        (B * rows, num_kv_heads, D)
+                        if varlen
+                        else (B, rows, num_kv_heads, D)
+                    )
+                    .contiguous()
                 )
-                .contiguous()
-            )
         if varlen:
-            cu_seqlens_q = _uniform_cu_seqlens(B, rows, str(q.device))
+            _gqa_rebuild_cu_q = True
             max_seqlen_q = rows
             _total_q = B * rows
         if not _gqa_stride_packed:
@@ -872,12 +934,34 @@ def _flydsl_flash_attn_paged(
             f"flydsl_flash_attn_func: num_heads ({H}) must be divisible by num_kv_heads ({num_kv_heads})"
         )
 
+    # Split-K (paged, dense only): split the KV dimension across grid_z = B*num_kv_splits
+    # workgroups + a combine pass. Fills the GPU for low-occupancy shapes (small B / few
+    # heads), where single-split paged underutilizes the device.
     # ── route + split-K sizing ──────────────────────────────────────────────
     # Two paged kernels: the generic "light" one and the gfx950 dualwave one. The
     # dualwave paged softmax overflows for f16 (narrow exponent) and on the causal
     # path at large logits, so those route to light regardless of seqlen; bf16
     # non-causal keeps the faster dualwave kernel. Decided here (rather than at the
     # launch site) because split-K sizing depends on which kernel runs.
+    requested_num_kv_splits = int(num_kv_splits)
+    if requested_num_kv_splits < 0:
+        raise ValueError(
+            "flydsl_flash_attn_func: num_kv_splits must be nonnegative, "
+            f"got {requested_num_kv_splits}"
+        )
+    block_table_stride = int(block_table.shape[1])
+    block_table_capacity = block_table_stride * page_size
+    if block_table_capacity > torch.iinfo(torch.int32).max:
+        raise ValueError(
+            "flydsl_flash_attn_func: block-table capacity exceeds the int32 "
+            f"kernel ABI limit; got {block_table_capacity}"
+        )
+    skv = block_table_capacity if max_seqlen_kv is None else int(max_seqlen_kv)
+    if not 0 <= skv <= block_table_capacity:
+        raise ValueError(
+            "flydsl_flash_attn_func: max_seqlen_kv must be between 0 and "
+            f"block-table capacity {block_table_capacity}; got {skv}"
+        )
     _arch = _gpu_arch(q.device)
     _gappy = kv_seqstart is not None
     _splitk_dtype_ok = D in (64, 128) and dtype_str in ("bf16", "f16")
@@ -893,7 +977,7 @@ def _flydsl_flash_attn_paged(
             and (
                 # Dualwave takes per-request KV lengths only via its varlen
                 # variant, which has no split-K.
-                (_dense_kv_lens and num_kv_splits > 1)
+                (_dense_kv_lens and requested_num_kv_splits > 1)
                 or dtype_str == "f16"
                 or causal
                 or not _arch.startswith("gfx950")
@@ -902,38 +986,38 @@ def _flydsl_flash_attn_paged(
         )
     )
 
-    # Split-K partitions the KV loop across extra workgroups + a combine pass. A
-    # decode-shaped paged call (Sq=1..16) launches only B*H workgroups and each one
-    # walks the whole context as a serial ~ctx/BLOCK_N_OUT chain of dependent
-    # loads, so wall time is (ctx/64) x memory latency no matter how idle the GPU
-    # is. Splitting shortens that chain, which is the entire lever on these shapes.
-    # No caller sizes num_kv_splits for paged, so do it here, treating the
-    # historical default of 1 the same as the 0 sentinel.
-    if (
-        num_kv_splits <= 1
-        and _paged_light_ok
-        and _splitk_dtype_ok
-        and not _gappy
-        and _varlen_uniform_q
-    ):
-        _kv_tiles = (
-            int(max_seqlen_kv) if max_seqlen_kv is not None else int(seqlen_k.max())
-        )
-        if _paged_window:
+    if varlen:
+        # The split-K combine kernel addresses a dense [B, H, Sq] output.
+        # Packed varlen Q has only sum(q_seqlens) rows, so automatic splitting
+        # would give the combine pass the wrong row mapping and allocation size.
+        num_kv_splits = 1
+    elif _paged_light_ok and requested_num_kv_splits == 0:
+        # Split-K partitions the KV loop across extra workgroups + a combine
+        # pass. A decode-shaped paged call (Sq=1..16) launches only B*H
+        # workgroups and each one walks the whole context as a serial
+        # ~ctx/BLOCK_N_OUT chain of dependent loads, so wall time is
+        # (ctx/64) x memory latency no matter how idle the GPU is. Splitting
+        # shortens that chain, which is the entire lever on these shapes.
+        if _gappy or not _splitk_dtype_ok:
+            num_kv_splits = 1
+        elif _paged_window:
             # The kernel only walks the keys the window can reach and splits
             # that range, so size by it rather than by the whole context. The
             # block-table window still spans the whole context, so keep at
             # least enough splits for its pages.
             _q_len = _gqa_qlen if _gqa_packed else Sq
-            _reach = min(_kv_tiles, int(window_left) + _q_len)
-            _pages = -(-_kv_tiles // page_size)
+            _reach = min(skv, int(window_left) + _q_len)
+            _pages = -(-skv // page_size)
             _floor = -(-_pages // _PAGED_BT_LDS_SIZE)
             num_kv_splits = _paged_window_num_kv_splits(B, H, Sq, _reach, D)
             if num_kv_splits < _floor:
                 num_kv_splits = 1 << (_floor - 1).bit_length()
         else:
-            num_kv_splits = _paged_num_kv_splits(B, H, Sq, _kv_tiles, D)
-
+            num_kv_splits = _paged_num_kv_splits(B, H, Sq, skv, D)
+    elif requested_num_kv_splits <= 1:
+        num_kv_splits = 1
+    else:
+        num_kv_splits = requested_num_kv_splits
     splitk = num_kv_splits > 1
     if splitk and not _splitk_dtype_ok:
         raise ValueError(
@@ -948,27 +1032,12 @@ def _flydsl_flash_attn_paged(
             f"flydsl_flash_attn_func: dualwave paged split-K requires seq_len>=384; "
             f"got seq_len={Sq}"
         )
+    if splitk:
+        _validate_splitk_workspace_descriptor(H, Sq, D, int(num_kv_splits))
 
     # Per-batch KV lengths differ in general → bottom-right cross-length masking. Varlen
     # paged always uses cross masking (per-batch seqlen_q/seqlen_kv come from cu_seqlens).
-    skv = (
-        int(max_seqlen_kv) if max_seqlen_kv is not None else int(seqlen_k.max().item())
-    )
     max_kv_pages = (skv + page_size - 1) // page_size
-    # Split-K (paged, dense only): split the KV dimension across grid_z = B*num_kv_splits
-    # workgroups + a combine pass. Fills the GPU for low-occupancy shapes (small B / few
-    # heads), where single-split paged underutilizes the device.
-    #
-    # `_paged_num_kv_splits` above has already sized this for the paged routes it
-    # covers, by KV-chain length rather than occupancy -- a grid that fills every
-    # CU can still be latency-stalled, which occupancy cannot see. Only resolve
-    # the `0` sentinel for what it left alone; never overwrite a count it chose,
-    # which moves shapes off the light kernel onto dualwave, where non-tile-
-    # aligned seqlen_k mis-masks (1e-2, above bf16 eps).
-    if num_kv_splits == 0:
-        num_kv_splits = 1
-
-    splitk = num_kv_splits > 1
     max_pages_per_split = (max_kv_pages + int(num_kv_splits) - 1) // int(num_kv_splits)
     if max_pages_per_split > _PAGED_BT_LDS_SIZE:
         max_supported_kv = _PAGED_BT_LDS_SIZE * int(num_kv_splits) * page_size
@@ -985,141 +1054,159 @@ def _flydsl_flash_attn_paged(
         cross = bool(cross_seqlen) if cross_seqlen is not None else True
     else:
         cross = _dw_kv_lens or skv != Sq
-    block_table_stride = int(block_table.shape[1])
-    # Flatten so the kernel's flat row-major index addresses block_table correctly.
-    block_table_i32 = (
-        (
-            block_table
-            if block_table.dtype == torch.int32
-            else block_table.to(torch.int32)
-        )
-        .contiguous()
-        .reshape(-1)
-    )
-
     with torch.cuda.device(q.device.index):
-        launch_stream = (
-            torch.cuda.current_stream(q.device) if stream is None else stream
-        )
-        # Route (_paged_light_ok) and split count were decided above, before the
-        # block-table LDS check, since that check is per-split.
-        if return_lse and not _paged_light_ok:
-            # Only the generic light path produces LSE; the dualwave native-paged
-            # kernel does not. (Short-q / gfx942 / paged-gappy take the light path.)
-            raise NotImplementedError(
-                "flydsl_flash_attn_func: return_lse for native paged KV is only "
-                "supported on the generic (short-seq / gfx942) path"
+        with torch.cuda.stream(launch_stream):
+            # Flatten so the kernel's row-major index addresses the table correctly.
+            block_table_i32 = block_table.to(torch.int32).contiguous().reshape(-1)
+            bounded_seqlen_k = None
+            if seqlen_k is not None:
+                bounded_seqlen_k, _ = _normalize_paged_lengths(
+                    seqlen_k,
+                    launch_kv_bound=skv,
+                    block_table_capacity=block_table_capacity,
+                )
+            bounded_cu_seqlens_kv = None
+            bounded_kv_seqstart = None
+            if cu_seqlens_kv is not None:
+                bounded_cu_seqlens_kv, bounded_kv_seqstart = (
+                    _normalize_paged_cumulative_lengths(
+                        cu_seqlens_kv,
+                        launch_kv_bound=skv,
+                        block_table_capacity=block_table_capacity,
+                        kv_seqstart=kv_seqstart,
+                    )
+                )
+            if return_lse and not _paged_light_ok:
+                raise NotImplementedError(
+                    "flydsl_flash_attn_func: return_lse for native paged KV is only "
+                    "supported on the generic (short-seq / gfx942) path"
+                )
+            if _paged_light_ok:
+                exe = _build_paged_light(
+                    num_heads=H,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=D,
+                    causal=causal,
+                    dtype_str=dtype_str,
+                    cross_seqlen=cross,
+                    varlen=varlen,
+                    kv_cache_layout=kv_cache_layout,
+                    waves_per_eu=waves_per_eu,
+                    daz=daz,
+                    lazy_rescale=dualwave_swp_lazy_rescale,
+                    setprio=dualwave_swp_setprio,
+                    debug_lazy_counts=False,
+                    enable_stagger=dualwave_swp_enable_stagger,
+                    gappy_kv=_gappy,
+                    return_lse=return_lse,
+                    sm_scale=sm_scale,
+                    window_left=window_left,
+                    q_pack_qlen=_gqa_qlen if (_gqa_packed and causal) else 0,
+                    q_pack_group=_gqa_group if _gqa_stride_packed else 0,
+                    kv_lens=_dense_kv_lens,
+                    block_m=128 if (_gqa_packed and Sq > 64) else 0,
+                    num_kv_splits=int(num_kv_splits),
+                )
+            else:
+                exe = _build_paged(
+                    num_heads=H,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=D,
+                    causal=causal,
+                    dtype_str=dtype_str,
+                    cross_seqlen=cross,
+                    waves_per_eu=waves_per_eu,
+                    daz=daz,
+                    lazy_rescale=dualwave_swp_lazy_rescale,
+                    setprio=dualwave_swp_setprio,
+                    enable_stagger=dualwave_swp_enable_stagger,
+                    num_kv_splits=int(num_kv_splits),
+                    varlen=varlen or _dw_kv_lens,
+                    kv_cache_layout=kv_cache_layout,
+                )
+            if out is None:
+                out = torch.empty_like(q)
+            q_flat = q.contiguous()
+            k_flat = k.contiguous()
+            v_flat = v.contiguous()
+            o_flat = out.contiguous()
+            if _dw_kv_lens:
+                q_flat = q_flat.view(B * Sq, H, D)
+                o_flat = o_flat.view(B * Sq, H, D)
+            kwargs = {
+                "block_table": block_table_i32,
+                "block_table_stride": block_table_stride,
+                "stream": launch_stream,
+            }
+            output_cu_seqlens_q = None
+            if varlen:
+                original_cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
+                kernel_cu_seqlens_q = (
+                    _uniform_cu_seqlens(B, Sq, str(q.device))
+                    if _gqa_rebuild_cu_q
+                    else original_cu_seqlens_q
+                )
+                kwargs["cu_seqlens_q"] = kernel_cu_seqlens_q
+                output_cu_seqlens_q = (
+                    original_cu_seqlens_q if _gqa_stride_packed else kernel_cu_seqlens_q
+                )
+                kwargs["cu_seqlens_kv"] = bounded_cu_seqlens_kv
+            if kv_seqstart is not None:
+                kwargs["kv_seqstart"] = bounded_kv_seqstart
+            if cross:
+                kwargs["seq_len_kv"] = skv
+            lse = (
+                torch.empty((B, H, Sq), dtype=torch.float32, device=q.device)
+                if return_lse
+                else None
             )
-        if _paged_light_ok:
-            exe = _build_paged_light(
-                num_heads=H,
-                num_kv_heads=num_kv_heads,
-                head_dim=D,
-                causal=causal,
-                dtype_str=dtype_str,
-                cross_seqlen=cross,
-                varlen=varlen,
-                kv_cache_layout=kv_cache_layout,
-                waves_per_eu=waves_per_eu,
-                daz=daz,
-                lazy_rescale=dualwave_swp_lazy_rescale,
-                setprio=dualwave_swp_setprio,
-                debug_lazy_counts=False,
-                enable_stagger=dualwave_swp_enable_stagger,
-                gappy_kv=_gappy,
-                return_lse=return_lse,
-                sm_scale=sm_scale,
-                window_left=window_left,
-                num_kv_splits=int(num_kv_splits),
-                q_pack_qlen=_gqa_qlen if (_gqa_packed and causal) else 0,
-                q_pack_group=_gqa_group if _gqa_stride_packed else 0,
-                kv_lens=_dense_kv_lens,
-                # Packing multiplies the M rows by the GQA group size. Rows that
-                # overflow BLOCK_M spill into a second Q tile, and each tile
-                # re-reads the whole KV range -- measured 4.08 -> 2.72 TB/s going
-                # from 64 rows to 88. Widen the tile instead. The reverse costs
-                # 19% when the rows do fit, so only widen when they do not.
-                block_m=128 if (_gqa_packed and Sq > 64) else 0,
-            )
-        else:
-            exe = _build_paged(
-                num_heads=H,
-                num_kv_heads=num_kv_heads,
-                head_dim=D,
-                causal=causal,
-                dtype_str=dtype_str,
-                cross_seqlen=cross,
-                waves_per_eu=waves_per_eu,
-                daz=daz,
-                lazy_rescale=dualwave_swp_lazy_rescale,
-                setprio=dualwave_swp_setprio,
-                enable_stagger=dualwave_swp_enable_stagger,
-                num_kv_splits=int(num_kv_splits),
-                varlen=varlen or _dw_kv_lens,
-                kv_cache_layout=kv_cache_layout,
-            )
-        if out is None:
-            out = torch.empty_like(q)
-        # Keep tensors in natural shape; flattening can overflow int32 C-ABI dims.
-        # The paged kernel rebuilds per-batch/page descriptors from base pointers.
-        q_flat = q.contiguous()
-        k_flat = k.contiguous()
-        v_flat = v.contiguous()
-        o_flat = out.contiguous()
-        if _dw_kv_lens:
-            q_flat = q_flat.view(B * Sq, H, D)
-            o_flat = o_flat.view(B * Sq, H, D)
-        kwargs = dict(
-            block_table=block_table_i32,
-            block_table_stride=block_table_stride,
-            stream=launch_stream,
-        )
-        if varlen:
-            kwargs["cu_seqlens_q"] = cu_seqlens_q
-            kwargs["cu_seqlens_kv"] = cu_seqlens_kv
-        if kv_seqstart is not None:
-            kwargs["kv_seqstart"] = kv_seqstart
-        if cross:
-            kwargs["seq_len_kv"] = skv
-        lse = (
-            torch.empty((B, H, Sq), dtype=torch.float32, device=q.device)
-            if return_lse
-            else None
-        )
-        if return_lse:
-            kwargs["lse"] = lse
-        if splitk:
-            ws_elems = dualwave_splitk_workspace_elems(
-                B, H, Sq, int(num_kv_splits), head_dim=D
-            )
-            _ws = torch.empty(ws_elems, dtype=torch.float32, device=q.device)
-            kwargs["workspace"] = _ws
-        if _dw_kv_lens:
-            # Dualwave's varlen variant reads lengths as cumulative deltas.
-            kwargs["cu_seqlens_kv"] = _paged_kv_cumsum(seqlen_k)
-            kwargs["cu_seqlens_q"] = _uniform_cu_seqlens(B, Sq, str(q.device))
-        elif _dense_kv_lens:
-            # KV_LENS reads each request's length directly.
-            kwargs["cu_seqlens_kv"] = (
-                seqlen_k
-                if seqlen_k.dtype == torch.int32 and seqlen_k.is_contiguous()
-                else seqlen_k.to(torch.int32).contiguous()
-            )
-        exe(q_flat, k_flat, v_flat, o_flat, B, Sq, **kwargs)
-        if o_flat.data_ptr() != out.data_ptr():
-            out.copy_(o_flat.view_as(out))
-
-    if _gqa_packed and not _gqa_stride_packed:
-        # Invert the pack permutation: (group, token, kv-head) -> (token, head).
-        unpacked = out.view(_gqa_B, _gqa_group, _gqa_qlen, H, D).permute(0, 2, 3, 1, 4)
-        out = unpacked.reshape(
-            (_gqa_B * _gqa_qlen, _gqa_heads, D)
-            if _gqa_varlen
-            else (_gqa_B, _gqa_qlen, _gqa_heads, D)
-        )
-        if _gqa_user_out is not None:
-            _gqa_user_out.view(out.shape).copy_(out)
-            out = _gqa_user_out
+            if return_lse:
+                kwargs["lse"] = lse
+            if splitk:
+                ws_elems = dualwave_splitk_workspace_elems(
+                    B, H, Sq, int(num_kv_splits), head_dim=D
+                )
+                workspace = torch.empty(ws_elems, dtype=torch.float32, device=q.device)
+                kwargs["workspace"] = workspace
+            if _dw_kv_lens:
+                kwargs["cu_seqlens_kv"] = _paged_kv_cumsum(bounded_seqlen_k)
+                kwargs["cu_seqlens_q"] = _uniform_cu_seqlens(B, Sq, str(q.device))
+            elif _dense_kv_lens:
+                kwargs["cu_seqlens_kv"] = bounded_seqlen_k
+            exe(q_flat, k_flat, v_flat, o_flat, B, Sq, **kwargs)
+            if o_flat.data_ptr() != out.data_ptr():
+                out.copy_(o_flat.view_as(out))
+            if not varlen and bounded_seqlen_k is not None:
+                empty_kv = bounded_seqlen_k.eq(0)
+                out.masked_fill_(empty_kv.view(B, 1, 1, 1), 0)
+                if lse is not None:
+                    lse.masked_fill_(empty_kv.view(B, 1, 1), -torch.inf)
+            elif varlen and bounded_cu_seqlens_kv is not None:
+                empty_kv = bounded_cu_seqlens_kv[1:].eq(bounded_cu_seqlens_kv[:-1])
+                q_lengths = output_cu_seqlens_q[1:] - output_cu_seqlens_q[:-1]
+                empty_q_rows = torch.repeat_interleave(
+                    empty_kv,
+                    q_lengths,
+                    output_size=q_flat.shape[0],
+                )
+                out.masked_fill_(empty_q_rows.view(-1, 1, 1), 0)
+                if lse is not None:
+                    lse.masked_fill_(empty_kv.view(B, 1, 1), -torch.inf)
+            if _gqa_packed and not _gqa_stride_packed:
+                # Invert the pack permutation: (group, token, kv-head) ->
+                # (token, head). Keep materialization and copy-back ordered after
+                # the kernel when the caller supplies a noncurrent stream.
+                unpacked = out.view(_gqa_B, _gqa_group, _gqa_qlen, H, D).permute(
+                    0, 2, 3, 1, 4
+                )
+                out = unpacked.reshape(
+                    (_gqa_B * _gqa_qlen, _gqa_heads, D)
+                    if _gqa_varlen
+                    else (_gqa_B, _gqa_qlen, _gqa_heads, D)
+                )
+                if _gqa_user_out is not None:
+                    _gqa_user_out.view(out.shape).copy_(out)
+                    out = _gqa_user_out
 
     return (out, lse) if return_lse else out
 
@@ -1140,10 +1227,10 @@ def _build_paged_light(
     setprio: bool,
     debug_lazy_counts: bool,
     enable_stagger: bool,
+    num_kv_splits: int,
     gappy_kv: bool = False,
     return_lse: bool = False,
     sm_scale: Optional[float] = None,
-    num_kv_splits: int = 1,
     q_pack_qlen: int = 0,
     q_pack_group: int = 0,
     kv_lens: bool = False,
@@ -1179,10 +1266,10 @@ def _build_paged_light(
         gappy_kv=gappy_kv,
         return_lse=return_lse,
         sm_scale=sm_scale,
-        num_kv_splits=num_kv_splits,
         q_pack_qlen=q_pack_qlen,
         q_pack_group=q_pack_group,
         kv_lens=kv_lens,
+        num_kv_splits=num_kv_splits,
     )
 
 
@@ -1215,9 +1302,9 @@ def flydsl_flash_attn_func(
     block_table: Optional[torch.Tensor] = None,
     seqlen_k: Optional[torch.Tensor] = None,
     kv_cache_layout: str = "linear",
-    # Split-K (gfx950 only, D=64/128, bf16/f16). The dense path additionally
-    # requires seq_len >= 384. 0 = auto (paged dense only; see below), 1 = never
-    # split, >1 = force that many splits.
+    # Split-K (gfx950 only, D=64/128, bf16/f16). The dense non-paged and the
+    # dualwave paged paths additionally require seq_len >= 384. 0 = auto (paged
+    # dense only), 1 = never split, >1 = force that many splits.
     num_kv_splits: int = 0,
     # fp8 dense ABI: per-tensor descales for pre-quantized e4m3fn Q/K/V.
     q_descale: Optional[torch.Tensor] = None,
@@ -1280,13 +1367,12 @@ def flydsl_flash_attn_func(
         cross_seqlen: Whether seqlen_q and seqlen_kv differ. Required in varlen mode;
             dense mode infers it from ``q.shape[1] != k.shape[1]``.
         block_table / seqlen_k: vLLM-style 2D block table metadata.
-        num_kv_splits: Split-K factor. ``0`` (default) and ``1`` both mean auto
-            on the paged light route (D=64/128, bf16/f16, uniform-q, not
-            gappy): the split count is sized from KV-chain length by
-            ``_paged_num_kv_splits``. Everywhere else they run a single pass,
-            except the dense non-paged path, which applies its own occupancy
-            heuristic. ``>1`` forces that many splits (gfx950 only, D=64/128,
-            bf16/f16; the dense non-paged path additionally requires seq>=384).
+        num_kv_splits: For paged dense attention, 0 selects the split count
+            automatically (sized from KV-chain length by ``_paged_num_kv_splits``
+            on the generic light route); values >=1 request that exact count, and
+            negative values are invalid. Split-K requires gfx950, D=64/128 and
+            bf16/f16; the dense non-paged and dualwave paged paths also require
+            seq>=384.
         q_descale / k_descale / v_descale: fp32 shape-[1] descales required
             for dense fp8 e4m3fn inputs.
         out: Optional pre-allocated output tensor. For fp8, output is bf16;
@@ -1340,11 +1426,10 @@ def flydsl_flash_attn_func(
         # builds with path_tag="N32" -- so the window is expressible there. fp8
         # has no mask path at all.
         #
-        # The *native* paged kernels (dualwave, pa_decode_gfx950) do their own
-        # masking and have no window, so they must not take a windowed shape:
-        # they would silently drop the window and return a full-context answer.
-        # `_paged_window` in the paged helper forces the light route and declines
-        # fast paths for exactly that reason.
+        # The *native* dualwave paged kernel does its own masking and has no
+        # window, so it must not take a windowed shape: it would silently drop
+        # the window and return a full-context answer. `_paged_window` in the
+        # paged helper forces the light route for exactly that reason.
         if dtype_str == "fp8":
             raise NotImplementedError(
                 "flydsl_flash_attn_func: sliding-window (window_left>=0) is not "
@@ -1410,13 +1495,6 @@ def flydsl_flash_attn_func(
         )
 
     varlen = cu_seqlens_q is not None
-
-    # `0` (auto) only selects a split count on the dense paged path, which has
-    # already returned above. Everything from here on is non-paged, where the
-    # existing per-shape `generic_splitk` selection is the auto mechanism, so
-    # collapse the sentinel to the historical default before anything reads it.
-    if num_kv_splits == 0:
-        num_kv_splits = 1
 
     if dtype_str == "fp8":
         if varlen:
@@ -1525,6 +1603,7 @@ def flydsl_flash_attn_func(
         ws_elems = dualwave_splitk_workspace_elems(
             B, H, Sq, int(num_kv_splits), head_dim=D
         )
+        _validate_splitk_workspace_descriptor(H, Sq, D, int(num_kv_splits))
 
     # ── build (cached) ──────────────────────────────────────────────────────
     debug_lazy = debug_counts is not None
@@ -1686,6 +1765,7 @@ def flydsl_flash_attn_func(
                     if _gen_splits > 1:
                         generic_splitk = True
                         num_kv_splits = _gen_splits
+                        _validate_splitk_workspace_descriptor(H, Sq, D, _gen_splits)
                         # BLOCK_M=64 short-q tile; N128 only for causal D128, else
                         # N32 (matches the generic builder's own path selection).
                         _sk_tag = "N128" if (causal and D == 128) else "N32"
@@ -1763,7 +1843,7 @@ def flydsl_flash_attn_func(
             if return_lse
             else None
         )
-        lse_kwargs = dict(lse=lse) if return_lse else {}
+        lse_kwargs = {"lse": lse} if return_lse else {}
 
         # ── launch ──────────────────────────────────────────────────────────
         if splitk:

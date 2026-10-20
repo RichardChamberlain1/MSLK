@@ -963,9 +963,15 @@ def combine_split_groups(head_dim):
 
 def combine_rows_per_block(head_dim, block_threads):
     """Output rows a combine block covers."""
-    if combine_split_groups(head_dim) > 1:
-        return max(1, block_threads // 64)  # a row owns a whole wave
-    return max(1, block_threads // combine_lanes_per_row(head_dim))
+    row_threads = (
+        64 if combine_split_groups(head_dim) > 1 else combine_lanes_per_row(head_dim)
+    )
+    if block_threads < row_threads or block_threads % row_threads != 0:
+        raise ValueError(
+            f"combine block {block_threads} must be a positive multiple of "
+            f"{row_threads} threads for head_dim={head_dim}"
+        )
+    return block_threads // row_threads
 
 
 def _q_pack_group(traits):
@@ -6491,32 +6497,41 @@ class DualwaveSplitKCombineContext:
         self.init_split_resources()
 
     def init_split_resources(self):
-        """One buffer descriptor per workspace region, spanning every split.
+        """One buffer descriptor per batch-local workspace region.
 
         Building a descriptor per split put a 4-SGPR setup between consecutive
         loads, so the splits' loads could not be in flight together and the
         combine paid a full memory latency per split (~0.47 us each, linear in
-        split count). The regions are contiguous in the split index, so a single
-        descriptor plus an element offset addresses all of them.
+        split count). Batch-local regions retain one descriptor across splits
+        without exceeding the raw-buffer descriptor's 32-bit byte range.
         """
         traits = self.traits
-        z_total = self.batch_size_v * traits.NUM_KV_SPLITS
-        ml_bytes = z_total * self.ws_ml_per_split_bytes
-        self.opart_rsrc_all = self.workspace_resource(
-            fx.Index(0), self.ws_mrow_abs_bytes
+        splits = fx.Index(traits.NUM_KV_SPLITS)
+        opart_batch_bytes = splits * self.ws_opart_per_split_bytes
+        ml_batch_bytes = splits * self.ws_ml_per_split_bytes
+        opart_batch_off = self.batch_idx * opart_batch_bytes
+        ml_batch_off = self.batch_idx * ml_batch_bytes
+        max_descriptor_bytes = fx.Index(0xFFFFFFFF)
+        opart_records = (opart_batch_bytes < max_descriptor_bytes).select(
+            opart_batch_bytes, max_descriptor_bytes
         )
-        self.mrow_rsrc_all = self.workspace_resource(self.ws_mrow_abs_bytes, ml_bytes)
-        self.lrow_rsrc_all = self.workspace_resource(self.ws_lrow_abs_bytes, ml_bytes)
+        self.opart_rsrc_all = self.workspace_resource(opart_batch_off, opart_records)
+        self.mrow_rsrc_all = self.workspace_resource(
+            self.ws_mrow_abs_bytes + ml_batch_off, ml_batch_bytes
+        )
+        self.lrow_rsrc_all = self.workspace_resource(
+            self.ws_lrow_abs_bytes + ml_batch_off, ml_batch_bytes
+        )
 
-    def opart_index(self, split_z):
+    def opart_index(self, split_i):
         return (
-            split_z * self.ws_opart_per_split_elems
+            split_i * self.ws_opart_per_split_elems
             + self.local_o_base
             + (self.col // 2)
         )
 
-    def ml_index(self, split_z):
-        return split_z * self.ws_ml_per_split_elems + self.local_ml_idx
+    def ml_index(self, split_i):
+        return split_i * self.ws_ml_per_split_elems + self.local_ml_idx
 
     def workspace_resource(self, byte_offset, nrec_bytes):
         return _make_ws_rsrc(self.ws_base_i64, byte_offset, nrec_bytes)
@@ -6529,11 +6544,7 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
     def __init__(self, ctx):
         super().__init__(ctx)
 
-    # Stands in for -inf on a split this lane does not own. A real -inf would
-    # make an all-empty group's merge compute (-inf) - (-inf) = NaN and poison
-    # every group it is then merged with; a large finite sentinel yields
-    # exp2(0) * 0 == 0 instead, and can never win the max against real data.
-    _M_EMPTY = -3.0e38
+    _M_EMPTY = float("-inf")
 
     def load_ml(self, split_i):
         """Load one split's (max, sum) statistics, masked to the valid range.
@@ -6545,7 +6556,7 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         n = self.traits.NUM_KV_SPLITS
         valid = fx.Int32(split_i) < fx.Int32(n)
         safe_i = valid.select(fx.Int32(split_i), fx.Int32(n - 1))
-        ml_idx_i = self.ml_index(self.split_z(fx.Index(safe_i)))
+        ml_idx_i = self.ml_index(fx.Index(safe_i))
         m_f32 = buffer_ops.buffer_load(
             self.mrow_rsrc_all,
             as_mlir_value(fx.Int32(ml_idx_i)),
@@ -6600,7 +6611,7 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         )
         o2_raw = buffer_ops.buffer_load(
             self.opart_rsrc_all,
-            as_mlir_value(fx.Int32(self.opart_index(self.split_z(fx.Index(safe_i))))),
+            as_mlir_value(fx.Int32(self.opart_index(fx.Index(safe_i)))),
             vec_width=self.chunk() // 2,
             dtype=T.i32,
         )
@@ -6612,7 +6623,6 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
 
     def accumulate_loaded(self, acc, den, m_i, l_i, m_max, o4):
         """Branchless merge of one already-loaded split partial.
-
         An unused split has l <= 0 and its workspace slot is uninitialised, so
         the weight is forced to zero *and* the operand is zeroed -- otherwise a
         garbage NaN would survive the multiply.
@@ -6658,30 +6668,27 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         )
         return arith.bitcast(T.f32, got)
 
-    def merge_split_groups(self, m_max, den, acc):
-        """Butterfly-merge the per-group (max, sum, numerator) across the wave.
+    def merge_m_max(self, m_max):
+        """Broadcast the maximum across every split group in the wave."""
+        if self.split_groups() <= 1:
+            return m_max
+        stride = combine_lanes_per_row(self.traits.HEAD_DIM)
+        while stride < 64:
+            m_max = _fmax(m_max, self._shuffle_f32(m_max, stride), self.fm_fast)
+            stride *= 2
+        return m_max
 
-        Each group weighted its numerator by its own local max, so the merge is
-        a log-sum-exp combine rather than a plain sum. After the last step every
-        lane in the group holds the full result; only group 0 stores.
-        """
+    def merge_split_groups(self, den, acc):
+        """Butterfly-sum globally scaled groups across the wave."""
         # Partners are the lanes holding the same head-dim slice in the next
         # split group, i.e. lanes_per_row apart -- not HEAD_DIM // 4, which only
         # coincides with it while the lane slice is 4 values wide.
         if self.split_groups() <= 1:
-            return m_max, den, acc
+            return den, acc
         stride = combine_lanes_per_row(self.traits.HEAD_DIM)
         while stride < 64:
-            m_p = self._shuffle_f32(m_max, stride)
-            m_new = _fmax(m_max, m_p, self.fm_fast)
-            w = rocdl.exp2(T.f32, as_mlir_value(_fsub(m_max, m_new, self.fm_fast)))
-            w_p = rocdl.exp2(T.f32, as_mlir_value(_fsub(m_p, m_new, self.fm_fast)))
             den_p = self._shuffle_f32(den, stride)
-            den = _fadd(
-                _fmul(den, w, self.fm_fast),
-                _fmul(den_p, w_p, self.fm_fast),
-                self.fm_fast,
-            )
+            den = _fadd(den, den_p, self.fm_fast)
             acc_p = Vec.from_elements(
                 [
                     fx.Float32(self._shuffle_f32(acc[j], stride))
@@ -6689,20 +6696,9 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
                 ],
                 fx.Float32,
             )
-            w4 = Vec.from_elements([fx.Float32(w)], fx.Float32).broadcast_to(
-                self.chunk()
-            )
-            wp4 = Vec.from_elements([fx.Float32(w_p)], fx.Float32).broadcast_to(
-                self.chunk()
-            )
-            acc = _fadd(
-                _fmul(acc, w4, self.fm_fast),
-                _fmul(acc_p, wp4, self.fm_fast),
-                self.fm_fast,
-            )
-            m_max = m_new
+            acc = _fadd(acc, acc_p, self.fm_fast)
             stride *= 2
-        return m_max, den, acc
+        return den, acc
 
     def accumulate_splits(self, m_max):
         """Merge every split, batching loads so they overlap.

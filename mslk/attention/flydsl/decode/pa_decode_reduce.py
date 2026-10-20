@@ -149,9 +149,11 @@ def _compile_reduce(
             part_sum = arith.select(active, p_sum_r, c_zero)
 
             gmax = arith.unwrap(wave_reduce_max_f32(fx.Float32(part_max)))
-            # An empty request leaves every partition at -inf; keep gmax finite so
-            # the weights come out 0 rather than exp(-inf - -inf) = NaN.
-            gmax = arith.maximumf(gmax, c_gmax_floor)
+            gmax = arith.select(
+                arith.cmpf(arith.CmpFPredicate.OEQ, gmax, c_neginf),
+                c_gmax_floor,
+                gmax,
+            )
             diff = arith.subf(part_max, gmax)
             w_f32 = arith.select(active, arith.unwrap(exp_f32(diff)), c_zero)
             gsum = arith.unwrap(
@@ -231,7 +233,11 @@ def _compile_reduce(
                     T.vec(1, T.f32), lm_lds, [fx.Index(arith.constant(p, type=T.i32))]
                 )[0]
                 gmax = arith.maximumf(gmax, arith.unwrap(fx.Float32(v)))
-            gmax = arith.maximumf(gmax, c_gmax_floor)
+            gmax = arith.select(
+                arith.cmpf(arith.CmpFPredicate.OEQ, gmax, c_neginf),
+                c_gmax_floor,
+                gmax,
+            )
 
             gsum = c_zero
             accs = [c_zero] * _CHUNKS
