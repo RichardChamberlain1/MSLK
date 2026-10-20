@@ -560,6 +560,66 @@ def test_explicit_max_seqlen_kv_bounds_each_request(causal, Sq):
     torch.testing.assert_close(got.float(), ref, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize(
+    "route,Sq,varlen",
+    [
+        ("generic", 4, False),
+        ("generic", 16, True),
+        ("head_packed", 4, False),
+        ("pa_decode_swa", 1, False),
+    ],
+)
+@pytest.mark.parametrize("num_kv_splits", [0, 1, 4])
+def test_int32_lengths_are_bounded_in_kernel(
+    monkeypatch, route, Sq, varlen, num_kv_splits
+):
+    """int32 lengths reach the kernels unnormalized: each clamps a negative
+    length to 0, a long one to max_seqlen_kv, and writes an empty request as 0."""
+    from mslk.attention.flydsl.decode import pa_decode_dense, pa_decode_swa
+
+    if route == "pa_decode_swa":
+        if num_kv_splits > 1:
+            pytest.skip("an explicit split count keeps the generic kernel")
+        monkeypatch.setattr(fai, "_PAGED_SWA_KERNEL", True)
+        calls = spy(monkeypatch, pa_decode_swa, "pa_decode_swa_launch")
+    elif route == "head_packed":
+        monkeypatch.setattr(fai, "_PAGED_GQA_PACK", False)
+        calls = spy(monkeypatch, pa_decode_dense, "pa_decode_paged_launch")
+    else:
+        monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
+        calls = spy(monkeypatch, fai, "_build_paged_light")
+    ctx, D = 512, 64
+    bound = ctx - PAGE
+    q, k, v, block_table, _ = _paged_inputs(4, Sq, ctx, D)
+    seqlen_k = torch.tensor([-1, 2**30, 0, 100], device="cuda", dtype=torch.int32)
+    bounded = torch.tensor([0, bound, 0, 100], device="cuda", dtype=torch.int32)
+    if varlen:
+        q_packed, cu_q = _varlen_q(q)
+        cu_kv = torch.nn.functional.pad(seqlen_k.clamp(min=0).cumsum(0), (1, 0))
+        cu_kv = cu_kv.to(torch.int32)
+        got = _run(
+            q_packed,
+            k,
+            v,
+            block_table,
+            seqlen_k,
+            num_kv_splits,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_kv,
+            max_seqlen_q=Sq,
+            max_seqlen_kv=bound,
+            cross_seqlen=True,
+        )
+        ref = _paged_varlen_reference(
+            q_packed, cu_q, k, v, block_table, bounded, causal=True
+        )
+    else:
+        got = _run(q, k, v, block_table, seqlen_k, num_kv_splits, max_seqlen_kv=bound)
+        ref = paged_reference(q, k, v, block_table, bounded, causal=True)
+    assert len(calls) == 1
+    torch.testing.assert_close(got.float(), ref, atol=2e-2, rtol=2e-2)
+
+
 def test_zero_length_has_empty_attention_result():
     q, k, v, block_table, seqlen_k = _paged_inputs(1, 4, 512, 64)
     seqlen_k.fill_(-1)

@@ -2680,6 +2680,13 @@ class GenericFlashAttnContext:
                 )
             else:
                 self.seqlen_kv_b = self.seq_len_kv_v
+        if const_expr(traits.PAGED and not traits.GAPPY_KV):
+            # Paged lengths arrive as the caller gave them: a negative length
+            # attends to nothing and none reaches past the launch bound.
+            n = fx.Int32(self.seqlen_kv_b)
+            bound = fx.Int32(self.seq_len_kv_v)
+            n = (n > fx.Int32(0)).select(n, fx.Int32(0))
+            self.seqlen_kv_b = fx.Index((n < bound).select(n, bound))
 
     def init_kv_batch_pointers(self):
         # Dense/varlen fold batch into raw K/V pointers; paged adds page_id per tile.
