@@ -45,11 +45,8 @@ import torch
 import torch.nn.functional as F  # noqa: F401  (imported for callers' convenience)
 
 # Re-export so callers only need to import from this module.
-from .flash_attn_utils import (
-    dualwave_splitk_workspace_elems,
-    FUSED_COMBINE_COUNTERS,
-    WAVE_SPLITK_MIN_D,
-)
+from .flash_attn_utils import dualwave_splitk_workspace_elems, WAVE_SPLITK_MIN_D
+from .split_arrival import ARRIVAL_COUNTERS, arrival_workspace
 
 __all__ = ["flydsl_flash_attn_func", "dualwave_splitk_workspace_elems"]
 
@@ -1007,30 +1004,11 @@ def _paged_fused_combine(
     The merge runs in the last workgroup to finish, so it is only used when there
     are many tiles and few splits per tile to merge.
     """
-    if not splitk or return_lse or workgroups_x > FUSED_COMBINE_COUNTERS:
+    if not splitk or return_lse or workgroups_x > ARRIVAL_COUNTERS:
         return False
     return (
         num_kv_splits <= 8 and workgroups_x >= 64 and (head_dim <= 64 or tile_rows <= 8)
     )
-
-
-# (device, stream) -> persistent fused split-K workspace; see _fused_workspace.
-_FUSED_WORKSPACES: dict = {}
-
-
-def _fused_workspace(elems: int, device: torch.device, stream) -> torch.Tensor:
-    """Workspace whose leading arrival counters are zero between calls.
-
-    The kernel resets each counter it uses; buffers are per stream so concurrent
-    streams never share counters.
-    """
-    key = (device, stream.cuda_stream)
-    need = FUSED_COMBINE_COUNTERS + elems
-    buf = _FUSED_WORKSPACES.get(key)
-    if buf is None or buf.numel() < need:
-        buf = torch.zeros(need, dtype=torch.float32, device=device)
-        _FUSED_WORKSPACES[key] = buf
-    return buf
 
 
 # Streaming tile of the head-packed decode kernel
@@ -1779,7 +1757,7 @@ def _flydsl_flash_attn_paged(
                     B, H, Sq, int(num_kv_splits), head_dim=D
                 )
                 if fused_combine:
-                    workspace = _fused_workspace(ws_elems, q.device, launch_stream)
+                    workspace = arrival_workspace(ws_elems, q.device, launch_stream)
                 else:
                     workspace = torch.empty(
                         ws_elems, dtype=torch.float32, device=q.device
