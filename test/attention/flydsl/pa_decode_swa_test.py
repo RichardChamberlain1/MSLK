@@ -169,3 +169,39 @@ def test_paged_decode_launches_on_the_given_stream(monkeypatch, route):
     torch.cuda.synchronize()
     assert still_busy, "the current stream finished first; the test proves nothing"
     torch.testing.assert_close(snapshot, ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("window_left", [2047, -1])
+def test_paged_decode_ignores_block_table_padding(window_left):
+    """Slots past a request's pages may hold anything (here -1); waves left
+    without keys must not read through them."""
+    if not _gfx950():
+        pytest.skip("pa_decode_swa is gfx950-only")
+    torch.manual_seed(0)
+    B, D, ctx = 4, 128, 4096
+    pages = ctx // PAGE
+    q = torch.randn(B, 1, H, D, device="cuda", dtype=torch.bfloat16) * 4
+    k = torch.randn(B * pages, PAGE, HKV, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    block_table = torch.arange(B * pages, device="cuda", dtype=torch.int32).view(
+        B, pages
+    )
+    # Page-aligned lengths put the empty waves on the first padding slot.
+    seqlen_k = torch.tensor([64, 128, 1024, 2048], device="cuda", dtype=torch.int32)
+    for b in range(B):
+        block_table[b, -(-int(seqlen_k[b]) // PAGE) :] = -1
+    out = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        max_seqlen_kv=ctx,
+        window_left=window_left,
+    )
+    ref = _reference(q, k, v, block_table, seqlen_k, window_left)
+    err = (out.float() - ref).abs().max().item()
+    assert err < 2e-2 * max(1.0, ref.abs().max().item()), err
