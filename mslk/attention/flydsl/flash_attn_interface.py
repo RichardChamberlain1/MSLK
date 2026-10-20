@@ -1239,38 +1239,6 @@ def _flydsl_flash_attn_paged(
             )
 
     varlen = cu_seqlens_q is not None
-    _swa_cfg = _paged_swa_kernel_config(
-        q,
-        k,
-        causal,
-        window_left,
-        return_lse,
-        varlen,
-        vectorized,
-        kv_seqstart,
-        seqlen_k,
-        block_table,
-        out,
-        num_kv_splits,
-    )
-    if _swa_cfg is not None:
-        from .decode.pa_decode_swa import pa_decode_swa_launch
-
-        if out is None:
-            out = torch.empty_like(q)
-        with torch.cuda.device(q.device.index):
-            return pa_decode_swa_launch(
-                q,
-                k,
-                v,
-                block_table,
-                seqlen_k,
-                window_left,
-                sm_scale if sm_scale is not None else q.shape[-1] ** -0.5,
-                out,
-                num_waves=_swa_cfg[0],
-                num_splits=_swa_cfg[1],
-            )
     # Dense paged callers hand us a per-request `seqlen_k` but the launch only
     # ever forwarded the batch maximum, so every request was masked to that
     # maximum and any shorter one read stale cache. Feed the kernel the real
@@ -1326,6 +1294,39 @@ def _flydsl_flash_attn_paged(
             raise ValueError(
                 "flydsl_flash_attn_func: stream must be on "
                 f"{q.device}, got {launch_stream.device}"
+            )
+
+    _swa_cfg = _paged_swa_kernel_config(
+        q,
+        k,
+        causal,
+        window_left,
+        return_lse,
+        varlen,
+        vectorized,
+        kv_seqstart,
+        seqlen_k,
+        block_table,
+        out,
+        num_kv_splits,
+    )
+    if _swa_cfg is not None:
+        from .decode.pa_decode_swa import pa_decode_swa_launch
+
+        if out is None:
+            out = torch.empty_like(q)
+        with torch.cuda.device(q.device.index), torch.cuda.stream(launch_stream):
+            return pa_decode_swa_launch(
+                q,
+                k,
+                v,
+                block_table,
+                seqlen_k,
+                window_left,
+                sm_scale if sm_scale is not None else q.shape[-1] ** -0.5,
+                out,
+                num_waves=_swa_cfg[0],
+                num_splits=_swa_cfg[1],
             )
 
     # ── GQA head packing ────────────────────────────────────────────────────
