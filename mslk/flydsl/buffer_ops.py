@@ -68,10 +68,10 @@ def _get_buffer_flags(arch=None):
       - bit 24 set to 1 (required on RDNA)
       - OOB_SELECT=2 (no bounds checking, matching LLVM boundsCheck=false)
     """
-    import os
-
     if arch is None:
-        arch = os.environ.get("FLYDSL_GPU_ARCH")
+        from flydsl.runtime.device import get_rocm_arch
+
+        arch = get_rocm_arch()
     flags = (7 << 12) | (4 << 15)
     if is_rdna_arch(arch):
         flags |= 1 << 24  # reserved bit, must be 1 on RDNA
