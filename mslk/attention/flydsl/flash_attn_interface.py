@@ -504,7 +504,14 @@ _UNIFORM_CU_SEQLENS: dict = {}
 
 
 def _uniform_cu_seqlens(count: int, step: int, device: str) -> torch.Tensor:
-    """Cached prefix sums for uniform sequence lengths; not cached under capture."""
+    """Prefix sums for uniform sequence lengths, cached by (count, step, device).
+
+    Decode replays the same shape indefinitely, so the cache saves an arange per
+    call. A new entry is built on the current stream and waited for once, so
+    any stream may read it afterwards. Nothing is stored during CUDA-graph
+    capture (the tensor would live in the graph's pool), and entries are never
+    evicted, since a captured graph may still point at one.
+    """
     key = (count, step, device)
     cached = _UNIFORM_CU_SEQLENS.get(key)
     if cached is not None:
@@ -1304,6 +1311,32 @@ def _flydsl_flash_attn_paged(
                 f"{q.device}, got {launch_stream.device}"
             )
 
+    block_table_stride = int(block_table.shape[1])
+    block_table_capacity = block_table_stride * int(
+        k.shape[3] if vectorized else k.shape[1]
+    )
+    if block_table_capacity > torch.iinfo(torch.int32).max:
+        raise ValueError(
+            "flydsl_flash_attn_func: block-table capacity exceeds the int32 "
+            f"kernel ABI limit; got {block_table_capacity}"
+        )
+    skv = block_table_capacity if max_seqlen_kv is None else int(max_seqlen_kv)
+    if not 0 <= skv <= block_table_capacity:
+        raise ValueError(
+            "flydsl_flash_attn_func: max_seqlen_kv must be between 0 and "
+            f"block-table capacity {block_table_capacity}; got {skv}"
+        )
+    # The kernels read int32 lengths and clamp each to [0, skv] themselves, so
+    # int32 metadata goes to them as is. Wider lengths are clamped here, before
+    # narrowing; gappy lengths also depend on their starts (see the launch).
+    if seqlen_k is not None and kv_seqstart is None and not _is_i32_vector(seqlen_k):
+        with torch.cuda.device(q.device.index), torch.cuda.stream(launch_stream):
+            seqlen_k, _ = _normalize_paged_lengths(
+                seqlen_k,
+                launch_kv_bound=skv,
+                block_table_capacity=block_table_capacity,
+            )
+
     _swa_cfg = _paged_swa_kernel_config(
         q,
         k,
@@ -1335,6 +1368,7 @@ def _flydsl_flash_attn_paged(
                 out,
                 num_waves=_swa_cfg[0],
                 num_splits=_swa_cfg[1],
+                max_seqlen_kv=skv,
             )
 
     # ── GQA head packing ────────────────────────────────────────────────────
@@ -1480,29 +1514,6 @@ def _flydsl_flash_attn_paged(
             "flydsl_flash_attn_func: num_kv_splits must be nonnegative, "
             f"got {requested_num_kv_splits}"
         )
-    block_table_stride = int(block_table.shape[1])
-    block_table_capacity = block_table_stride * page_size
-    if block_table_capacity > torch.iinfo(torch.int32).max:
-        raise ValueError(
-            "flydsl_flash_attn_func: block-table capacity exceeds the int32 "
-            f"kernel ABI limit; got {block_table_capacity}"
-        )
-    skv = block_table_capacity if max_seqlen_kv is None else int(max_seqlen_kv)
-    if not 0 <= skv <= block_table_capacity:
-        raise ValueError(
-            "flydsl_flash_attn_func: max_seqlen_kv must be between 0 and "
-            f"block-table capacity {block_table_capacity}; got {skv}"
-        )
-    with torch.cuda.device(q.device.index):
-        with torch.cuda.stream(launch_stream):
-            block_table_2d_i32 = block_table.to(torch.int32).contiguous()
-            bounded_seqlen_k = seqlen_k
-            if seqlen_k is not None:
-                bounded_seqlen_k, _ = _normalize_paged_lengths(
-                    seqlen_k,
-                    launch_kv_bound=skv,
-                    block_table_capacity=block_table_capacity,
-                )
     _arch = _gpu_arch(q.device)
     _splitk_dtype_ok = D in (64, 128) and dtype_str in ("bf16", "f16")
     _paged_light_ok = (
@@ -1598,8 +1609,8 @@ def _flydsl_flash_attn_paged(
                     q.view(B, Sq, 1, H, D),
                     k,
                     v,
-                    block_table_2d_i32,
-                    bounded_seqlen_k,
+                    block_table,
+                    seqlen_k,
                     float(sm_scale) if sm_scale is not None else float(D**-0.5),
                     page_size=page_size,
                     max_seqlen_kv=skv,
@@ -1645,9 +1656,13 @@ def _flydsl_flash_attn_paged(
     with torch.cuda.device(q.device.index):
         with torch.cuda.stream(launch_stream):
             # Flatten so the kernel's row-major index addresses the table correctly.
-            block_table_i32 = block_table_2d_i32.reshape(-1)
-            _host_bounds = True
-            if _host_bounds and seqlen_k is not None and bounded_seqlen_k is seqlen_k:
+            block_table_i32 = block_table.to(torch.int32).contiguous().reshape(-1)
+            # The light kernel clamps int32 lengths to [0, skv] itself and writes
+            # an empty request as 0 (LSE -inf). Dualwave and gappy lengths are
+            # bounded here and their empty requests masked after the launch.
+            _host_bounds = not _paged_light_ok or kv_seqstart is not None
+            bounded_seqlen_k = seqlen_k
+            if seqlen_k is not None and (_host_bounds or not _is_i32_vector(seqlen_k)):
                 bounded_seqlen_k, _ = _normalize_paged_lengths(
                     seqlen_k,
                     launch_kv_bound=skv,
@@ -1655,7 +1670,9 @@ def _flydsl_flash_attn_paged(
                 )
             bounded_cu_seqlens_kv = cu_seqlens_kv
             bounded_kv_seqstart = None
-            if cu_seqlens_kv is not None:
+            if cu_seqlens_kv is not None and (
+                _host_bounds or not _is_i32_vector(cu_seqlens_kv)
+            ):
                 bounded_cu_seqlens_kv, bounded_kv_seqstart = (
                     _normalize_paged_cumulative_lengths(
                         cu_seqlens_kv,
@@ -1770,6 +1787,7 @@ def _flydsl_flash_attn_paged(
             if kv_seqstart is not None:
                 kwargs["kv_seqstart"] = bounded_kv_seqstart
             if cross or _paged_light_ok:
+                # The light kernel also bounds every request's length by it.
                 kwargs["seq_len_kv"] = skv
             lse = (
                 torch.empty((B, H, Sq), dtype=torch.float32, device=q.device)

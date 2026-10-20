@@ -2681,7 +2681,8 @@ class GenericFlashAttnContext:
             else:
                 self.seqlen_kv_b = self.seq_len_kv_v
         if const_expr(traits.PAGED and not traits.GAPPY_KV):
-            # Clamp the caller's paged length to [0, seq_len_kv].
+            # Paged lengths arrive as the caller gave them: a negative length
+            # attends to nothing and none reaches past the launch bound.
             n = fx.Int32(self.seqlen_kv_b)
             bound = fx.Int32(self.seq_len_kv_v)
             n = (n > fx.Int32(0)).select(n, fx.Int32(0))

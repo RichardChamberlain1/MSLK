@@ -21,7 +21,7 @@ pos = seqlen_kv - seqlen_q + i, matching the generic paged kernel.
 from __future__ import annotations
 
 import functools
-from typing import Any
+from typing import Any, Optional
 
 import flydsl.compiler as flyc  # pyre-ignore[21]
 import flydsl.expr as fx  # pyre-ignore[21]
@@ -198,6 +198,7 @@ def compile_pa_decode_swa(
         stride_km: fx.Int32,  # token stride within a page
         stride_kh: fx.Int32,
         stride_btb: fx.Int32,
+        kv_bound: fx.Int32,
         window_left: fx.Int32,
         softmax_scale: fx.Float32,
         ws_ptr: fx.Tensor,
@@ -230,7 +231,9 @@ def compile_pa_decode_swa(
         bt_rsrc = buffer_ops.create_buffer_resource(bt_ptr, max_size=False)
 
         seq_len = buffer_ops.buffer_load(seq_rsrc, b_idx, vec_width=1, dtype=T.i32)
+        # A negative length attends to nothing; none reaches past kv_bound.
         t_full = fx.Int32(arith.select(seq_len > fx.Int32(0), seq_len, fx.Int32(0)))
+        t_full = fx.Int32(arith.select(t_full < kv_bound, t_full, kv_bound))
         # Keys any row of this CTA can see: from the first row's window start
         # (aligned down to a tile) to the end of the sequence.
         lo = t_full - fx.Int32(_SQ - 1) - window_left
@@ -930,6 +933,7 @@ def _make_swa_launcher(
         stride_km,
         stride_kh,
         stride_btb,
+        kv_bound,
         window_left,
         scale,
         ws_ptr,
@@ -951,6 +955,7 @@ def _make_swa_launcher(
             stride_km,
             stride_kh,
             stride_btb,
+            kv_bound,
             window_left,
             scale,
             ws_ptr,
@@ -1016,11 +1021,14 @@ def pa_decode_swa_launch(
     out: torch.Tensor,
     num_waves: int = 8,
     num_splits: int = 1,
+    max_seqlen_kv: Optional[int] = None,
 ) -> torch.Tensor:
     """Sliding-window (or, with window_left < 0, full) paged decode. q/out are
     [B, Sq, H_q, D]; k/v are [num_pages, page_size, H_kv, D]; block_table is
-    [B, pages] int32. Splits are merged by the last CTA to finish, or by a
-    reduce kernel past _MAX_INKERNEL_SPLITS."""
+    [B, pages] int32 and seqlen_k [B] int32, each length clamped to [0,
+    max_seqlen_kv] (default: the block table's capacity). Splits are merged
+    by the last CTA to finish, or by a reduce kernel past
+    _MAX_INKERNEL_SPLITS."""
     from mslk.flydsl.jit import run_compiled
 
     B, Sq, H_q, D = q.shape
@@ -1068,6 +1076,9 @@ def pa_decode_swa_launch(
         ks[1],
         ks[2],
         block_table.stride(0),
+        int(max_seqlen_kv)
+        if max_seqlen_kv is not None
+        else block_table.shape[1] * page_size,
         int(window_left) if window_left >= 0 else 1 << 30,
         float(softmax_scale),
         ws,
