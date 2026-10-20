@@ -21,7 +21,7 @@ pos = seqlen_kv - seqlen_q + i, matching the generic paged kernel.
 from __future__ import annotations
 
 import functools
-from typing import Any, Optional
+from typing import Any
 
 import flydsl.compiler as flyc  # pyre-ignore[21]
 import flydsl.expr as fx  # pyre-ignore[21]
@@ -62,6 +62,8 @@ TILE_N = 32  # tokens per tile (= PV MFMA K-dim)
 N_SUBTILE = TILE_N // MFMA_N
 LOG2E: float = 1.4426950408889634
 _FX_DTYPE = {"f16": fx.Float16, "bf16": fx.BFloat16}
+# Splits the last CTA merges in-kernel; more go to the reduce kernel.
+_MAX_INKERNEL_SPLITS = 8
 # Running max before any partial: finite, so (max - max) is never NaN.
 _EMPTY_MAX = -3.0e38
 
@@ -969,7 +971,6 @@ def pa_decode_swa_supported(
     kv_capacity: int = 0,
     num_waves: int = 1,
     num_splits: int = 1,
-    merge_kernel: Optional[bool] = None,
 ) -> bool:
     """Shapes pa_decode_swa_launch handles. Full attention (window_left < 0)
     needs kv_capacity, the most keys a request can hold."""
@@ -981,10 +982,10 @@ def pa_decode_swa_supported(
     # Pages one CTA's keys can touch (its share only with the reduce kernel):
     # one page id per lane.
     tiles = -(-(keys + TILE_N) // TILE_N)
-    if merge_kernel is None:
-        merge_kernel = num_splits > 8
     cta_tiles = (
-        -(-tiles // (num_splits * num_waves)) * num_waves if merge_kernel else tiles
+        -(-tiles // (num_splits * num_waves)) * num_waves
+        if num_splits > _MAX_INKERNEL_SPLITS
+        else tiles
     )
     pages = -(-cta_tiles * TILE_N // page_size) + 1
     return (
@@ -1009,12 +1010,11 @@ def pa_decode_swa_launch(
     out: torch.Tensor,
     num_waves: int = 8,
     num_splits: int = 1,
-    merge_kernel: Optional[bool] = None,
 ) -> torch.Tensor:
     """Sliding-window (or, with window_left < 0, full) paged decode. q/out are
     [B, Sq, H_q, D]; k/v are [num_pages, page_size, H_kv, D]; block_table is
     [B, pages] int32. Splits are merged by the last CTA to finish, or by a
-    reduce kernel (merge_kernel, default for more than 8 splits)."""
+    reduce kernel past _MAX_INKERNEL_SPLITS."""
     from mslk.flydsl.jit import run_compiled
 
     B, Sq, H_q, D = q.shape
@@ -1022,8 +1022,7 @@ def pa_decode_swa_launch(
     assert k.numel() < 2**31 and v.numel() < 2**31, "32-bit KV offsets"
     assert out.stride() == q.stride()
     kv_str = {torch.float16: "f16", torch.bfloat16: "bf16"}[k.dtype]
-    if merge_kernel is None:
-        merge_kernel = num_splits > 8
+    merge_kernel = num_splits > _MAX_INKERNEL_SPLITS
     launcher = _make_swa_launcher(
         D,
         kv_str,
