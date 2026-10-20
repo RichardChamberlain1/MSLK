@@ -412,19 +412,7 @@ def build_flash_attn_func_module_primary(
             and not traits.ENABLE_PREFETCH_3BUF
             and traits.N_SUBTILES == 1
         )
-        # Next K tile is loaded into registers during the softmax, then lands in
-        # the single LDS K buffer. No second K buffer. Not the DMA double-buffer
-        # path: that copy is issued while the current tile is still live.
-        _pipe_paged_k = (
-            traits.PAGED_K_PREFETCH
-            and not traits.GAPPY_KV
-            and not traits.KV_NEEDS_GUARD
-            and not traits.KV_VECTORIZED
-            and not traits.ENABLE_DMA
-            and not traits.ENABLE_PREFETCH_3BUF
-            and traits.N_SUBTILES == 1
-            and not _pipe_k
-        )
+        _pipe_paged_k = traits.PAGED_K_PREFETCH
         # 16-byte global loads per K tile (VEC_WIDTH bf16 / 8): the V wait's count.
         _k_prefetch_inflight = traits.NUM_BATCHES_KV * (traits.VEC_WIDTH // 8)
         init_args = [ctx.c_neg_inf, ctx.c_zero_f]
