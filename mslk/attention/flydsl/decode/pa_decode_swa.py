@@ -98,27 +98,6 @@ def _row_coords(row, hq_base, ratio, t_pack):  # pyre-ignore[2,3]
     return qtok, hq_base + m % fx.Int32(ratio)
 
 
-def _merge_parts(m_run, den, acc, parts):  # pyre-ignore[2,3]
-    """Fold (max, sum, [vec4 numerator]) partials into a running log-sum-exp
-    state. A partial with max -inf is empty and weighs 0."""
-    m_new = m_run
-    for pm, _, _ in parts:
-        m_new = _mxf(m_new, pm)
-    a = _ex2(arith.subf(arith.unwrap(m_run), arith.unwrap(m_new)))
-    den = _f(arith.mulf(arith.unwrap(den), arith.unwrap(a)))
-    acc = _scale(acc, a)
-    c_zero = arith.constant(0.0, type=T.f32)
-    c_neginf = arith.constant(float("-inf"), type=T.f32)
-    for pm, pl, pn in parts:
-        w = _ex2(arith.subf(arith.unwrap(pm), arith.unwrap(m_new)))
-        w = _f(arith.select(arith.unwrap(pm) > c_neginf, arith.unwrap(w), c_zero))
-        den = _f(
-            arith.addf(arith.unwrap(den), arith.mulf(arith.unwrap(w), arith.unwrap(pl)))
-        )
-        acc = [arith.addf(x, y) for x, y in zip(acc, _scale(pn, w))]
-    return m_new, den, acc
-
-
 def _store_normalized(acc, den, fx_dtype, rsrc, offset):  # pyre-ignore[2]
     """Store acc / den (0 where den is 0) as one vector of fx_dtype."""
     c_zero = arith.constant(0.0, type=T.f32)
@@ -241,7 +220,6 @@ def compile_pa_decode_swa(
 
         c_zero = arith.constant(0.0, type=T.f32)
         c_neginf = arith.constant(float("-inf"), type=T.f32)
-        c_empty = arith.constant(_EMPTY_MAX, type=T.f32)
         zero_v4 = arith.constant_vector(0.0, T.vec(4, T.f32))
 
         q_rsrc = buffer_ops.create_buffer_resource(q_ptr, max_size=True)
@@ -601,7 +579,36 @@ def compile_pa_decode_swa(
             return row, d0, qtok, head_abs, ok
 
         def _lse_merge(parts):
-            return _merge_parts(_f(c_empty), _f(c_zero), [zero_v4] * (_V // 4), parts)
+            """(max, sum, [numerator vec4] ) parts -> merged; max -inf is empty."""
+            mx = parts[0][0]
+            for pm, _, _ in parts[1:]:
+                mx = _mxf(mx, pm)
+            den = _f(c_zero)
+            num = [zero_v4 for _ in parts[0][2]]
+            for pm, pl, pn in parts:
+                sc = _exp2_fast(
+                    _f(
+                        arith.mulf(
+                            arith.subf(arith.unwrap(pm), arith.unwrap(mx)),
+                            arith.constant(LOG2E, type=T.f32),
+                        )
+                    )
+                )
+                sc = _f(
+                    arith.select(arith.unwrap(pm) > c_neginf, arith.unwrap(sc), c_zero)
+                )
+                den = _f(
+                    arith.addf(
+                        arith.unwrap(den),
+                        arith.mulf(arith.unwrap(sc), arith.unwrap(pl)),
+                    )
+                )
+                sc4 = vector.broadcast(T.vec(4, T.f32), arith.unwrap(sc))
+                num = [
+                    arith.addf(n, arith.mulf(sc4, arith.unwrap(p)))
+                    for n, p in zip(num, pn)
+                ]
+            return mx, den, num
 
         def _lds_f(idx):
             return _f(fx.Vector.load(T.vec(1, T.f32), lds_f32, [fx.Index(idx)])[0])
@@ -761,19 +768,21 @@ def compile_pa_decode_swa_reduce(
         d0 = (lane % fx.Int32(_LANES)) * fx.Int32(_V)
         grp = lane // fx.Int32(_LANES)
         c_zero = arith.constant(0.0, type=T.f32)
-        c_neginf = arith.constant(float("-inf"), type=T.f32)
+        c_empty = arith.constant(_EMPTY_MAX, type=T.f32)
         v4f = T.vec(4, T.f32)
         out_rsrc = buffer_ops.create_buffer_resource(out_ptr, max_size=True)
         ws_rsrc = buffer_ops.create_buffer_resource(ws_ptr, max_size=True)
         part0 = fx.Int32(ARRIVAL_COUNTERS) + head_flat * fx.Int32(_S * _PART)
 
         if qtok < fx.Int32(_SQ):
-            m_run = fx.Float32(_EMPTY_MAX)
+            # Empty partials (max -inf) and a group's missing splits weigh 0;
+            # the finite stand-in keeps (max - max) from becoming NaN.
+            m_run = _f(c_empty)
             den = _f(c_zero)
             acc = [arith.constant_vector(0.0, v4f) for _ in range(_V // 4)]
             for b0 in range_constexpr(0, _PER, _BATCH):
                 ks = list(range(b0, min(_PER, b0 + _BATCH)))
-                parts = []
+                loaded = []
                 for k in ks:
                     sp = grp + fx.Int32(k * _G)
                     live = sp < fx.Int32(_S)
@@ -796,10 +805,28 @@ def compile_pa_decode_swa_reduce(
                         )
                         for j in range(_V // 4)
                     ]
-                    # A group's missing splits are empty.
-                    pm = _f(arith.select(live, arith.unwrap(pm), c_neginf))
-                    parts.append((pm, pl, pn))
-                m_run, den, acc = _merge_parts(m_run, den, acc, parts)
+                    ok = live & (
+                        arith.unwrap(pm) > arith.constant(float("-inf"), type=T.f32)
+                    )
+                    pm = _f(arith.select(arith.unwrap(ok), arith.unwrap(pm), c_empty))
+                    loaded.append((ok, pm, pl, pn))
+                m_new = m_run
+                for _, pm, _, _ in loaded:
+                    m_new = _mxf(m_new, pm)
+                a = _ex2(arith.subf(arith.unwrap(m_run), arith.unwrap(m_new)))
+                den = _f(arith.mulf(arith.unwrap(den), arith.unwrap(a)))
+                acc = _scale(acc, a)
+                for ok, pm, pl, pn in loaded:
+                    w = _ex2(arith.subf(arith.unwrap(pm), arith.unwrap(m_new)))
+                    w = _f(arith.select(arith.unwrap(ok), arith.unwrap(w), c_zero))
+                    den = _f(
+                        arith.addf(
+                            arith.unwrap(den),
+                            arith.mulf(arith.unwrap(w), arith.unwrap(pl)),
+                        )
+                    )
+                    acc = [arith.addf(x, y) for x, y in zip(acc, _scale(pn, w))]
+                m_run = m_new
             # Merge the split groups: lanes _LANES apart hold the same values.
             c_ws = arith.constant(WARP_SIZE, type=T.i32)
             for sh in _SHIFTS:
@@ -808,6 +835,16 @@ def compile_pa_decode_swa_reduce(
                 def _peer(x):
                     return _f(_f(x).shuffle_xor(c_sh, c_ws))
 
+                m_p = _peer(m_run)
+                m_new = _mxf(m_run, m_p)
+                a = _ex2(arith.subf(arith.unwrap(m_run), arith.unwrap(m_new)))
+                a_p = _ex2(arith.subf(arith.unwrap(m_p), arith.unwrap(m_new)))
+                den = _f(
+                    arith.addf(
+                        arith.mulf(arith.unwrap(den), arith.unwrap(a)),
+                        arith.mulf(arith.unwrap(_peer(den)), arith.unwrap(a_p)),
+                    )
+                )
                 acc_p = [
                     fx.Vector.from_elements(
                         [
@@ -824,9 +861,10 @@ def compile_pa_decode_swa_reduce(
                     ).ir_value()
                     for v in acc
                 ]
-                m_run, den, acc = _merge_parts(
-                    m_run, den, acc, [(_peer(m_run), _peer(den), acc_p)]
-                )
+                acc = [
+                    arith.addf(x, y) for x, y in zip(_scale(acc, a), _scale(acc_p, a_p))
+                ]
+                m_run = m_new
             if grp == fx.Int32(0):
                 _store_normalized(
                     acc,
