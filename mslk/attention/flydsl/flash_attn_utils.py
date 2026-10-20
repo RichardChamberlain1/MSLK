@@ -7171,6 +7171,64 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         _ws_store_f32(lse_val, store_idx, lse_rsrc)
 
 
+def run_splitk_combine(
+    traits,
+    O,  # noqa: E741
+    workspace,
+    LSE,
+    batch_size,
+    seq_len,
+    stride_q_n,
+    rows_per_block,
+    lanes_per_row,
+    packed_rows=0,
+):
+    """Body of a split-K combine kernel: merge each row's split partials into O
+    (and the LSE when the build returns it).
+
+    ``packed_rows`` > 0 fixes the per-head row count at build time (packed GQA
+    rows are q_len * group), turning the row decode into constant divisions.
+    """
+    ctx = DualwaveSplitKCombineContext(
+        traits, O, workspace, batch_size, seq_len, stride_q_n, LSE=LSE
+    )
+    ctx.init_types_and_constants()
+    ctx.init_runtime_indices()
+    if const_expr(packed_rows > 0):
+        ctx.seq_len_v = fx.Index(packed_rows)
+    ctx.init_thread_mapping(rows_per_block, lanes_per_row)
+    # A ceil-div grid spawns rows past the last (batch, head, seq) row. Clamp
+    # them into range so the workspace/O descriptors stay in bounds, then drop
+    # their stores (the real owner of the clamped row writes it).
+    total_rows = fx.Index(batch_size) * fx.Index(traits.NUM_HEADS_Q) * ctx.seq_len_v
+    ctx.row_in_bounds = ctx.row < total_rows
+    ctx.row = ctx.row_in_bounds.select(ctx.row, fx.Index(0))
+    heads_per_batch = ctx.seq_len_v * traits.NUM_HEADS_Q
+    ctx.batch_idx = ctx.row // heads_per_batch
+    rem = ctx.row % heads_per_batch
+    ctx.q_head_idx = rem // ctx.seq_len_v
+    ctx.seq_idx = rem % ctx.seq_len_v
+    ctx.init_workspace()
+    ctx.init_descriptors()
+
+    combine = DualwaveSplitKCombineHelper(ctx)
+    # Each split group reduces its own share against its own max, then the
+    # groups are merged across the wave.
+    m_max = combine.reduce_m_max()
+    m_max = combine.merge_m_max(m_max)
+    acc, den = combine.accumulate_splits(m_max)
+    den, acc = combine.merge_split_groups(den, acc)
+    o_pack = combine.pack_output(acc, den)
+
+    # Every split group holds the merged result; one of them stores it.
+    def _store():
+        combine.store_output(o_pack)
+        if const_expr(traits.RETURN_LSE):
+            combine.store_lse(m_max, den)
+
+    scf_if_dispatch(ctx.row_in_bounds & (ctx.sgrp == fx.Index(0)), _store)
+
+
 def _splitk_store_cpol(traits):
     """Cache policy for split-K partial stores (agent-coherent when fused)."""
     return CPOL_SC1 if traits.FUSED_COMBINE else 0
