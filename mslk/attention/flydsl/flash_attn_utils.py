@@ -1627,7 +1627,6 @@ def _make_flash_attn_generic_traits(
             and not gappy_kv
         )
         enable_dma = paged_dma_ok and (enable_dma or paged_kv_dma)
-    paged_k_prefetch = paged and paged_k_prefetch and not enable_dma
     enable_gfx942_kv_gpfetch = (
         gpu_arch.startswith("gfx942")
         and not enable_prefetch_3buf
@@ -1662,6 +1661,8 @@ def _make_flash_attn_generic_traits(
         and not enable_gfx942_kv_gpfetch
         and not enable_dma
     )
+    # Bias and dropout gather both column halves; paged inputs reject them.
+    assert not (enable_wave_splitk and (has_bias or has_dropout))
     enable_gfx942_vec_k = (
         gpu_arch.startswith("gfx942")
         and enable_dma
@@ -1744,6 +1745,19 @@ def _make_flash_attn_generic_traits(
         assert block_n % rows_per_batch_load == 0
         num_batches_kv = block_n // rows_per_batch_load
         kv_needs_guard = False
+    # The next K tile is loaded into registers during the softmax and lands in
+    # the single LDS K buffer, so only the plain single-buffer K path takes it.
+    paged_k_prefetch = (
+        paged
+        and paged_k_prefetch
+        and not gappy_kv
+        and not kv_needs_guard
+        and not kv_vectorized
+        and not enable_dma
+        and not enable_prefetch_3buf
+        and not enable_gfx942_kv_gpfetch
+        and n_subtiles == 1
+    )
 
     v_perm_tr_env = os.getenv("FLYDSL_FLASH_ATTN_FUNC_V_PERM_TR", "1") == "1"
     v_perm_tr = (
@@ -2981,6 +2995,13 @@ class GenericPageIdLoader:
             return fx.Index(fx.Int32(self._pid_from_regs(tile_start)))
         return self.consume_page_id(self.issue_page_id(tile_start))
 
+    def clamped_page_id(self, tile_start):
+        """page_id, kept within the block-table row for tiles past the end."""
+        if const_expr(self.ctx.traits.PAGED_PID_REGS):
+            # The preload is clamped already.
+            return self.page_id(tile_start)
+        return self._bt_load(tile_start // fx.Index(self.ctx.traits.PAGE_SIZE))
+
     def _bt_load(self, tile_idx):
         # Load block_table[batch, tile_idx], clamped to the row width so prefetch /
         # tail tiles that index past a sequence's pages stay in a valid page (those
@@ -3493,7 +3514,7 @@ class GenericKvGmemToLdsLoader:
         if const_expr(paged_base is not None):
             # One tile is one page. Clamped: an empty split's prologue reads past
             # the last page.
-            pid = self.page_ids._bt_load(tile_start // fx.Index(traits.PAGE_SIZE))
+            pid = self.page_ids.clamped_page_id(tile_start)
             rsrc = buffer_ops.create_buffer_resource_from_addr(
                 as_mlir_value(paged_base + fx.Int64(pid) * self._dma_page_bytes),
                 num_records_bytes=as_mlir_value(self._dma_page_bytes),
@@ -3903,8 +3924,7 @@ class GenericSoftmaxHelper:
         # QK*scale + bias; -inf propagates.
         ctx = self.ctx
         traits = ctx.traits
-        half_only = const_expr(traits.ENABLE_WAVE_SPLITK)
-        col_base_i32, moff = self._kv_mask_lane_off(self._half_kv_start(kv_start))
+        col_base_i32, moff = self._kv_mask_lane_off(fx.Int32(kv_start))
         # The bounded plane resource (init_bias) zero-fills OOB rows (q_row>=Sq) in
         # hardware, so no index clamp is needed; a within-row kv overrun reads a
         # neighboring in-bounds value that is masked to -inf afterward.
@@ -3917,12 +3937,9 @@ class GenericSoftmaxHelper:
             off_lo = (row_base_i32 + kv_col) * eb
             b_lo = _bf16_buffer_load_f32(ctx, ctx.bias_rsrc, off_lo)
             s_raw_lo[r] = _fadd(s_raw_lo[r], _fmul(b_lo, inv, ctx.fm_fast), ctx.fm_fast)
-            if const_expr(not half_only):
-                off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
-                b_hi = _bf16_buffer_load_f32(ctx, ctx.bias_rsrc, off_hi)
-                s_raw_hi[r] = _fadd(
-                    s_raw_hi[r], _fmul(b_hi, inv, ctx.fm_fast), ctx.fm_fast
-                )
+            off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
+            b_hi = _bf16_buffer_load_f32(ctx, ctx.bias_rsrc, off_hi)
+            s_raw_hi[r] = _fadd(s_raw_hi[r], _fmul(b_hi, inv, ctx.fm_fast), ctx.fm_fast)
         return s_raw_lo, s_raw_hi
 
     def apply_dropout(self, p_vals_lo, p_vals_hi, kv_start):
@@ -3931,8 +3948,7 @@ class GenericSoftmaxHelper:
         # after online_softmax. The 1/(1-p) scale is applied to the output.
         ctx = self.ctx
         traits = ctx.traits
-        half_only = const_expr(traits.ENABLE_WAVE_SPLITK)
-        col_base_i32, moff = self._kv_mask_lane_off(self._half_kv_start(kv_start))
+        col_base_i32, moff = self._kv_mask_lane_off(fx.Int32(kv_start))
         # Bounded plane resource (init_dropout) zero-fills OOB rows in hardware; these
         # lanes are already zero post-softmax, so no index clamp is needed.
         row_base_i32 = ctx.q_row_i32 * ctx.drop_stride_q
@@ -3945,10 +3961,9 @@ class GenericSoftmaxHelper:
             # caller (constant factor, so it factors out of the per-(q,k) sum).
             m_lo = _u8_buffer_load_f32(ctx, ctx.drop_rsrc, off_lo)
             p_vals_lo[r] = _fmul(p_vals_lo[r], m_lo, ctx.fm_fast)
-            if const_expr(not half_only):
-                off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
-                m_hi = _u8_buffer_load_f32(ctx, ctx.drop_rsrc, off_hi)
-                p_vals_hi[r] = _fmul(p_vals_hi[r], m_hi, ctx.fm_fast)
+            off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
+            m_hi = _u8_buffer_load_f32(ctx, ctx.drop_rsrc, off_hi)
+            p_vals_hi[r] = _fmul(p_vals_hi[r], m_hi, ctx.fm_fast)
         return p_vals_lo, p_vals_hi
 
     def apply_kv_mask(self, s_raw_lo, s_raw_hi, kv_start):
