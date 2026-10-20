@@ -897,21 +897,37 @@ ASYNC_LDS = os.getenv("FLYDSL_FLASH_ATTN_ASYNC_LDS", "0") == "1"
 COMBINE_PREFETCH = int(os.getenv("FLYDSL_COMBINE_PREFETCH", "8"))
 
 
+def _async_lds():
+    """ASYNC_LDS, on the architecture that has the async copy (CDNA4)."""
+    from flydsl.runtime.device import get_rocm_arch
+
+    return ASYNC_LDS and get_rocm_arch().startswith("gfx950")
+
+
 def _buffer_load_to_lds(rsrc, lds_ptr, size, voffset, soffset, offset, aux):
     """Issue one global->LDS copy, async when enabled (see ASYNC_LDS)."""
-    if ASYNC_LDS:
-        return rocdl.raw_ptr_buffer_load_async_lds(
-            rsrc, lds_ptr, size, voffset, soffset, offset, aux=aux
+    if _async_lds():
+        op = rocdl.raw_ptr_buffer_load_async_lds(
+            as_mlir_value(rsrc),
+            as_mlir_value(lds_ptr),
+            as_mlir_value(fx.Int32(size)),
+            as_mlir_value(fx.Int32(voffset)),
+            as_mlir_value(fx.Int32(soffset)),
+            as_mlir_value(fx.Int32(offset)),
+            aux=ir.IntegerAttr.get(T.i32, int(aux)),
         )
+        # Async copies complete in marks, one per copy.
+        rocdl.asyncmark()
+        return op
     return rocdl.raw_ptr_buffer_load_lds(
         rsrc, lds_ptr, size, voffset, soffset, offset, aux
     )
 
 
 def wait_lds_copies(count=0):
-    """Wait for outstanding global->LDS copies on the right counter."""
-    if ASYNC_LDS:
-        rocdl.s_wait_asynccnt(count)
+    """Wait until at most ``count`` global->LDS copies are outstanding."""
+    if _async_lds():
+        rocdl.wait_asyncmark(count)
     else:
         rocdl.s_waitcnt(count)
 
