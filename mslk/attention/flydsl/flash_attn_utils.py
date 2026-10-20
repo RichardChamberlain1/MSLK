@@ -1580,6 +1580,8 @@ def _make_flash_attn_generic_traits(
     enable_prefetch_3buf = (
         os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_PREFETCH3", "0") == "1"
     )
+    if fused_combine and return_lse:
+        raise ValueError("the fused split-K combine does not produce LSE")
     has_lds_load_b128 = not gpu_arch.startswith("gfx942")
     enable_gfx942_dma = gpu_arch.startswith("gfx942") and (
         os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_GFX942_DMA", "0") == "1"
@@ -7255,11 +7257,15 @@ class GenericFusedSplitKCombine:
         if const_expr(traits.Q_PACK_QLEN > 0 and _q_pack_group(traits) > 0):
             rows = min(rows, traits.Q_PACK_QLEN * _q_pack_group(traits))
         for p in range_constexpr((rows + rows_per_pass - 1) // rows_per_pass):
-            row = ctx.q_start + fx.Index(p * rows_per_pass) + slot
+            local = fx.Index(p * rows_per_pass) + slot
+            row = ctx.q_start + local
+            # Only this tile's rows: a thread past the last full row group, or a
+            # row past the tile, would merge a neighbouring tile's partials.
+            in_tile = (slot < fx.Index(rows_per_pass)) & (local < fx.Index(rows))
 
             @flyc.jit
             def _merge_row_if_valid():
-                if row < seq_len_v:
+                if (row < seq_len_v) & in_tile:
                     self._merge_row(row, col, rsrcs)
 
             _merge_row_if_valid()
