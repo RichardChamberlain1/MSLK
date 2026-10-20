@@ -47,6 +47,19 @@ from ..split_arrival import (
     CPOL_SC1,
     reset_counter,
 )
+from .head_packed_common import (
+    finalize_smem,
+    FX_DTYPE as _FX_DTYPE,
+    load_q_frags,
+    LOG2E,
+    mfma_16x16x32,
+    MFMA_K_QK,
+    MFMA_M,
+    MFMA_N,
+    N_SUBTILE,
+    read_v_frag_tr,
+    TILE_N,
+)
 from .utils import (
     exp2_f32 as _exp2_fast,
     maxnumf as _mxf,
@@ -55,13 +68,6 @@ from .utils import (
     WARP_SIZE,
 )
 
-MFMA_M = 16  # (query token, head) pairs packed on the QK MFMA M-axis
-MFMA_N = 16  # tokens per QK sub-tile
-MFMA_K_QK = 32  # head-dim elements per QK MFMA
-TILE_N = 32  # tokens per tile (= PV MFMA K-dim)
-N_SUBTILE = TILE_N // MFMA_N
-LOG2E: float = 1.4426950408889634
-_FX_DTYPE = {"f16": fx.Float16, "bf16": fx.BFloat16}
 # Splits the last CTA merges in-kernel; more go to the reduce kernel.
 _MAX_INKERNEL_SPLITS = 8
 # Running max before any partial: finite, so (max - max) is never NaN.
@@ -168,11 +174,7 @@ def compile_pa_decode_swa(
     _FX_KV = _FX_DTYPE[kv_dtype_str]
     _QK_GRP = _HEAD // MFMA_K_QK
     _DN = _HEAD // MFMA_N
-    _mfma = (
-        rocdl.mfma_f32_16x16x32_bf16
-        if kv_dtype_str == "bf16"
-        else rocdl.mfma_f32_16x16x32_f16
-    )
+    _mfma = mfma_16x16x32(kv_dtype_str)
 
     # Per-wave LDS region: the loop's K and V tiles, later reused by that wave
     # for its merge partials (acc rows, then max and sum).
@@ -284,26 +286,10 @@ def compile_pa_decode_swa(
 
         # Q fragments, loop-invariant. M slot m = qtok * ratio + head.
         q_head = tok_lane % fx.Int32(_RATIO)
-        q_tok_local = tok_lane // fx.Int32(_RATIO)
         q_base_bh = b_idx * stride_qb + (hq_base + q_head) * stride_qh
-        q_frags = []
-        for t in range_constexpr(_M_TILES):
-            q_tok = q_tok_local + fx.Int32(t * _T_PACK)
-            q_tok = fx.Int32(
-                arith.select(q_tok < fx.Int32(_SQ), q_tok, fx.Int32(_SQ - 1))
-            )
-            frags = []
-            for g in range_constexpr(_QK_GRP):
-                q_off = (
-                    q_base_bh
-                    + q_tok * stride_qs
-                    + fx.Int32(g * MFMA_K_QK)
-                    + grp * fx.Int32(8)
-                )
-                frags.append(
-                    buffer_ops.buffer_load(q_rsrc, q_off, vec_width=8, dtype=_FX_KV)
-                )
-            q_frags.append(frags)
+        q_frags = load_q_frags(
+            q_rsrc, q_base_bh, stride_qs, tok_lane, grp, _RATIO, _SQ, _HEAD, _FX_KV
+        )
 
         kv_base = hkv_abs * stride_kh
 
@@ -363,7 +349,6 @@ def compile_pa_decode_swa(
             arith.mulf(arith.unwrap(softmax_scale), arith.constant(LOG2E, type=T.f32))
         )
         _v8h = T.vec(8, _FX_KV.ir_type)
-        _v4h = T.vec(4, _FX_KV.ir_type)
 
         def _row_bounds(t):
             """[begin, end) of keys this lane's query row may attend."""
@@ -536,20 +521,9 @@ def compile_pa_decode_swa(
                     + fx.Index(grp * fx.Int32(4 * 16))
                     + fx.Index(tok_lane) * fx.Index(4)
                 )
-                _vlo = rocdl.ds_read_tr16_b64(
-                    _v4h,
-                    buffer_ops.create_llvm_ptr(
-                        fx.Int64(_off_lo * fx.Index(2)), address_space=3
-                    ),
-                ).result
-                _off_hi = _off_lo + fx.Index(MFMA_N * 16)
-                _vhi = rocdl.ds_read_tr16_b64(
-                    _v4h,
-                    buffer_ops.create_llvm_ptr(
-                        fx.Int64(_off_hi * fx.Index(2)), address_space=3
-                    ),
-                ).result
-                v_frag = vector.shuffle(_vlo, _vhi, [0, 1, 2, 3, 4, 5, 6, 7])
+                v_frag = read_v_frag_tr(
+                    _off_lo, _off_lo + fx.Index(MFMA_N * 16), _FX_KV
+                )
                 for t in range_constexpr(_M_TILES):
                     a4 = vector.broadcast(T.vec(4, T.f32), arith.unwrap(alphas[t]))
                     c_in = arith.mulf(acc[t][dpass], a4)
@@ -924,13 +898,7 @@ def _make_swa_launcher(
         grid_x,
         stream: fx.Stream = fx.Stream(None),
     ):
-        from flydsl._mlir import ir as _ir
-        from flydsl.compiler.kernel_function import CompilationContext
-
-        _alloc.finalized = False
-        ctx = CompilationContext.get_current()
-        with _ir.InsertionPoint(ctx.gpu_module_body):
-            _alloc.finalize()
+        finalize_smem(_alloc)
         kernel(
             out_ptr,
             q_ptr,
