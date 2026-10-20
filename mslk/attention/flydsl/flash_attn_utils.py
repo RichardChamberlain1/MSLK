@@ -893,6 +893,8 @@ def _vec_v_src_elem(traits, d, wave_id_uni, lane_in_warp, kv_head_idx):
 # the vmcnt-tracked `buffer_load ... lds`. Same operands, different completion
 # counter, so the swap is mechanical; opt-in until it is proven on this kernel.
 ASYNC_LDS = os.getenv("FLYDSL_FLASH_ATTN_ASYNC_LDS", "0") == "1"
+# Head dim from which wave split-K pays at any concurrency.
+WAVE_SPLITK_MIN_D = 128
 # Split-K combine: O-partial loads issued per chunk before being consumed.
 COMBINE_PREFETCH = int(os.getenv("FLYDSL_COMBINE_PREFETCH", "8"))
 
@@ -1617,14 +1619,7 @@ def _make_flash_attn_generic_traits(
             and kv_cache_layout == "linear"
             and not gappy_kv
         )
-        # FLYDSL_PAGED_KV_DMA=0/1 overrides the caller's choice.
-        forced = os.getenv("FLYDSL_PAGED_KV_DMA", "")
-        want = forced == "1" if forced in ("0", "1") else (enable_dma or paged_kv_dma)
-        enable_dma = paged_dma_ok and want
-    # FLYDSL_PAGED_K_PREFETCH=0/1 overrides the caller's choice.
-    forced_pf = os.getenv("FLYDSL_PAGED_K_PREFETCH", "")
-    if forced_pf in ("0", "1"):
-        paged_k_prefetch = forced_pf == "1"
+        enable_dma = paged_dma_ok and (enable_dma or paged_kv_dma)
     paged_k_prefetch = paged and paged_k_prefetch and not enable_dma
     enable_gfx942_kv_gpfetch = (
         gpu_arch.startswith("gfx942")
@@ -1641,13 +1636,12 @@ def _make_flash_attn_generic_traits(
     #
     # Limited to packed-GQA decode over a full (unwindowed) context. The merge
     # costs two barriers and an LDS round trip per workgroup, and below
-    # FLYDSL_WAVE_SPLITK_MIN_D there is not enough MFMA per tile to absorb it
+    # WAVE_SPLITK_MIN_D there is not enough MFMA per tile to absorb it
     # outright -- there it only pays at high concurrency. Whether a given call
     # clears that bar turns on batch, which this builder cannot see:
     # num_kv_splits does not stand in for it, because the batches that win and
     # the batches that lose share a split count. The caller resolves it and
     # passes the answer as `high_concurrency`.
-    _wsk_min_d = int(os.getenv("FLYDSL_WAVE_SPLITK_MIN_D", "128"))
     enable_wave_splitk = (
         int(num_kv_splits) > 1
         and q_pack_group > 0
@@ -1657,10 +1651,9 @@ def _make_flash_attn_generic_traits(
         # tile exactly; a single-wave (narrow) tile would drop half its keys.
         and num_waves * k_sub_n == block_n
         and window_left < 0
-        and (head_dim >= _wsk_min_d or high_concurrency)
+        and (head_dim >= WAVE_SPLITK_MIN_D or high_concurrency)
         and not enable_gfx942_kv_gpfetch
         and not enable_dma
-        and os.getenv("FLYDSL_FLASH_ATTN_FUNC_WAVE_SPLITK", "1") == "1"
     )
     enable_gfx942_vec_k = (
         gpu_arch.startswith("gfx942")

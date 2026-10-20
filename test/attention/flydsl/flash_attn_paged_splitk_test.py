@@ -36,7 +36,7 @@ def test_target_requires_gfx950_and_flydsl():
 def _generic_paged_route(monkeypatch):
     """Keep decodes on the generic split-K kernel these tests inspect, rather
     than pa_decode_swa (covered by pa_decode_swa_test.py)."""
-    monkeypatch.setattr(fai, "_PAGED_SWA_KERNEL", "0")
+    monkeypatch.setattr(fai, "_PAGED_SWA_KERNEL", False)
 
 
 def _paged_inputs(B, Sq, ctx, D, device="cuda", dtype=torch.bfloat16):

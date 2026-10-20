@@ -124,7 +124,7 @@ def test_paged_decode_launches_on_the_given_stream(monkeypatch, route):
     from mslk.attention.flydsl import flash_attn_interface as fai
 
     if route != "pa_decode_swa":
-        monkeypatch.setattr(fai, "_PAGED_SWA_KERNEL", "0")
+        monkeypatch.setattr(fai, "_PAGED_SWA_KERNEL", False)
     if route == "head_packed":
         monkeypatch.setattr(fai, "_PAGED_GQA_PACK", False)
     if route == "generic":
