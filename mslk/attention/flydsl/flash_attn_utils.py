@@ -35,6 +35,13 @@ from flydsl.utils.smem_allocator import SmemPtr
 from mslk.flydsl import buffer_ops
 
 from ._common import dtype_to_elem_type
+from .split_arrival import (
+    ARRIVAL_COUNTERS,
+    arrive,
+    counter_ptr,
+    CPOL_SC1,
+    reset_counter,
+)
 
 _LOG2E = host_math.log2(host_math.e)
 # s_waitcnt bitfield encoding
@@ -2571,9 +2578,7 @@ class GenericFlashAttnContext:
                 # Fused split-K: the arrival counters lead the workspace and the
                 # partials follow them (see GenericFusedSplitKCombine).
                 self.ws_counter_base_i64 = self.ws_base_i64
-                self.ws_base_i64 = self.ws_base_i64 + fx.Int64(
-                    FUSED_COMBINE_COUNTERS * 4
-                )
+                self.ws_base_i64 = self.ws_base_i64 + fx.Int64(ARRIVAL_COUNTERS * 4)
             self.ws_opart_per_split_elems = (
                 fx.Index(traits.NUM_HEADS_Q)
                 * self.seq_len_v
@@ -7151,27 +7156,18 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         _ws_store_f32(lse_val, store_idx, lse_rsrc)
 
 
-# Arrival counters at the head of a fused split-K workspace; bounds grid.x.
-FUSED_COMBINE_COUNTERS = 1 << 16
-# gfx94x/gfx950 SC1 cache-policy bit: an agent-scope coherent access. Stores
-# write through the per-XCD L2 and loads do not hit a stale L2 line, so the
-# fused split-K hands partials across XCDs without agent-scope fences (which
-# would write back / invalidate the whole L2 per workgroup).
-_CPOL_SC1 = 16
-
-
 def _splitk_store_cpol(traits):
     """Cache policy for split-K partial stores (agent-coherent when fused)."""
-    return _CPOL_SC1 if traits.FUSED_COMBINE else 0
+    return CPOL_SC1 if traits.FUSED_COMBINE else 0
 
 
 class GenericFusedSplitKCombine:
     """Split-K merge done inside the attention kernel by the last split to finish.
 
     Every split publishes its partial and counts itself in on a per-tile counter
-    at the head of the workspace; the split that completes the count merges all
-    partials in split order (deterministic, one online log-sum-exp pass), writes
-    O and resets the counter to zero for the next call.
+    at the head of the workspace (see split_arrival); the split that completes
+    the count merges all partials in split order (deterministic, one online
+    log-sum-exp pass) and writes O.
     """
 
     # Splits whose loads are issued together before being consumed.
@@ -7180,51 +7176,19 @@ class GenericFusedSplitKCombine:
     def __init__(self, ctx):
         self.ctx = ctx
 
-    def _counter_ptr(self):
-        ctx = self.ctx
-        addr = ctx.ws_counter_base_i64 + fx.Int64(ctx.block_id * fx.Index(4))
-        return buffer_ops.create_llvm_ptr(addr, address_space=1)
-
     def run(self):
         ctx = self.ctx
-        traits = ctx.traits
-        counter_ptr = self._counter_ptr()
+        counter = counter_ptr(ctx.ws_counter_base_i64, ctx.block_id)
+        leader = ctx.tid == fx.Index(0)
         # The KV tiles are consumed, so the start of their LDS can carry the flag.
-        flag_ptr = buffer_ops.create_llvm_ptr(
-            fx.Int64(ctx.lds_kv_offset), address_space=3
-        )
-        # The partials were stored agent-coherent (SC1); once every thread's
-        # stores have completed, the split may count itself in.
-        rocdl.s_waitcnt(0)
-        gpu.barrier()
-        tid = ctx.tid
-
-        @flyc.jit
-        def _arrive():
-            if tid == fx.Index(0):
-                old = fx.llvm.atomic_add(
-                    counter_ptr,
-                    fx.Int32(1),
-                    syncscope=rocdl.SyncScope.Agent,
-                    ordering=fx.AtomicOrdering.Monotonic,
-                )
-                last = (fx.Int32(old) == fx.Int32(traits.NUM_KV_SPLITS - 1)).select(
-                    fx.Int32(1), fx.Int32(0)
-                )
-                llvm.StoreOp(as_mlir_value(last), flag_ptr)
-
-        _arrive()
-        gpu.barrier()
-        is_last = fx.Int32(
-            rocdl.readfirstlane(T.i32, llvm.LoadOp(T.i32, flag_ptr).result)
-        )
+        is_last = arrive(counter, ctx.lds_kv_offset, leader, ctx.traits.NUM_KV_SPLITS)
 
         @flyc.jit
         def _merge_if_last():
             if is_last != fx.Int32(0):
                 self._merge()
-                if tid == fx.Index(0):
-                    llvm.StoreOp(as_mlir_value(fx.Int32(0)), counter_ptr)
+                if leader:
+                    reset_counter(counter)
 
         _merge_if_last()
 
@@ -7296,21 +7260,21 @@ class GenericFusedSplitKCombine:
                     ml_idx,
                     vec_width=1,
                     dtype=T.f32,
-                    cache_modifier=_CPOL_SC1,
+                    cache_modifier=CPOL_SC1,
                 )
                 l_i = buffer_ops.buffer_load(
                     lrow_rsrc,
                     ml_idx,
                     vec_width=1,
                     dtype=T.f32,
-                    cache_modifier=_CPOL_SC1,
+                    cache_modifier=CPOL_SC1,
                 )
                 o_raw = buffer_ops.buffer_load(
                     opart_rsrc,
                     as_mlir_value(fx.Int32(z * ctx.ws_opart_per_split_elems + local_o)),
                     vec_width=n // 2,
                     dtype=T.i32,
-                    cache_modifier=_CPOL_SC1,
+                    cache_modifier=CPOL_SC1,
                 )
                 loaded.append((m_i, l_i, o_raw))
             for m_i, l_i, o_raw in loaded:
