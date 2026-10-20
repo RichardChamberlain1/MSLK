@@ -3120,6 +3120,13 @@ class GenericKvGmemToLdsLoader:
             return self.page_ids.gappy_tile_pages(self.ctx.kv_seq_start + tile_start)
         return self.page_ids.page_id(tile_start)
 
+    def _kv_row_idx(self, pid, tile_start, row_in_tile):
+        """KV row of `row_in_tile` in the tile at `tile_start` (`pid` is its
+        page id, or None when not paged)."""
+        if const_expr(self.ctx.traits.PAGED):
+            return self._paged_row_idx(pid, tile_start, row_in_tile)
+        return self.row_clamp(tile_start + row_in_tile)
+
     def _paged_row_idx(self, pid, tile_start, row_total):
         # Physical KV row for a paged load. Normal paged: row_idx = pid*PAGE_SIZE +
         # row. Gappy paged: resolve the row's page from the cached 2-page tile window.
@@ -3142,10 +3149,7 @@ class GenericKvGmemToLdsLoader:
             pid = self._tile_page_id(tile_start)
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
-            if const_expr(traits.PAGED):
-                row_idx = self._paged_row_idx(pid, tile_start, row + row_offset)
-            else:
-                row_idx = self.row_clamp(tile_start + row + row_offset)
+            row_idx = self._kv_row_idx(pid, tile_start, row + row_offset)
             if const_expr(traits.KV_NEEDS_GUARD):
                 if row < fx.Index(traits.BLOCK_N):
                     g_idx = self.global_idx(row_idx, col)
@@ -3188,14 +3192,9 @@ class GenericKvGmemToLdsLoader:
             pid = self._tile_page_id(tile_start)
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
-            if const_expr(traits.PAGED):
-                row_idx = self._paged_row_idx(
-                    pid, tile_start, ctx.load_row_in_batch + row_offset
-                )
-            else:
-                row_idx = self.row_clamp(
-                    tile_start + ctx.load_row_in_batch + row_offset
-                )
+            row_idx = self._kv_row_idx(
+                pid, tile_start, ctx.load_row_in_batch + row_offset
+            )
             vecs.append(
                 self.load_f16xN(ctx.k_ptr, self.global_idx(row_idx, ctx.load_col_base))
             )
@@ -3245,14 +3244,10 @@ class GenericKvGmemToLdsLoader:
         row = ctx.load_row_in_batch
         col = ctx.load_col_base
         v_base = self.v_buf_base(buf_id)
-        if const_expr(traits.PAGED):
-            pid = self._tile_page_id(tile_start)
+        pid = self._tile_page_id(tile_start) if traits.PAGED else None
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
-            if const_expr(traits.PAGED):
-                row_idx = self._paged_row_idx(pid, tile_start, row + row_offset)
-            else:
-                row_idx = self.row_clamp(tile_start + row + row_offset)
+            row_idx = self._kv_row_idx(pid, tile_start, row + row_offset)
             if const_expr(traits.KV_NEEDS_GUARD):
                 if row < fx.Index(traits.BLOCK_N):
                     g_idx = self.global_idx(row_idx, col)
@@ -3297,14 +3292,9 @@ class GenericKvGmemToLdsLoader:
         vecs = []
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
-            if const_expr(traits.PAGED):
-                row_idx = self._paged_row_idx(
-                    pid, tile_start, ctx.load_row_in_batch + row_offset
-                )
-            else:
-                row_idx = self.row_clamp(
-                    tile_start + ctx.load_row_in_batch + row_offset
-                )
+            row_idx = self._kv_row_idx(
+                pid, tile_start, ctx.load_row_in_batch + row_offset
+            )
             vecs.append(
                 self.load_f16xN(ctx.v_ptr, self.global_idx(row_idx, ctx.load_col_base))
             )
@@ -3344,13 +3334,9 @@ class GenericKvGmemToLdsLoader:
         ctx = self.ctx
         traits = ctx.traits
         vecs = []
-        if const_expr(traits.PAGED):
-            pid = self._tile_page_id(tile_start)
+        pid = self._tile_page_id(tile_start) if traits.PAGED else None
         for r in range_constexpr(ctx.vp_rows_per_thread):
-            if const_expr(traits.PAGED):
-                row_idx = self._paged_row_idx(pid, tile_start, ctx.vp_row_base + r)
-            else:
-                row_idx = self.row_clamp(tile_start + ctx.vp_row_base + r)
+            row_idx = self._kv_row_idx(pid, tile_start, ctx.vp_row_base + r)
             vecs.append(
                 self.load_f16xN(ctx.v_ptr, self.global_idx(row_idx, ctx.vp_col_base))
             )
