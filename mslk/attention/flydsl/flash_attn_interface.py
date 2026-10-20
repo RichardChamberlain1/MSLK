@@ -618,8 +618,7 @@ def _paged_num_kv_splits(
 
     Sized by chain length, not by workgroup count. The KV loop is a serial chain
     of dependent loads costing roughly one memory latency per BLOCK_N_OUT tile,
-    so a grid that already covers every CU can still be latency-stalled -- at
-    r=64 (2048 workgroups, 8 per CU) splitting 32 ways is still worth 22%.
+    so a grid that already covers every CU can still be latency-stalled.
     Pick the smallest split count that brings the chain to _PAGED_TARGET_CHAIN
     tiles, then clamp to the workspace budget.
     """
@@ -634,11 +633,10 @@ def _paged_num_kv_splits(
     blocks = num_batches * num_heads * ceildiv(max(seqlen_q, 1), 64)
     starved = blocks < _PAGED_STARVED_BLOCKS
     cap = _PAGED_MAX_SPLITS * (2 if starved else 1)
-    # A starved grid (r=1 leaves 4 workgroups before splitting) is short of
-    # latency hiding, not of work, so it pays to halve the chain and take the
-    # extra combine passes: measured 20.8 -> 18.2 us at r=1/ctx=32000. The same
-    # target costs 13% at r=4 and 4% at r=16, where the base grid already has
-    # enough in flight, so it stays keyed to the starvation test.
+    # A starved grid is short of latency hiding, not of work, so it pays to
+    # halve the chain and take the extra combine passes. Where the base grid
+    # already has enough in flight the same target only costs, so it stays
+    # keyed to the starvation test.
     chain = max(1, _PAGED_TARGET_CHAIN // 2 if starved else _PAGED_TARGET_CHAIN)
     want = min(ceildiv(kv_tiles, chain), cap)
 
@@ -1060,14 +1058,13 @@ def _hp_decode_ok(
     Three derived gates -- no tuned table:
 
     1. **Register budget.** `ratio * Sq` pairs must fit in `MFMA_M` slots across
-       at most `max_m_tiles(head_dim)` tiles, the measured point before the
-       compiler spills.
+       at most `max_m_tiles(head_dim)` tiles, the point before the compiler
+       spills.
     2. **Query grouping.** A block too deep for that budget can instead be run as
        `_HP_QUERY_GROUPS` shallower passes (see `query_group_seqlen`). Costs one
-       extra KV pass per group but avoids the spill, measured 1.5x-2.0x where a
-       single pass would spill. Only used to rescue a shape the budget would
-       reject: where single-pass already fits, it was inside run-to-run noise
-       (1.03x-1.28x) and is not worth the extra traffic.
+       extra KV pass per group but avoids the spill. Only used to rescue a shape
+       the budget would reject: where single-pass already fits, the gain does
+       not pay for the extra traffic.
     3. **Parallelism floor.** The resulting CTA count must reach
        `_HP_MIN_CTAS_PER_CU * CUs`. More tiles buy fewer KV passes but cost
        occupancy, and that trade only pays when enough CTAs are resident.
@@ -1103,7 +1100,7 @@ def _hp_decode_ok(
         return 0
 
     # Only deep tiling trades enough occupancy away to need the floor; shallow
-    # tiling still leaves 6+ waves/SIMD resident. Grouping makes each pass
+    # tiling still leaves enough waves resident. Grouping makes each pass
     # shallower, so the depth that matters is the per-group one.
     tiles = -(-(seqlen_q // groups) // t_pack)
     if tiles < _HP_FLOOR_MIN_TILES:
@@ -1288,9 +1285,7 @@ def _flydsl_flash_attn_paged(
 
     # The grid is one workgroup per (request, QUERY head), so the group_size
     # query heads sharing a KV head each stream that head's entire KV range
-    # independently. Measured on GQA 32x4: 7.3 TB/s of issued loads for
-    # 0.9 TB/s of distinct DRAM traffic, while the same kernel at MHA 32x32
-    # reaches 5.2 TB/s DRAM -- it is L2-bound on redundant reads, not slow.
+    # independently, so the kernel is L2-bound on redundant reads.
     #
     # Fold the group's query heads into M instead: one workgroup per
     # (request, KV head), KV read once and shared across the group. Rows are

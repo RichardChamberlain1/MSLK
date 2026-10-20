@@ -63,16 +63,9 @@ BLOCK = WARP_SIZE  # one warp per CTA
 
 # Query blocks longer than MFMA_M//ratio need several M-tiles, looped inside the
 # KV loop so one K/V stream feeds them all. Each tile adds loop-carried
-# accumulator, so the count is bounded by where the compiler starts spilling.
-#
-# Measured on gfx950 (rocprofv3 --kernel-trace, VGPR_Count + Scratch_Size):
-#
-#   tiles     1    2    3    4    5    6      7      8
-#   D=64     52   76  104  132  140  168    188    212      all clean
-#   D=128    88  120  148  184  220  256   256*   256*      * spills (280B, 916B)
-#
-# So D=64 is clean to 8 tiles and D=128 to 6. Spilling a bandwidth-bound decode
-# kernel is self-defeating.
+# accumulator, so the count is bounded by where the compiler starts spilling:
+# D=64 compiles without scratch up to 8 tiles and D=128 up to 6. Spilling a
+# bandwidth-bound decode kernel is self-defeating.
 MAX_M_TILES_BY_HEAD_DIM = {64: 8, 128: 6}
 
 
@@ -119,7 +112,7 @@ def compile_pa_decode_gfx950(
     _PAGED = bool(paged)
     _PAGE_SIZE = int(page_size)
     # Paged caches past 4 GiB need 64-bit page offsets. That costs a descriptor
-    # per tile (measured ~6% at D=128), so it is only compiled in when needed.
+    # per tile, so it is only compiled in when needed.
     _KV_I64 = _PAGED and bool(kv_i64)
 
     # M-axis packing. The 16 M slots hold (query-token, head) pairs laid out as
