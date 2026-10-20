@@ -392,9 +392,8 @@ def test_gqa_packing_takes_precedence(monkeypatch):
     """With both available, GQA packing owns the shape and the decode kernel idles.
 
     Packing folds query heads into M inside the generic paged kernel, so it
-    fixes the same fan-out with a far wider reach. Measured across the paged
-    decode shapes it is equal at a single query token, within noise at four, and
-    2.8x better for longer query blocks, so it must win wherever it applies.
+    fixes the same fan-out with a far wider reach, so it must win wherever it
+    applies.
     """
     from mslk.attention.flydsl.decode import pa_decode_dense
 
@@ -782,7 +781,7 @@ def test_head_packed_selected_for_short_query_blocks(monkeypatch, Sq):
 
 @pytest.mark.parametrize("Sq", [8, 13])
 def test_head_packed_selected_for_deep_tiling_at_d64(monkeypatch, Sq):
-    """D=64 is measured clean to 8 M-tiles, so Sq up to 16 is in range (Sq=16
+    """D=64 compiles clean to 8 M-tiles, so Sq up to 16 is in range (Sq=16
     is test_query_grouping_not_used_when_single_pass_fits)."""
     calls = _count_hp_calls(monkeypatch)
     _run(*_paged_inputs(8, Sq, 32768, 64))
@@ -791,7 +790,7 @@ def test_head_packed_selected_for_deep_tiling_at_d64(monkeypatch, Sq):
 
 @pytest.mark.parametrize("Sq", [13, 15])
 def test_head_packed_declined_when_d128_would_spill(monkeypatch, Sq):
-    """D=128 spills past 6 M-tiles (measured 280B at 7, 916B at 8).
+    """D=128 spills past 6 M-tiles.
 
     Spilling a bandwidth-bound decode kernel is self-defeating, so these fall
     through to the existing path. 13 and 15 are odd, so equal-span query
@@ -806,7 +805,7 @@ def test_head_packed_uses_query_groups_when_single_pass_would_spill(monkeypatch)
     """D=128 / Sq=16 needs 8 tiles in one pass, which spills.
 
     Two passes of 8 query tokens need 4 tiles each -- under the budget -- at the
-    cost of reading KV twice. Measured 1.9x faster than the path it replaces.
+    cost of reading KV twice.
     """
 
     calls = _count_hp_calls(monkeypatch)
@@ -827,8 +826,7 @@ def test_query_grouping_kill_switch(monkeypatch):
 def test_query_grouping_not_used_when_single_pass_fits(monkeypatch):
     """Grouping is only for rescuing shapes the register budget would reject.
 
-    D=64 fits Sq=16 in one pass, and grouping there measured inside run-to-run
-    noise, so the extra KV pass must not be spent.
+    D=64 fits Sq=16 in one pass, so the extra KV pass must not be spent.
     """
     calls = _count_hp_calls(monkeypatch)
     _run(*_paged_inputs(8, 16, 32768, 64))
@@ -839,7 +837,7 @@ def test_query_grouping_not_used_when_single_pass_fits(monkeypatch):
 def test_head_packed_declined_when_too_few_ctas(monkeypatch):
     """Deep tiling costs occupancy, so it needs enough CTAs to stay resident.
 
-    One CTA per CU measured 0.74x the path it replaced; the floor rejects it.
+    About one CTA per CU cannot hide latency; the floor rejects it.
     """
     calls = _count_hp_calls(monkeypatch)
     _run(*_paged_inputs(1, 16, 32000, 64))  # 8 tiles, batch 1 -> ~1 CTA/CU
@@ -849,8 +847,8 @@ def test_head_packed_declined_when_too_few_ctas(monkeypatch):
 def test_head_packed_floor_does_not_reject_shallow_tiling(monkeypatch):
     """The CTA floor applies to deep tiling only.
 
-    Sq=4 is two tiles and still holds 6 waves/SIMD; it was measured winning at
-    batch 1, so the floor must not take it away.
+    Sq=4 is two tiles and still keeps enough waves resident, so the floor must
+    not take it away at batch 1.
     """
     calls = _count_hp_calls(monkeypatch)
     _run(*_paged_inputs(1, 4, 32000, 64))
