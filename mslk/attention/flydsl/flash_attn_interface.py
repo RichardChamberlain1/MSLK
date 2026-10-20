@@ -596,6 +596,19 @@ _PAGED_MAX_WG = 8192
 _PAGED_WS_BUDGET_MB = 512
 
 
+def _paged_affordable_splits(
+    num_batches: int, num_heads: int, seqlen_q: int, head_dim: int
+) -> int:
+    """Largest split count whose fp32 workspace fits _PAGED_WS_BUDGET_MB.
+
+    rows = B*splits*H*Sq and elems = rows*(D//2) + 2*rows (see
+    dualwave_splitk_workspace_elems).
+    """
+    per_split_elems = num_batches * num_heads * max(seqlen_q, 1) * (head_dim // 2 + 2)
+    budget_elems = _PAGED_WS_BUDGET_MB * 1024 * 1024 // 4
+    return max(1, budget_elems // max(per_split_elems, 1))
+
+
 def _paged_num_kv_splits(
     num_batches: int, num_heads: int, seqlen_q: int, seqlen_kv: int, head_dim: int
 ) -> int:
@@ -630,11 +643,7 @@ def _paged_num_kv_splits(
     # combine pass starts to dominate.
     by_grid = max(1, _PAGED_MAX_WG // max(blocks, 1))
 
-    # rows = B*splits*H*Sq; elems = rows*(D//2) + 2*rows  (see
-    # dualwave_splitk_workspace_elems). Solve for the largest affordable split.
-    per_split_elems = num_batches * num_heads * max(seqlen_q, 1) * (head_dim // 2 + 2)
-    budget_elems = _PAGED_WS_BUDGET_MB * 1024 * 1024 // 4
-    affordable = max(1, budget_elems // max(per_split_elems, 1))
+    affordable = _paged_affordable_splits(num_batches, num_heads, seqlen_q, head_dim)
     limit = max(1, min(cap, by_grid, affordable, kv_tiles))
     splits = max(1, min(want, limit))
     # NUM_KV_SPLITS is compiled in, and the raw count moves with every ~512
@@ -662,32 +671,15 @@ _PAGED_WINDOW_MAX_SPLITS = 32
 
 
 def _paged_window_num_kv_splits(
-    num_batches: int,
-    num_heads: int,
-    seqlen_q: int,
-    reach: int,
-    head_dim: int,
-    max_kv_pages: int,
+    num_batches: int, num_heads: int, seqlen_q: int, reach: int, head_dim: int
 ) -> int:
     """KV splits for a windowed paged call that can see `reach` keys."""
     kv_tiles = -(-max(reach, 1) // _PAGED_BLOCK_N_OUT)
     units = num_batches * num_heads * -(-max(seqlen_q, 1) // 64)
-    per_split_elems = num_batches * num_heads * max(seqlen_q, 1) * (head_dim // 2 + 2)
-    affordable = _PAGED_WS_BUDGET_MB * 1024 * 1024 // 4 // max(per_split_elems, 1)
+    affordable = _paged_affordable_splits(num_batches, num_heads, seqlen_q, head_dim)
     splits = max(_PAGED_WINDOW_TARGET_WG // max(units, 1), _PAGED_WINDOW_MIN_SPLITS)
     splits = max(1, min(splits, _PAGED_WINDOW_MAX_SPLITS, kv_tiles, affordable))
-    splits = 1 << (splits.bit_length() - 1)
-
-    # The generic paged kernel stages at most `_PAGED_BT_LDS_SIZE` block-table
-    # entries per split. Raise the split count only when that count still fits
-    # the workspace budget; otherwise the common LDS-window validation below
-    # rejects the unsupported shape before allocating a split-K workspace.
-    minimum = (max_kv_pages + _PAGED_BT_LDS_SIZE - 1) // _PAGED_BT_LDS_SIZE
-    minimum_pow2 = 1 << (max(minimum, 1) - 1).bit_length()
-    allowed = max(1, min(_PAGED_WINDOW_MAX_SPLITS, kv_tiles, affordable))
-    if minimum_pow2 <= allowed:
-        splits = max(splits, minimum_pow2)
-    return splits
+    return 1 << (splits.bit_length() - 1)
 
 
 # Workgroups below which the grid cannot keep the device busy on its own.
@@ -1098,6 +1090,76 @@ def _hp_decode_ok(
     return groups if ctas >= _HP_MIN_CTAS_PER_CU * num_cu else 0
 
 
+def _paged_auto_num_kv_splits(
+    num_batches: int,
+    num_heads: int,
+    seqlen_q: int,
+    q_len: int,
+    seqlen_kv: int,
+    head_dim: int,
+    page_size: int,
+    window_left: int,
+    gqa_packed: bool,
+    num_cu: int,
+) -> int:
+    """Split count for a generic paged call that left it to us.
+
+    ``seqlen_q`` counts the (possibly GQA-packed) rows and ``q_len`` the query
+    tokens. Sized by chain length (or, windowed, by the keys the window
+    reaches), topped up to fill the device, capped for wide tiles, traded for
+    the narrow tile where that pays, and finally raised so every split's pages
+    fit the block-table LDS window.
+    """
+    if window_left >= 0:
+        # The kernel only walks the keys the window can reach and splits that
+        # range, so size by it rather than by the whole context.
+        span = min(seqlen_kv, window_left + q_len)
+        splits = _paged_window_num_kv_splits(
+            num_batches, num_heads, seqlen_q, span, head_dim
+        )
+    else:
+        span = seqlen_kv
+        splits = _paged_num_kv_splits(
+            num_batches, num_heads, seqlen_q, seqlen_kv, head_dim
+        )
+    splits = _paged_occupancy_topup(
+        splits, num_batches, num_heads, seqlen_q, span, head_dim, gqa_packed
+    )
+    if window_left < 0:
+        splits = _paged_wide_tile_split_cap(
+            splits,
+            num_batches,
+            num_heads,
+            seqlen_q,
+            -(-seqlen_kv // _PAGED_BLOCK_N_OUT),
+            head_dim,
+            gqa_packed,
+        )
+    splits = _paged_narrow_chain_splits(
+        splits,
+        num_batches * num_heads,
+        seqlen_q,
+        window_left,
+        q_len,
+        seqlen_kv,
+        head_dim,
+        page_size,
+        _PAGED_NARROW_WG_PER_CU * num_cu,
+    )
+    # The block-table window spans the whole context, windowed or not. Raise
+    # the count to cover it only while the workspace stays in budget; past that
+    # the LDS-window validation rejects the shape before allocating.
+    floor = -(-(-(-seqlen_kv // page_size)) // _PAGED_BT_LDS_SIZE)
+    if splits < floor:
+        floor_pow2 = 1 << (floor - 1).bit_length()
+        affordable = _paged_affordable_splits(
+            num_batches, num_heads, seqlen_q, head_dim
+        )
+        if floor_pow2 <= affordable:
+            splits = floor_pow2
+    return splits
+
+
 def _flydsl_flash_attn_paged(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1452,38 +1514,17 @@ def _flydsl_flash_attn_paged(
     if varlen and not _varlen_uniform_q:
         num_kv_splits = 1
     elif _paged_light_ok and requested_num_kv_splits == 0:
-        if _paged_window:
-            q_len = _gqa_qlen if _gqa_packed else Sq
-            reach = min(skv, int(window_left) + q_len)
-            pages = (skv + page_size - 1) // page_size
-            num_kv_splits = _paged_window_num_kv_splits(B, H, q_len, reach, D, pages)
-            span = reach
-        else:
-            num_kv_splits = _paged_num_kv_splits(B, H, Sq, skv, D)
-            span = skv
-        num_kv_splits = _paged_occupancy_topup(
-            num_kv_splits, B, H, Sq, span, D, _gqa_packed
-        )
-        if not _paged_window:
-            num_kv_splits = _paged_wide_tile_split_cap(
-                num_kv_splits,
-                B,
-                H,
-                Sq,
-                -(-skv // _PAGED_BLOCK_N_OUT),
-                D,
-                _gqa_packed,
-            )
-        num_kv_splits = _paged_narrow_chain_splits(
-            num_kv_splits,
-            B * H,
+        num_kv_splits = _paged_auto_num_kv_splits(
+            B,
+            H,
             Sq,
-            window_left,
             _gqa_qlen if _gqa_packed else Sq,
             skv,
             D,
             page_size,
-            _PAGED_NARROW_WG_PER_CU * _dense_light_cu(q.device),
+            window_left,
+            _gqa_packed,
+            _dense_light_cu(q.device),
         )
     elif requested_num_kv_splits <= 1:
         num_kv_splits = 1

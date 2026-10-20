@@ -251,6 +251,18 @@ def test_paged_splits_keep_block_table_window():
     assert math.ceil(pages / splits) <= fai._PAGED_BT_LDS_SIZE
 
 
+@pytest.mark.parametrize("window_left", [-1, 2048])
+def test_auto_splits_keep_block_table_window(window_left):
+    """The wide-tile cap lowers the split count after chain sizing; the final
+    count must still give every split at most the block-table window's pages."""
+    ctx = 3 << 20
+    for Sq in (64, 128):
+        splits = fai._paged_auto_num_kv_splits(
+            1, H, Sq, Sq, ctx, 128, PAGE, window_left, False, 256
+        )
+        assert math.ceil(ctx / PAGE / splits) <= fai._PAGED_BT_LDS_SIZE
+
+
 @pytest.mark.parametrize("ctx", [128, 512])
 @pytest.mark.parametrize("Sq,D", [(1, 64), (4, 128)])
 def test_single_split_gqa_packed_matches_reference(ctx, Sq, D):
