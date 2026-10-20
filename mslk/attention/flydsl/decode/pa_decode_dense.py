@@ -223,14 +223,11 @@ def pa_decode_paged_launch(
     parts = []
     for g in range(query_groups):
         kv_g = max(0, query_group_seqlen(max_seqlen_kv, Sq, query_groups, g))
-        # `.contiguous()` is load-bearing, not hygiene. The kernel's non-split
-        # epilogue addresses the output with Q's strides, so it requires the two
-        # to share a layout. A slice of the query block keeps the parent's
-        # stride(0) (Sq*...) while the freshly allocated output has span*...,
-        # and the mismatch silently corrupts every batch above the first.
+        # pa_decode_gfx950_launch makes the slice contiguous: its non-split
+        # epilogue addresses the output with Q's strides.
         parts.append(
             pa_decode_gfx950_launch(
-                q[:, g * span : (g + 1) * span].contiguous(),
+                q[:, g * span : (g + 1) * span],
                 k_cache,
                 v_cache,
                 (

@@ -1376,7 +1376,6 @@ def _flydsl_flash_attn_paged(
 
     if vectorized:
         kvs = 16 // q.element_size()
-        Hkv = int(k.shape[1])
         page_size = int(k.shape[3])
         k_head_dim = int(k.shape[2]) * int(k.shape[4])  # (D/kVS) * kVS
         if int(k.shape[4]) != kvs:
@@ -1386,16 +1385,15 @@ def _flydsl_flash_attn_paged(
             )
     else:
         page_size = int(k.shape[1])
-        Hkv = int(k.shape[2])
         k_head_dim = int(k.shape[3])
     # Gappy paged uses the generic kernel (any D the generic path builds; the op
     # reshapes the cache to 64-row sub-pages), so skip the native-paged D/page gates.
-    _gappy_paged = kv_seqstart is not None
-    if page_size != _PAGED_PAGE_SIZE and not _gappy_paged:
+    _gappy = kv_seqstart is not None
+    if page_size != _PAGED_PAGE_SIZE and not _gappy:
         raise NotImplementedError(
             f"flydsl_flash_attn_func: native paged KV supports page_size={_PAGED_PAGE_SIZE} only, got {page_size}"
         )
-    if D not in (64, 128) and not _gappy_paged:
+    if D not in (64, 128) and not _gappy:
         raise NotImplementedError(
             f"flydsl_flash_attn_func: native paged KV supports head_dim=64 or 128, got {D}"
         )
@@ -1404,8 +1402,6 @@ def _flydsl_flash_attn_paged(
             f"flydsl_flash_attn_func: paged K head_dim ({k_head_dim}) must match q head_dim ({D})"
         )
 
-    if num_kv_heads is None:
-        num_kv_heads = Hkv
     if H % num_kv_heads != 0:
         raise ValueError(
             f"flydsl_flash_attn_func: num_heads ({H}) must be divisible by num_kv_heads ({num_kv_heads})"
@@ -1451,7 +1447,6 @@ def _flydsl_flash_attn_paged(
                     block_table_capacity=block_table_capacity,
                 )
     _arch = _gpu_arch(q.device)
-    _gappy = kv_seqstart is not None
     _splitk_dtype_ok = D in (64, 128) and dtype_str in ("bf16", "f16")
     _paged_light_ok = (
         _gappy
@@ -1595,7 +1590,6 @@ def _flydsl_flash_attn_paged(
     if num_kv_splits == 0:
         num_kv_splits = 1
 
-    splitk = num_kv_splits > 1
     max_pages_per_split = (max_kv_pages + int(num_kv_splits) - 1) // int(num_kv_splits)
     if max_pages_per_split > _PAGED_BT_LDS_SIZE:
         max_supported_kv = _PAGED_BT_LDS_SIZE * int(num_kv_splits) * page_size
@@ -1673,10 +1667,6 @@ def _flydsl_flash_attn_paged(
                     kv_cache_layout=kv_cache_layout,
                     waves_per_eu=waves_per_eu,
                     daz=daz,
-                    lazy_rescale=dualwave_swp_lazy_rescale,
-                    setprio=dualwave_swp_setprio,
-                    debug_lazy_counts=False,
-                    enable_stagger=dualwave_swp_enable_stagger,
                     gappy_kv=_gappy,
                     return_lse=return_lse,
                     sm_scale=sm_scale,
@@ -1820,10 +1810,6 @@ def _build_paged_light(
     kv_cache_layout: str,
     waves_per_eu: int,
     daz: bool,
-    lazy_rescale: bool,
-    setprio: bool,
-    debug_lazy_counts: bool,
-    enable_stagger: bool,
     num_kv_splits: int,
     gappy_kv: bool = False,
     return_lse: bool = False,

@@ -196,7 +196,6 @@ def compile_pa_decode_gfx950(
         num_g: fx.Int32,
         kv_max: fx.Int32,
         num_hkv: fx.Int32,
-        ratio: fx.Int32,
         softmax_scale: fx.Float32,
         split_total: fx.Int32,
     ) -> None:
@@ -216,7 +215,7 @@ def compile_pa_decode_gfx950(
         rest2 = rest // num_hkv
         g_idx = rest2 % num_g
         b_idx = rest2 // num_g
-        hq_base = hkv_abs * ratio  # first query head sharing this KV head
+        hq_base = hkv_abs * fx.Int32(_RATIO)  # first query head sharing this KV head
 
         c_zero = arith.constant(0.0, type=T.f32)
         c_one = arith.constant(1.0, type=T.f32)
@@ -769,7 +768,6 @@ def _make_gfx950_jit_launcher(
         num_g,
         kv_max,
         num_hkv,
-        ratio,
         scale,
         split_total,
         grid_x,
@@ -804,7 +802,6 @@ def _make_gfx950_jit_launcher(
             num_g,
             kv_max,
             num_hkv,
-            ratio,
             scale,
             split_total,
         ).launch(grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream)
@@ -969,7 +966,6 @@ def pa_decode_gfx950_launch(
             G,
             KV_MAX,
             H_kv,
-            ratio,
             softmax_scale,
             split_k,
             n_cta_base,
@@ -1013,7 +1009,6 @@ def pa_decode_gfx950_launch(
             G,
             KV_MAX,
             H_kv,
-            ratio,
             softmax_scale,
             split_k,
             n_cta_base * split_k,
