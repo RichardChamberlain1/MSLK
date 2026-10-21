@@ -934,7 +934,11 @@ def _buffer_load_to_lds(rsrc, lds_ptr, size, voffset, soffset, offset, aux):
 
 
 def wait_lds_copies(count=0):
-    """Wait until at most ``count`` global->LDS copies are outstanding."""
+    """Wait for outstanding global->LDS copies.
+
+    On the async path ``count`` is how many copies may stay in flight; on the
+    vmcnt path it is the raw ``s_waitcnt`` immediate, where 0 waits for all.
+    """
     if _async_lds():
         rocdl.wait_asyncmark(count)
     else:
