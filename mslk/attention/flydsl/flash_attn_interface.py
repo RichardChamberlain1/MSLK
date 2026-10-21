@@ -735,8 +735,8 @@ def _paged_occupancy_topup(
 
     Under _PAGED_OCC_TARGET_WG workgroups the kernel sits at one wave per SIMD
     with nothing to hide memory latency behind, and splitting is the only lever.
-    The raise is bounded by the KV span and by _paged_combine_cap, and never
-    lowers the count it is given.
+    The raise is bounded by the KV span, by _paged_combine_cap and by the
+    workspace budget, and never lowers the count it is given.
     """
 
     def ceildiv(a: int, b: int) -> int:
@@ -753,6 +753,7 @@ def _paged_occupancy_topup(
         ceildiv(_PAGED_OCC_TARGET_WG, max(grid, 1)),
         _paged_combine_cap(head_dim),
         max(ceildiv(max(span, 1), _PAGED_BLOCK_N_OUT), 1),
+        _paged_affordable_splits(num_batches, num_heads, seqlen_q, head_dim),
     )
     # Compiled into the kernel, so keep it a power of two.
     want = 1 << (want.bit_length() - 1) if want > 0 else 1
@@ -1337,6 +1338,13 @@ def _flydsl_flash_attn_paged(
                 block_table_capacity=block_table_capacity,
             )
 
+    if B == 0:
+        empty_out = torch.empty_like(q) if out is None else out
+        if return_lse:
+            empty_lse = torch.empty((B, H, Sq), dtype=torch.float32, device=q.device)
+            return empty_out, empty_lse
+        return empty_out
+
     _swa_cfg = _paged_swa_kernel_config(
         q,
         k,
@@ -1372,13 +1380,6 @@ def _flydsl_flash_attn_paged(
             )
 
     # ── GQA head packing ────────────────────────────────────────────────────
-    if B == 0:
-        empty_out = torch.empty_like(q) if out is None else out
-        if return_lse:
-            empty_lse = torch.empty((B, H, Sq), dtype=torch.float32, device=q.device)
-            return empty_out, empty_lse
-        return empty_out
-
     # The grid is one workgroup per (request, QUERY head), so the group_size
     # query heads sharing a KV head each stream that head's entire KV range
     # independently, so the kernel is L2-bound on redundant reads.
