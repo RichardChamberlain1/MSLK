@@ -445,6 +445,14 @@ def compile_pa_decode_gfx950(
                             )
                         )
                     )
+                    # A row that has seen no key keeps max -inf, and
+                    # (-inf) - (-inf) is NaN; its sum and accumulator are
+                    # still zero, so any finite rescale is exact.
+                    a = fx.Float32(
+                        arith.select(
+                            arith.unwrap(nm) > c_neginf, arith.unwrap(a), c_one
+                        )
+                    )
                     alpha[t].append(a)
 
             # P = exp2((score - new_max)*log2e); write to LDS[m_tile][m, tok];
