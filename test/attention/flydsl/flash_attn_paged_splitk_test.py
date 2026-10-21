@@ -759,32 +759,6 @@ def test_paged_window_long_context_matches_reference():
     torch.testing.assert_close(got[0].float(), ref, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("window", [-1, 2047])
-@pytest.mark.parametrize("seqlen_q", [1, 16])
-def test_default_split_count_runs_past_one_block_table_window(window, seqlen_q):
-    """``num_kv_splits=1`` past one split's block-table window is auto-sized."""
-    ctx, head_dim = 262144, 64
-    assert ctx // PAGE > fai._PAGED_BT_LDS_SIZE
-    q, k, v, block_table, seqlen_k = _paged_inputs(1, seqlen_q, ctx, head_dim)
-    got = flydsl_flash_attn_func(
-        q,
-        k,
-        v,
-        causal=True,
-        num_kv_heads=HKV,
-        block_table=block_table,
-        seqlen_k=seqlen_k,
-        kv_cache_layout="linear",
-        num_kv_splits=1,
-        max_seqlen_kv=ctx,
-        window_left=window,
-    )
-    reference = paged_reference(
-        q, k, v, block_table, seqlen_k, causal=True, window_left=window
-    )
-    torch.testing.assert_close(got.float(), reference, atol=2e-2, rtol=2e-2)
-
-
 def test_paged_window_keeps_gqa_packing(monkeypatch):
     """A causal window stays on the light kernel under GQA packing: the packed
     rows carry their query position, so the window bound still applies per row."""
@@ -808,8 +782,8 @@ def test_paged_window_is_never_silently_dropped(Sq, causal):
 
     This is the sharp form of the routing guard: a route with no window term
     returns a full-context answer rather than failing, so identical output is
-    the bug. Non-causal windows are rejected outright, so only causal shapes
-    are checked.
+    the bug. Non-causal windows are rejected outright (see
+    test_paged_window_rejects_noncausal).
     """
     ctx = 2048
     q, k, v, block_table, seqlen_k = _paged_inputs(1, Sq, ctx, 64)
@@ -1268,3 +1242,449 @@ def test_materialized_gqa_pack_and_unpack_stay_on_explicit_stream(monkeypatch, v
     assert got.data_ptr() == out.data_ptr()
     torch.testing.assert_close(got, expected, atol=0, rtol=0)
     producer_stream.synchronize()
+
+
+def test_chain_sized_splits_are_bounded():
+    short = fai._PAGED_TARGET_CHAIN * fai._PAGED_BLOCK_N_OUT
+    assert fai._paged_num_kv_splits(1, HKV, 8, short, 128) == 1
+    assert fai._paged_num_kv_splits(1, HKV, 8, 32768, 128) > 1
+
+    for ctx in range(1024, 131072, 512):
+        splits = fai._paged_num_kv_splits(4, HKV, 32, ctx, 128)
+        assert splits & (splits - 1) == 0
+        assert splits <= fai._PAGED_MAX_SPLITS
+
+
+def test_chain_sized_splits_respect_workspace(monkeypatch):
+    monkeypatch.setattr(fai, "_PAGED_WS_BUDGET_MB", 1)
+    batch, seqlen_q, head_dim = 4, 16, 128
+    splits = fai._paged_num_kv_splits(batch, H, seqlen_q, 131072, head_dim)
+    elems = splits * batch * H * seqlen_q * (head_dim // 2 + 2)
+    assert splits == 1 or elems * 4 <= 1024 * 1024
+
+
+def test_window_sized_splits_respect_workspace_after_lds_floor(monkeypatch):
+    """The block-table floor raises a windowed split count only while the
+    workspace stays in budget; past that the shape is left to be rejected."""
+    monkeypatch.setattr(fai, "_PAGED_WS_BUDGET_MB", 1)
+    batch, heads, seqlen_q, head_dim = 4, 8, 64, 128
+    max_kv_pages = 2 * fai._PAGED_BT_LDS_SIZE
+    splits = fai._paged_auto_num_kv_splits(
+        batch,
+        heads,
+        seqlen_q,
+        seqlen_q,
+        max_kv_pages * PAGE,
+        head_dim,
+        PAGE,
+        255,
+        False,
+        256,
+    )
+    elems = splits * batch * heads * seqlen_q * (head_dim // 2 + 2)
+
+    assert splits == 1
+    assert elems * 4 <= 1024 * 1024
+    assert (max_kv_pages + splits - 1) // splits > fai._PAGED_BT_LDS_SIZE
+
+
+def test_window_sized_splits_do_not_exceed_tile_or_configured_caps(monkeypatch):
+    monkeypatch.setattr(fai, "_PAGED_WS_BUDGET_MB", 512)
+    monkeypatch.setattr(fai, "_PAGED_WINDOW_MAX_SPLITS", 4)
+
+    by_configured_cap = fai._paged_window_num_kv_splits(1, 1, 1, 4096, 64)
+    by_tile_cap = fai._paged_window_num_kv_splits(1, 1, 1, fai._PAGED_BLOCK_N_OUT, 64)
+
+    assert by_configured_cap <= 4
+    assert by_tile_cap == 1
+
+
+@pytest.mark.parametrize("window", [-1, 2047])
+@pytest.mark.parametrize("seqlen_q", [1, 16])
+def test_default_split_count_runs_past_one_block_table_window(window, seqlen_q):
+    """``num_kv_splits=1`` past one split's block-table window is auto-sized."""
+    ctx, head_dim = 262144, 64
+    assert ctx // PAGE > fai._PAGED_BT_LDS_SIZE
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, seqlen_q, ctx, head_dim)
+    got = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=1,
+        max_seqlen_kv=ctx,
+        window_left=window,
+    )
+    reference = paged_reference(
+        q, k, v, block_table, seqlen_k, causal=True, window_left=window
+    )
+    torch.testing.assert_close(got.float(), reference, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("seqlen_q", [1, 16])
+def test_paged_window_rejects_noncausal(monkeypatch, seqlen_q):
+    monkeypatch.setattr(
+        fai,
+        "_build_paged_light",
+        lambda **_kwargs: pytest.fail("non-causal window reached kernel construction"),
+    )
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, seqlen_q, 2048, 64)
+
+    with pytest.raises(NotImplementedError, match="paged KV requires causal=True"):
+        flydsl_flash_attn_func(
+            q,
+            k,
+            v,
+            causal=False,
+            num_kv_heads=HKV,
+            block_table=block_table,
+            seqlen_k=seqlen_k,
+            kv_cache_layout="linear",
+            max_seqlen_kv=2048,
+            window_left=255,
+        )
+
+
+def test_paged_window_rejects_gappy_kv():
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, 4, 2048, 64)
+    with pytest.raises(NotImplementedError, match="gappy"):
+        flydsl_flash_attn_func(
+            q,
+            k,
+            v,
+            causal=True,
+            num_kv_heads=HKV,
+            block_table=block_table,
+            seqlen_k=seqlen_k,
+            kv_seqstart=torch.zeros(2, device="cuda", dtype=torch.int32),
+            kv_cache_layout="linear",
+            num_kv_splits=1,
+            max_seqlen_kv=2048,
+            window_left=255,
+        )
+
+
+def test_head_packed_matches_dualwave_at_sq1(monkeypatch):
+    """The two kernels must agree; the head-packed one is the faster path."""
+
+    args = _paged_inputs(2, 1, 32768, 64)
+    monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
+    ref = _run(*args, 1)
+    monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", False)
+    got = _run(*args, 0)
+    assert got.shape == ref.shape
+    torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("Sq,D", [(2, 64), (4, 64), (4, 128)])
+def test_head_packed_matches_dualwave_multi_token(monkeypatch, Sq, D):
+    """Packed (qtok, head) rows must agree with the dualwave path.
+
+    This is the check on the per-query-token causal bound: the kernel applies
+    `min(t_end, t_full - Sq + qtok + 1)` itself, so a wrong bound shows up here
+    as a mismatch on the earlier query rows only.
+    """
+
+    args = _paged_inputs(2, Sq, 32768, D)
+    monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
+    ref = _run(*args, 1)
+    monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", False)
+    got = _run(*args, 0)
+    assert got.shape == ref.shape == (2, Sq, H, D)
+    torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("metadata_dtype", [torch.int32, torch.int64])
+def test_head_packed_normalizes_strided_metadata(monkeypatch, metadata_dtype):
+    calls = _count_hp_calls(monkeypatch)
+    B, Sq, ctx, D = 2, 2, 1024, 64
+    q, k, v, block_table, _ = _paged_inputs(B, Sq, ctx, D)
+    table_storage = torch.full(
+        (B, block_table.shape[1] * 2),
+        -1,
+        device="cuda",
+        dtype=metadata_dtype,
+    )
+    strided_table = table_storage[:, ::2]
+    strided_table.copy_(block_table.flip(1))
+    length_storage = torch.full((B * 2,), -1, device="cuda", dtype=metadata_dtype)
+    strided_lengths = length_storage[::2]
+    logical_lengths = torch.tensor([ctx, ctx - PAGE], device="cuda", dtype=torch.int32)
+    strided_lengths.copy_(logical_lengths)
+
+    got = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=strided_table,
+        seqlen_k=strided_lengths,
+        kv_cache_layout="linear",
+        num_kv_splits=1,
+        max_seqlen_kv=ctx,
+    )
+    reference = paged_reference(q, k, v, strided_table, logical_lengths, causal=True)
+
+    assert len(calls) == 1
+    torch.testing.assert_close(got.float(), reference, atol=2e-2, rtol=2e-2)
+
+
+def test_head_packed_clamps_lengths_before_launch(monkeypatch):
+    calls = _count_hp_calls(monkeypatch)
+    B, Sq, ctx, D = 2, 1, 1024, 64
+    q, k, v, block_table, _ = _paged_inputs(B, Sq, ctx, D)
+    raw_lengths = torch.tensor(
+        [ctx + 7 * PAGE, ctx // 2], device="cuda", dtype=torch.int64
+    )
+    bounded_lengths = torch.tensor([ctx, ctx // 2], device="cuda", dtype=torch.int32)
+
+    got = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=raw_lengths,
+        kv_cache_layout="linear",
+        num_kv_splits=1,
+        max_seqlen_kv=ctx,
+    )
+    reference = paged_reference(q, k, v, block_table, bounded_lengths, causal=True)
+
+    assert len(calls) == 1
+    torch.testing.assert_close(got.float(), reference, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("split_k", [1, 0])
+def test_head_packed_independent_kv_strides(monkeypatch, split_k):
+    calls = _count_hp_calls(monkeypatch)
+    B, Sq, ctx, D = 2, 2, 1024, 64
+    pages = B * ctx // PAGE
+    torch.manual_seed(0)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    k_storage = torch.randn(
+        pages, PAGE * 2, HKV, D, device="cuda", dtype=torch.bfloat16
+    )
+    v_storage = torch.randn(
+        pages, PAGE, HKV * 2, D, device="cuda", dtype=torch.bfloat16
+    )
+    k = k_storage[:, ::2]
+    v = v_storage[:, :, ::2]
+    block_table = torch.arange(pages, device="cuda", dtype=torch.int32).view(
+        B, ctx // PAGE
+    )
+    lengths = torch.full((B,), ctx, device="cuda", dtype=torch.int32)
+
+    assert k.shape == v.shape
+    assert k.stride() != v.stride()
+    assert not k.is_contiguous()
+    assert not v.is_contiguous()
+    got = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=lengths,
+        kv_cache_layout="linear",
+        num_kv_splits=split_k,
+        max_seqlen_kv=ctx,
+    )
+    reference = paged_reference(q, k, v, block_table, lengths, causal=True)
+
+    assert len(calls) == 1
+    torch.testing.assert_close(got.float(), reference, atol=2e-2, rtol=2e-2)
+
+
+def test_head_packed_rejects_mismatched_kv_shapes(monkeypatch):
+    _count_hp_calls(monkeypatch)
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, 1, 1024, 64)
+
+    with pytest.raises(ValueError, match="matching shapes"):
+        flydsl_flash_attn_func(
+            q,
+            k,
+            v[:-1],
+            causal=True,
+            num_kv_heads=HKV,
+            block_table=block_table,
+            seqlen_k=seqlen_k,
+            kv_cache_layout="linear",
+            num_kv_splits=1,
+            max_seqlen_kv=1024,
+        )
+
+
+def test_head_packed_runs_on_explicit_stream(monkeypatch):
+    calls = _count_hp_calls(monkeypatch)
+    q, k, v, block_table, seqlen_k = _paged_inputs(2, 2, 1024, 64)
+    reference = paged_reference(q, k, v, block_table, seqlen_k, causal=True)
+    out = torch.full_like(q, math.nan)
+    launch_stream = torch.cuda.Stream()
+    ready = torch.cuda.Event()
+    done = torch.cuda.Event()
+    ready.record(torch.cuda.current_stream())
+    launch_stream.wait_event(ready)
+
+    got = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=1,
+        max_seqlen_kv=1024,
+        out=out,
+        stream=launch_stream,
+    )
+    done.record(launch_stream)
+    torch.cuda.current_stream().wait_event(done)
+
+    assert len(calls) == 1
+    assert got.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(got.float(), reference, atol=2e-2, rtol=2e-2)
+
+
+def test_head_packed_cuda_graph_replays_metadata(monkeypatch):
+    calls = _count_hp_calls(monkeypatch)
+    B, Sq, ctx, D = 2, 1, 1024, 64
+    q, k, v, block_table, _ = _paged_inputs(B, Sq, ctx, D)
+    static_q = q.clone()
+    static_lengths = torch.tensor([ctx, ctx], device="cuda", dtype=torch.int32)
+
+    def attend():
+        return flydsl_flash_attn_func(
+            static_q,
+            k,
+            v,
+            causal=True,
+            num_kv_heads=HKV,
+            block_table=block_table,
+            seqlen_k=static_lengths,
+            kv_cache_layout="linear",
+            num_kv_splits=1,
+            max_seqlen_kv=ctx,
+        )
+
+    attend()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = attend()
+
+    graph.replay()
+    torch.cuda.synchronize()
+    first_reference = paged_reference(
+        static_q, k, v, block_table, static_lengths, causal=True
+    )
+    torch.testing.assert_close(captured.float(), first_reference, atol=2e-2, rtol=2e-2)
+
+    static_q.copy_(q * 0.5)
+    static_lengths.copy_(torch.tensor([ctx, ctx // 2], device="cuda"))
+    graph.replay()
+    torch.cuda.synchronize()
+    second_reference = paged_reference(
+        static_q, k, v, block_table, static_lengths, causal=True
+    )
+
+    assert len(calls) == 2
+    torch.testing.assert_close(captured.float(), second_reference, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("split_k", [128, 256])
+def test_head_packed_large_split_counts_match_reference(monkeypatch, split_k):
+    calls = _count_hp_calls(monkeypatch)
+    ctx, D = split_k * PAGE, 64
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, 1, ctx, D)
+    out = torch.empty_like(q)
+    got = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=split_k,
+        max_seqlen_kv=ctx,
+        out=out,
+    )
+    reference = paged_reference(q, k, v, block_table, seqlen_k, causal=True)
+
+    assert len(calls) == 1
+    assert got.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(got.float(), reference, atol=2e-2, rtol=2e-2)
+
+
+def test_empty_batch_returns_without_launching():
+    q = torch.empty(0, 1, H, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.empty(1, PAGE, HKV, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.empty_like(k)
+    block_table = torch.empty(0, 1, device="cuda", dtype=torch.int32)
+    seqlen_k = torch.empty(0, device="cuda", dtype=torch.int32)
+    out = torch.empty_like(q)
+
+    got = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=0,
+        max_seqlen_kv=PAGE,
+        out=out,
+    )
+
+    assert got.data_ptr() == out.data_ptr()
+    assert got.shape == q.shape
+    assert got.numel() == 0
+
+
+def test_query_grouping_clamps_empty_prefix(monkeypatch):
+    from mslk.attention.flydsl.decode import pa_decode_dense
+
+    launches = []
+
+    def fake_launch(q, _k, _v, seq_positions, *_args, kv_max, **_kwargs):
+        launches.append((kv_max, seq_positions.clone()))
+        return torch.zeros_like(q)
+
+    monkeypatch.setattr(
+        "mslk.attention.flydsl.decode.pa_decode_gfx950.pa_decode_gfx950_launch",
+        fake_launch,
+    )
+    q = torch.empty(1, 16, 1, H, 64, device="cuda", dtype=torch.bfloat16)
+    cache = torch.empty(1, PAGE, HKV, 64, device="cuda", dtype=torch.bfloat16)
+    pa_decode_dense.pa_decode_paged_launch(
+        q,
+        cache,
+        cache,
+        torch.zeros(1, 1, device="cuda", dtype=torch.int32),
+        torch.tensor([4], device="cuda", dtype=torch.int32),
+        64**-0.5,
+        page_size=PAGE,
+        max_seqlen_kv=4,
+        split_k=1,
+        output_dtype=torch.bfloat16,
+        query_groups=2,
+    )
+    assert [kv_max for kv_max, _ in launches] == [0, 4]
+    # The kernel bounds each group's length to [0, kv_max].
+    assert [min(max(int(length.item()), 0), kv_max) for kv_max, length in launches] == [
+        0,
+        4,
+    ]
