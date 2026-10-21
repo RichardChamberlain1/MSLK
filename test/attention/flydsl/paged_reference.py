@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 """Helpers shared by the FlyDSL paged attention tests: an fp32 reference over a
-paged KV cache and a call-recording spy."""
+paged KV cache, a call-recording spy and a wrong-stream detector."""
 
 import math
 
@@ -76,3 +76,22 @@ def spy(monkeypatch, owner, name):
 
     monkeypatch.setattr(owner, name, wrapper)
     return calls
+
+
+def run_on_busy_side_stream(run):
+    """Call ``run(stream)`` with a side stream while the current stream is held
+    busy, and return a copy of its result taken on that side stream.
+
+    The copy is only right if ``run`` launched on the stream it was given: a
+    kernel queued on the busy current stream has not run when the copy does.
+    """
+    side = torch.cuda.Stream()
+    torch.cuda._sleep(1 << 31)  # hold the current stream busy
+    got = run(side)
+    with torch.cuda.stream(side):
+        snapshot = got.clone()
+    side.synchronize()
+    still_busy = not torch.cuda.current_stream().query()
+    torch.cuda.synchronize()
+    assert still_busy, "the current stream finished first; the check proves nothing"
+    return snapshot
