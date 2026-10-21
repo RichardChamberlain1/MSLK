@@ -1194,6 +1194,8 @@ def _paged_auto_num_kv_splits(
         )
         if floor_pow2 <= affordable:
             splits = floor_pow2
+        elif floor <= affordable:
+            splits = floor
     return splits
 
 
