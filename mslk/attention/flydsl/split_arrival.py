@@ -43,11 +43,13 @@ _ZEROING_STREAMS: dict = {}
 
 
 def _zeroed(numel: int, device: torch.device) -> torch.Tensor:
-    """fp32 zeros. Under graph capture the zeroing runs right away on a side
-    stream rather than as a node of the graph being captured: a graph-owned
-    memset would leave every other graph that shares the buffer depending on
-    that one graph having run, and would cost every replay. The capture is
-    ordered after the zeroing."""
+    """fp32 zeros. Under graph capture the whole buffer is zeroed right away on
+    a side stream, so other graphs that share it do not depend on this one
+    having run; this graph also clears the counters itself, which orders its
+    own first replay after the zeroing. (Waiting on the side stream instead
+    would add a node every replay pays for, and an event cannot be queried
+    during capture; a later graph is captured and instantiated long after the
+    side stream's memset was queued.)"""
     buf = torch.empty(numel, dtype=torch.float32, device=device)
     if not torch.cuda.is_current_stream_capturing():
         buf.zero_()
@@ -57,9 +59,7 @@ def _zeroed(numel: int, device: torch.device) -> torch.Tensor:
         side = _ZEROING_STREAMS[device] = torch.cuda.Stream(device)
     with torch.cuda.stream(side):
         buf.zero_()
-    zeroed = torch.cuda.Event()
-    zeroed.record(side)
-    torch.cuda.current_stream().wait_event(zeroed)
+    buf[:ARRIVAL_COUNTERS].zero_()
     return buf
 
 
