@@ -33,26 +33,40 @@ ARRIVAL_COUNTERS = 1 << 16
 # invalidate the whole L2 per workgroup).
 CPOL_SC1 = 16
 
-# (device, stream) -> persistent workspace whose counters are zero between calls.
+# (device, stream) -> [workspace, used by a captured graph]. The counters are
+# zero between calls: every launch resets the ones it used.
 _WORKSPACES: dict = {}
-# Workspaces replaced by a larger one. A CUDA graph may have captured their
-# address, so they are never freed.
-_RETIRED: list = []
+# Workspaces a captured graph still addresses, kept alive for its replays.
+_GRAPH_HELD: list = []
 
 
 def arrival_workspace(elems: int, device: torch.device, stream: Any) -> torch.Tensor:
     """fp32 workspace of ARRIVAL_COUNTERS zeroed counters followed by `elems`.
 
-    Buffers are per stream so concurrent streams never share counters.
+    Buffers are per stream so concurrent streams never share counters. Under
+    CUDA graph capture a missing or too-small buffer is not grown in place:
+    the zeroing would then be a node of that one graph, leaving every other
+    user of the buffer with whatever its memory held. The graph gets a buffer
+    of its own instead. Graphs captured on one stream share its workspace, so
+    they must not be replayed concurrently.
     """
     key = (device, stream.cuda_stream)
     need = ARRIVAL_COUNTERS + elems
-    buf = _WORKSPACES.get(key)
-    if buf is None or buf.numel() < need:
-        if buf is not None:
-            _RETIRED.append(buf)
+    entry = _WORKSPACES.get(key)
+    capturing = torch.cuda.is_current_stream_capturing()
+    if entry is not None and entry[0].numel() >= need:
+        entry[1] = entry[1] or capturing
+        return entry[0]
+    if capturing:
         buf = torch.zeros(need, dtype=torch.float32, device=device)
-        _WORKSPACES[key] = buf
+        _GRAPH_HELD.append(buf)
+        return buf
+    if entry is not None and entry[1]:
+        _GRAPH_HELD.append(entry[0])
+    # Grow geometrically so a slowly growing batch does not reallocate per call.
+    size = max(need, 2 * entry[0].numel()) if entry is not None else need
+    buf = torch.zeros(size, dtype=torch.float32, device=device)
+    _WORKSPACES[key] = [buf, False]
     return buf
 
 
