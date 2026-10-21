@@ -970,6 +970,12 @@ def _make_swa_launcher(
     return _launcher
 
 
+def kv_span_elems(t: torch.Tensor) -> int:
+    """Elements addressed from t's base pointer, so a strided view of a larger
+    cache counts everything it can reach."""
+    return 1 + sum((n - 1) * st for n, st in zip(t.shape, t.stride()))
+
+
 def pa_decode_swa_supported(
     *,
     head_dim: int,
@@ -982,9 +988,11 @@ def pa_decode_swa_supported(
     kv_capacity: int = 0,
     num_waves: int = 1,
     num_splits: int = 1,
+    kv_span: int = 0,
 ) -> bool:
     """Shapes pa_decode_swa_launch handles. Full attention (window_left < 0)
-    needs kv_capacity, the most keys a request can hold."""
+    needs kv_capacity, the most keys a request can hold. kv_span is the larger
+    of kv_span_elems(k) and kv_span_elems(v): KV offsets are 32-bit."""
     ratio = num_heads // num_kv_heads if num_kv_heads else 0
     if not (ratio and num_heads % num_kv_heads == 0 and MFMA_M % ratio == 0):
         return False
@@ -1004,6 +1012,9 @@ def pa_decode_swa_supported(
         and dtype in (torch.float16, torch.bfloat16)
         and head_dim in (64, 128)
         and keys > 0
+        and num_waves >= 1
+        and num_splits >= 1
+        and kv_span < 2**31
         and page_size % TILE_N == 0
         and pages <= WARP_SIZE
         and -(-seqlen_q // t_pack) <= 2
@@ -1033,8 +1044,10 @@ def pa_decode_swa_launch(
 
     B, Sq, H_q, D = q.shape
     _, page_size, H_kv, _ = k.shape
-    assert k.numel() < 2**31 and v.numel() < 2**31, "32-bit KV offsets"
-    assert out.stride() == q.stride()
+    if max(kv_span_elems(k), kv_span_elems(v)) >= 2**31:
+        raise ValueError("pa_decode_swa_launch: KV cache exceeds 32-bit offsets")
+    if out.stride() != q.stride():
+        raise ValueError("pa_decode_swa_launch: out must have q's strides")
     kv_str = {torch.float16: "f16", torch.bfloat16: "bf16"}[k.dtype]
     merge_kernel = num_splits > _MAX_INKERNEL_SPLITS
     launcher = _make_swa_launcher(

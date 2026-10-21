@@ -893,6 +893,7 @@ _PAGED_SWA_KERNEL = True
 def _paged_swa_kernel_config(
     q,
     k,
+    v,
     causal,
     window_left,
     return_lse,
@@ -921,6 +922,13 @@ def _paged_swa_kernel_config(
         or seqlen_k is None
         or block_table is None
         or q.dim() != 4
+        or k.dim() != 4
+        or v.shape != k.shape
+        # The checks the other routes make later: page size, head dim.
+        or k.shape[1] != _PAGED_PAGE_SIZE
+        or k.shape[3] != q.shape[3]
+        # A caller-set split count is honoured by the generic kernel.
+        or num_kv_splits > 1
         or seqlen_k.dtype != torch.int32
         or not seqlen_k.is_contiguous()
         or block_table.dtype != torch.int32
@@ -928,7 +936,7 @@ def _paged_swa_kernel_config(
         or (out is not None and out.stride() != q.stride())
     ):
         return None
-    from .decode.pa_decode_swa import pa_decode_swa_supported
+    from .decode.pa_decode_swa import kv_span_elems, pa_decode_swa_supported
 
     B, Sq, H, D = q.shape
     H_kv = k.shape[2]
@@ -937,20 +945,25 @@ def _paged_swa_kernel_config(
     groups = B * H_kv
     m_tiles = -(-Sq // (16 // (H // H_kv)))
     cus = _dense_light_cu(q.device)
+    # Split counts are compiled in; powers of two keep the variants few.
+
+    def pow2_floor(n: int) -> int:
+        return 1 << (n.bit_length() - 1)
+
     # Splits bring the grid to about one CTA per CU.
-    splits = max(1, min(8, cus // groups))
+    splits = pow2_floor(max(1, min(8, cus // groups)))
     cfg = None
     if window_left < 0:
-        # Full attention over a few requests and moderate contexts (left to
-        # the generic kernel when the caller sets the split count): the CTAs
+        # Full attention over a few requests and moderate contexts: the CTAs
         # of a (request, KV head) split its keys, merged by the reduce kernel.
+        # With more groups than CUs there is nothing to split across.
         keys = block_table.shape[1] * k.shape[1]
-        if num_kv_splits > 1 or groups * keys > 1 << 18:
+        if groups > cus or groups * keys > 1 << 18:
             cfg = None
         elif m_tiles == 1:
-            cfg = (2, cus // groups)
+            cfg = (2, pow2_floor(cus // groups))
         elif m_tiles == 2 and D == 64:
-            cfg = (4, cus // groups)
+            cfg = (4, pow2_floor(cus // groups))
     elif m_tiles == 1:
         if D == 128:
             # Below cus/4 groups, 16 splits each merged by the reduce kernel.
@@ -976,6 +989,7 @@ def _paged_swa_kernel_config(
         kv_capacity=block_table.shape[1] * k.shape[1],
         num_waves=cfg[0],
         num_splits=cfg[1],
+        kv_span=max(kv_span_elems(k), kv_span_elems(v)),
     ):
         return None
     return cfg
@@ -1312,6 +1326,12 @@ def _flydsl_flash_attn_paged(
                 f"{q.device}, got {launch_stream.device}"
             )
 
+    requested_num_kv_splits = int(num_kv_splits)
+    if requested_num_kv_splits < 0:
+        raise ValueError(
+            "flydsl_flash_attn_func: num_kv_splits must be nonnegative, "
+            f"got {requested_num_kv_splits}"
+        )
     block_table_stride = int(block_table.shape[1])
     block_table_capacity = block_table_stride * int(
         k.shape[3] if vectorized else k.shape[1]
@@ -1348,6 +1368,7 @@ def _flydsl_flash_attn_paged(
     _swa_cfg = _paged_swa_kernel_config(
         q,
         k,
+        v,
         causal,
         window_left,
         return_lse,
@@ -1357,14 +1378,17 @@ def _flydsl_flash_attn_paged(
         seqlen_k,
         block_table,
         out,
-        num_kv_splits,
+        requested_num_kv_splits,
     )
     if _swa_cfg is not None:
         from .decode.pa_decode_swa import pa_decode_swa_launch
 
-        if out is None:
-            out = torch.empty_like(q)
         with torch.cuda.device(q.device.index), torch.cuda.stream(launch_stream):
+            if out is None:
+                # The kernel addresses out with q's strides.
+                out = torch.empty_strided(
+                    q.size(), q.stride(), dtype=q.dtype, device=q.device
+                )
             return pa_decode_swa_launch(
                 q,
                 k,
@@ -1509,12 +1533,6 @@ def _flydsl_flash_attn_paged(
     # path at large logits, so those route to light regardless of seqlen; bf16
     # non-causal keeps the faster dualwave kernel. Decided here (rather than at the
     # launch site) because split-K sizing depends on which kernel runs.
-    requested_num_kv_splits = int(num_kv_splits)
-    if requested_num_kv_splits < 0:
-        raise ValueError(
-            "flydsl_flash_attn_func: num_kv_splits must be nonnegative, "
-            f"got {requested_num_kv_splits}"
-        )
     _arch = _gpu_arch(q.device)
     _splitk_dtype_ok = D in (64, 128) and dtype_str in ("bf16", "f16")
     _paged_light_ok = (
