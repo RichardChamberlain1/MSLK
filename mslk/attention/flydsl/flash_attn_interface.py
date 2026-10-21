@@ -1532,18 +1532,24 @@ def _flydsl_flash_attn_paged(
             )
         )
     )
-    # 1 (the historical default) auto-sizes like 0 wherever split-K applies.
-    _auto_splits = requested_num_kv_splits == 0 or (
-        requested_num_kv_splits == 1 and _splitk_dtype_ok and not _gappy
-    )
 
     if varlen and not _varlen_uniform_q and requested_num_kv_splits > 1:
         raise NotImplementedError(
             "flydsl_flash_attn_func: paged split-K requires uniform varlen Q"
         )
+    _auto_sized = False
     if varlen and not _varlen_uniform_q:
         num_kv_splits = 1
-    elif _paged_light_ok and _auto_splits:
+    elif (
+        _paged_light_ok
+        and requested_num_kv_splits <= 1
+        and _splitk_dtype_ok
+        and not _gappy
+    ):
+        # Split-K is the lever on decode-shaped paged calls: each workgroup
+        # walks its whole KV range as a serial chain of dependent loads, so
+        # shortening the chain matters however idle the GPU is. No caller
+        # sizes the count for paged, so 1 is treated like the 0 sentinel.
         num_kv_splits = _paged_auto_num_kv_splits(
             B,
             H,
@@ -1556,6 +1562,7 @@ def _flydsl_flash_attn_paged(
             _gqa_packed,
             _dense_light_cu(q.device),
         )
+        _auto_sized = True
     elif requested_num_kv_splits <= 1:
         num_kv_splits = 1
     else:
@@ -1614,7 +1621,13 @@ def _flydsl_flash_attn_paged(
                     float(sm_scale) if sm_scale is not None else float(D**-0.5),
                     page_size=page_size,
                     max_seqlen_kv=skv,
-                    split_k=(0 if _auto_splits else int(num_kv_splits)),
+                    # A count sized for the light kernel's chain means nothing to
+                    # this kernel (and need not be a compiled power of two).
+                    split_k=(
+                        0
+                        if _auto_sized or requested_num_kv_splits == 0
+                        else int(num_kv_splits)
+                    ),
                     output_dtype=q.dtype,
                     query_groups=_hp_groups,
                 ).view(B, Sq, H, D)
@@ -1949,7 +1962,9 @@ def flydsl_flash_attn_func(
     block_table: Optional[torch.Tensor] = None,
     seqlen_k: Optional[torch.Tensor] = None,
     kv_cache_layout: str = "linear",
-    # Split-K (gfx950 only, seq_len >= 384, D=64/128, bf16/f16).
+    # Split-K (gfx950 only, D=64/128, bf16/f16). The dense path additionally
+    # requires seq_len >= 384. 0 and 1 = auto on the paged light route and a
+    # single pass elsewhere (see below), >1 = force that many splits.
     num_kv_splits: int = 0,
     # fp8 dense ABI: per-tensor descales for pre-quantized e4m3fn Q/K/V.
     q_descale: Optional[torch.Tensor] = None,
@@ -2013,9 +2028,14 @@ def flydsl_flash_attn_func(
         cross_seqlen: Whether seqlen_q and seqlen_kv differ. Required in varlen mode;
             dense mode infers it from ``q.shape[1] != k.shape[1]``.
         block_table / seqlen_k: vLLM-style 2D block table metadata.
-        num_kv_splits: For paged dense attention, 0 and 1 select the split count
-            automatically; values >1 request that exact count, and negative values
-            are invalid. Split-K requires gfx950, D=64/128, bf16/f16, and seq>=384.
+        num_kv_splits: Split-K factor. ``0`` (default) and ``1`` both mean auto
+            on the paged light route (D=64/128, bf16/f16, uniform-q, not
+            gappy): the split count is sized from KV-chain length by
+            ``_paged_auto_num_kv_splits``. Everywhere else they run a single pass,
+            except the dense non-paged path, which applies its own occupancy
+            heuristic. ``>1`` forces that many splits (gfx950 only, D=64/128,
+            bf16/f16; the dense non-paged path additionally requires seq>=384).
+            Negative values are invalid.
         q_descale / k_descale / v_descale: fp32 shape-[1] descales required
             for dense fp8 e4m3fn inputs.
         out: Optional pre-allocated output tensor. For fp8, output is bf16;
