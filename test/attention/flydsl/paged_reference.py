@@ -20,7 +20,8 @@ def paged_reference(q, k, v, block_table, lengths, causal, window_left=-1, start
     (default 0) of the row its ``block_table`` pages spell out; a zero-length
     request returns zeros. Masks are bottom-right aligned: query row ``i`` sits
     at ``pos = n - Sq + i``, ``causal`` keeps keys ``<= pos`` and
-    ``window_left >= 0`` keeps keys ``>= pos - window_left``.
+    ``window_left >= 0`` keeps keys ``>= pos - window_left``; a row that keeps
+    no key (``pos < 0``) is zeros, as the kernels write it.
     """
     batch, seqlen_q, num_heads, head_dim = q.shape
     page_size, num_kv_heads = k.shape[1], k.shape[2]
@@ -44,7 +45,7 @@ def paged_reference(q, k, v, block_table, lengths, causal, window_left=-1, start
             keep &= k_pos[None, :] <= q_pos[:, None]
         if window_left >= 0:
             keep &= k_pos[None, :] >= q_pos[:, None] - window_left
-        probs = scores.masked_fill(~keep, -math.inf).softmax(-1)
+        probs = scores.masked_fill(~keep, -math.inf).softmax(-1).nan_to_num(0.0)
         outputs.append(
             torch.einsum("ngtk,knd->tngd", probs, vb).reshape(
                 seqlen_q, num_heads, head_dim
