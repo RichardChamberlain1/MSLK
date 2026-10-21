@@ -38,35 +38,51 @@ CPOL_SC1 = 16
 _WORKSPACES: dict = {}
 # Workspaces a captured graph still addresses, kept alive for its replays.
 _GRAPH_HELD: list = []
+# device -> stream that zeroes workspaces created during graph capture.
+_ZEROING_STREAMS: dict = {}
+
+
+def _zeroed(numel: int, device: torch.device) -> torch.Tensor:
+    """fp32 zeros. Under graph capture the zeroing runs right away on a side
+    stream rather than as a node of the graph being captured: a graph-owned
+    memset would leave every other graph that shares the buffer depending on
+    that one graph having run, and would cost every replay. The capture is
+    ordered after the zeroing."""
+    buf = torch.empty(numel, dtype=torch.float32, device=device)
+    if not torch.cuda.is_current_stream_capturing():
+        buf.zero_()
+        return buf
+    side = _ZEROING_STREAMS.get(device)
+    if side is None:
+        side = _ZEROING_STREAMS[device] = torch.cuda.Stream(device)
+    with torch.cuda.stream(side):
+        buf.zero_()
+    zeroed = torch.cuda.Event()
+    zeroed.record(side)
+    torch.cuda.current_stream().wait_event(zeroed)
+    return buf
 
 
 def arrival_workspace(elems: int, device: torch.device, stream: Any) -> torch.Tensor:
     """fp32 workspace of ARRIVAL_COUNTERS zeroed counters followed by `elems`.
 
-    Buffers are per stream so concurrent streams never share counters. Under
-    CUDA graph capture a missing or too-small buffer is not grown in place:
-    the zeroing would then be a node of that one graph, leaving every other
-    user of the buffer with whatever its memory held. The graph gets a buffer
-    of its own instead. Graphs captured on one stream share its workspace, so
-    they must not be replayed concurrently.
+    Buffers are per stream so concurrent streams never share counters, and
+    grow geometrically so a slowly growing batch does not reallocate per call.
+    A buffer a captured graph used is kept alive when outgrown. Graphs captured
+    on one stream share its workspace, so they must not replay concurrently.
     """
     key = (device, stream.cuda_stream)
     need = ARRIVAL_COUNTERS + elems
-    entry = _WORKSPACES.get(key)
     capturing = torch.cuda.is_current_stream_capturing()
+    entry = _WORKSPACES.get(key)
     if entry is not None and entry[0].numel() >= need:
         entry[1] = entry[1] or capturing
         return entry[0]
-    if capturing:
-        buf = torch.zeros(need, dtype=torch.float32, device=device)
-        _GRAPH_HELD.append(buf)
-        return buf
     if entry is not None and entry[1]:
         _GRAPH_HELD.append(entry[0])
-    # Grow geometrically so a slowly growing batch does not reallocate per call.
     size = max(need, 2 * entry[0].numel()) if entry is not None else need
-    buf = torch.zeros(size, dtype=torch.float32, device=device)
-    _WORKSPACES[key] = [buf, False]
+    buf = _zeroed(size, device)
+    _WORKSPACES[key] = [buf, capturing]
     return buf
 
 
