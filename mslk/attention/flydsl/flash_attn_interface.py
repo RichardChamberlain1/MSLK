@@ -1225,8 +1225,8 @@ def _flydsl_flash_attn_paged(
     dualwave_swp_setprio: bool,
     dualwave_swp_enable_stagger: bool,
     stream,
-    # Sliding window, forwarded to the generic (light) paged kernel. Keyword
-    # with a default so the positional call sites above stay valid.
+    # Sliding window (exclusive left bound), forwarded to the generic (light)
+    # paged kernel and pa_decode_swa.
     window_left: int = -1,
 ) -> torch.Tensor:
     """Native paged-KV attention on the gfx950 dualwave kernel.
@@ -1234,10 +1234,12 @@ def _flydsl_flash_attn_paged(
     Supported config ONLY (anything else raises): linear/vectorized cache layout
     [NumBlocks, PageSize=64, NumKVHeads, HeadDim], vLLM lookup (block_table +
     seqlen_k), causal, D=64/128, dtype bf16/f16.
-    - Dense 4D Q ``[B, Sq, H, D]``: split-K supported at any Sq. ``num_kv_splits=0``
-      and ``1`` auto-size the count; ``>1`` forces.
+    - Dense 4D Q ``[B, Sq, H, D]``: split-K supported at any Sq. On the light
+      route ``num_kv_splits`` 0 and 1 size the count from KV-chain length
+      (``_paged_auto_num_kv_splits``); ``>1`` forces.
     - Varlen packed Q ``[total_q, H, D]`` (cu_seqlens_q given): paged K/V looked up
-      per kv-tile via block_table; split-K not supported (matches dense varlen).
+      per kv-tile via block_table; split-K only when every sequence has the same
+      query length.
     """
     if kv_cache_layout not in ("linear", "vectorized"):
         raise NotImplementedError(
@@ -1525,10 +1527,6 @@ def _flydsl_flash_attn_paged(
             f"flydsl_flash_attn_func: num_heads ({H}) must be divisible by num_kv_heads ({num_kv_heads})"
         )
 
-    # Split-K (paged, dense only): split the KV dimension across
-    # grid_z = B*num_kv_splits workgroups + a combine pass. Fills the GPU for
-    # low-occupancy shapes (small B / few heads), where single-split paged
-    # underutilizes the device.
     # ── route + split-K sizing ──────────────────────────────────────────────
     # Two paged kernels: the generic "light" one and the gfx950 dualwave one. The
     # dualwave paged softmax overflows for f16 (narrow exponent) and on the causal
@@ -1660,17 +1658,7 @@ def _flydsl_flash_attn_paged(
     # Split-K (paged, dense only): split the KV dimension across
     # grid_z = B*num_kv_splits workgroups + a combine pass. Fills the GPU for
     # low-occupancy shapes (small B / few heads), where single-split paged
-    # underutilizes the device.
-    #
-    # `_paged_num_kv_splits` above has already sized this for the paged routes it
-    # covers, by KV-chain length rather than occupancy -- a grid that fills every
-    # CU can still be latency-stalled, which occupancy cannot see. Only resolve
-    # the `0` sentinel for what it left alone; never overwrite a count it chose,
-    # which moves shapes off the light kernel onto dualwave, where non-tile-
-    # aligned seqlen_k mis-masks (1e-2, above bf16 eps).
-    if num_kv_splits == 0:
-        num_kv_splits = 1
-
+    # underutilizes the device. The count was resolved with the route above.
     max_pages_per_split = (max_kv_pages + int(num_kv_splits) - 1) // int(num_kv_splits)
     if max_pages_per_split > _PAGED_BT_LDS_SIZE:
         max_supported_kv = _PAGED_BT_LDS_SIZE * int(num_kv_splits) * page_size
