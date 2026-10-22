@@ -564,20 +564,24 @@ def test_explicit_max_seqlen_kv_bounds_each_request(causal, Sq):
 
 
 @pytest.mark.parametrize(
-    "route,Sq,varlen",
+    "route,Sq,varlen,causal",
     [
-        ("generic", 4, False),
-        ("generic", 16, True),
-        ("head_packed", 4, False),
-        ("pa_decode_swa", 1, False),
+        ("generic", 4, False, True),
+        ("generic", 16, True, True),
+        # Non-causal leaves an empty request's rows with no masked key to fall
+        # back on, so only the kernel's own empty-request store keeps them 0.
+        ("generic", 1, False, False),
+        ("head_packed", 4, False, True),
+        ("pa_decode_swa", 1, False, True),
     ],
 )
 @pytest.mark.parametrize("num_kv_splits", [0, 1, 4])
 def test_int32_lengths_are_bounded_in_kernel(
-    monkeypatch, route, Sq, varlen, num_kv_splits
+    monkeypatch, route, Sq, varlen, causal, num_kv_splits
 ):
     """int32 lengths reach the kernels unnormalized: each clamps a negative
-    length to 0, a long one to max_seqlen_kv, and writes an empty request as 0."""
+    length to 0, a long one to max_seqlen_kv, and writes an empty request as 0,
+    not NaN."""
     from mslk.attention.flydsl.decode import pa_decode_dense, pa_decode_swa
 
     if route == "pa_decode_swa":
@@ -590,6 +594,11 @@ def test_int32_lengths_are_bounded_in_kernel(
         calls = spy(monkeypatch, pa_decode_dense, "pa_decode_paged_launch")
     else:
         monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
+        if not causal:
+            # Auto-sizing splits even this short a walk, and a split partial
+            # guards an empty row itself; pin one split so the single-pass store
+            # is what writes it.
+            monkeypatch.setattr(fai, "_paged_auto_num_kv_splits", lambda *a, **kw: 1)
         calls = spy(monkeypatch, fai, "_build_paged_light")
     ctx, D = 512, 64
     bound = ctx - PAGE
@@ -612,14 +621,25 @@ def test_int32_lengths_are_bounded_in_kernel(
             max_seqlen_q=Sq,
             max_seqlen_kv=bound,
             cross_seqlen=True,
+            causal=causal,
         )
         ref = _paged_varlen_reference(
-            q_packed, cu_q, k, v, block_table, bounded, causal=True
+            q_packed, cu_q, k, v, block_table, bounded, causal=causal
         )
     else:
-        got = _run(q, k, v, block_table, seqlen_k, num_kv_splits, max_seqlen_kv=bound)
-        ref = paged_reference(q, k, v, block_table, bounded, causal=True)
+        got = _run(
+            q,
+            k,
+            v,
+            block_table,
+            seqlen_k,
+            num_kv_splits,
+            max_seqlen_kv=bound,
+            causal=causal,
+        )
+        ref = paged_reference(q, k, v, block_table, bounded, causal=causal)
     assert len(calls) == 1
+    assert not got.isnan().any()
     torch.testing.assert_close(got.float(), ref, atol=2e-2, rtol=2e-2)
 
 
