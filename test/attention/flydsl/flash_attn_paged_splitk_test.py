@@ -1353,6 +1353,32 @@ def test_window_sized_splits_do_not_exceed_tile_or_configured_caps(monkeypatch):
     assert by_tile_cap == 1
 
 
+@pytest.mark.parametrize("window", [-1, 2047])
+@pytest.mark.parametrize("seqlen_q", [1, 16])
+def test_default_split_count_runs_past_one_block_table_window(window, seqlen_q):
+    """``num_kv_splits=1`` past one split's block-table window is auto-sized."""
+    ctx, head_dim = 262144, 64
+    assert ctx // PAGE > fai._PAGED_BT_LDS_SIZE
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, seqlen_q, ctx, head_dim)
+    got = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=1,
+        max_seqlen_kv=ctx,
+        window_left=window,
+    )
+    reference = paged_reference(
+        q, k, v, block_table, seqlen_k, causal=True, window_left=window
+    )
+    torch.testing.assert_close(got.float(), reference, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("seqlen_q", [1, 16])
 def test_paged_window_rejects_noncausal(monkeypatch, seqlen_q):
     monkeypatch.setattr(
