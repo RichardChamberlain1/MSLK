@@ -677,6 +677,23 @@ class FP8Tests(unittest.TestCase):
             )
 
     @skipUnlessRocm()
+    def test_gemm_rowwise_weight_at_reused_address(self) -> None:
+        # Each weight is freed just before the next is quantized, and no other
+        # tensor here has its size, so the allocator hands the new weight the
+        # old one's address; every result must still come from its own weight.
+        M, K, N = 128, 256, 1024
+        wq = None
+        for _ in range(3):
+            x = torch.randn((M, K), dtype=torch.bfloat16, device=self.device)
+            w = torch.randn((N, K), dtype=torch.bfloat16, device=self.device)
+            xq, x_scale = quantize_fp8_row(x)
+            del wq
+            wq, w_scale = quantize_fp8_row(w)
+            out = torch.ops.mslk.f8f8bf16_rowwise(xq, wq, x_scale, w_scale)
+            ref = (xq.float() @ wq.float().T) * x_scale[:, None] * w_scale[None, :]
+            torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+
+    @skipUnlessRocm()
     def test_grouped_gemm_single_cta_group_boundary(self) -> None:
         device_max_groups = torch.cuda.get_device_properties(
             self.device
