@@ -137,9 +137,8 @@ def _wave_splitk_shapes():
     (``test_auto_splitk_matches_single_split[0-128-1-1]``, which is not repeated).
 
     The gate turns on for packed-GQA decode at HEAD_DIM >= 128 over a full
-    context, so it covers every GQA ratio and both 16-bit dtypes -- a far wider
-    set than the benchmark suite, which only ever runs 32 query heads over 4 KV
-    heads in bf16. The ratio matters because the gate's
+    context, so it covers every GQA ratio and both 16-bit dtypes. The ratio
+    matters because the gate's
     ``q_pack_group * q_pack_qlen <= rows_per_wave`` bound is what keeps a wave's
     share of the packed rows addressable; the dtype and head dim matter because
     they set how much MFMA work each tile carries against the merge's fixed cost.
