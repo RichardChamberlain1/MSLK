@@ -2123,6 +2123,13 @@ def flydsl_flash_attn_func(
             raise NotImplementedError(
                 "flydsl_flash_attn_func: sliding-window paged KV requires causal=True"
             )
+        if not causal:
+            # apply_kv_mask bounds the window inside its causal branch only, so a
+            # non-causal dense/varlen call would silently get full attention.
+            raise NotImplementedError(
+                "flydsl_flash_attn_func: sliding-window (window_left>=0) requires "
+                "causal=True"
+            )
         if paged_kv and kv_seqstart is not None:
             # Gappy paged builds a different KV index space; the window bound is
             # expressed in flat KV columns and would not line up.
