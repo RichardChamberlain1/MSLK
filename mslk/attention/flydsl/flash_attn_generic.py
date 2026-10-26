@@ -1226,7 +1226,14 @@ def build_flash_attn_func_module_primary(
         )
 
         def _pad_dispatch(*args, **kwargs):
+            # The mask being skipped bounds KV columns, so the KV length decides.
+            # seq_len is the Q length; a cross-length launch passes seq_len_kv.
             S_int = _extract_seq_len(args, kwargs)
+            if kwargs.get("seq_len_kv") is not None:
+                try:
+                    S_int = int(kwargs["seq_len_kv"])
+                except (TypeError, ValueError):
+                    S_int = None
             if S_int is not None and S_int % 64 == 0:
                 return _launch_skip(*args, **kwargs)
             return _launch_mask(*args, **kwargs)
