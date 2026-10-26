@@ -132,6 +132,9 @@ def _dense_generic_tile(
 
 # Generic split-K uses BLOCK_M=64, so the "mtile" (Q rows per workgroup) is 64.
 _GENERIC_SPLITK_BLOCK_M = 64
+# Cross length splits once the KV walk pays for the combine launch: measured
+# 2.9-3.6x faster at Skv~4096 and ~8us slower at Skv~1000 (2x8 heads, Sq=128).
+_CROSS_SPLITK_MIN_KV = 2048
 
 
 def _generic_splitk_list(i: int) -> int:
@@ -2477,7 +2480,7 @@ def flydsl_flash_attn_func(
                     _gen_splits = 1
                     if (
                         not _has_dropout
-                        and not cross
+                        and (not cross or Skv >= _CROSS_SPLITK_MIN_KV)
                         and D in (64, 128, 256)
                         and dtype_str in ("bf16", "f16")
                     ):
