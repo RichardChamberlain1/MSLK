@@ -1673,6 +1673,12 @@ def _make_flash_attn_generic_traits(
         and os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_GFX942_VEC_K", "1") == "1"
     )
     enable_lds_vec16 = os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "1") == "1"
+    # 16-wide row loads at a small head dim and a large workgroup (D=64 at 512
+    # threads) cover more rows per batch than BLOCK_N. That layout needs a
+    # runtime row guard, which the cooperative KV loaders write as a Python `if`
+    # and cannot trace; 8-wide loads cover exactly BLOCK_N rows instead.
+    if enable_lds_vec16 and block_size // max(head_dim // 16, 1) > block_n:
+        enable_lds_vec16 = False
     reduce_mode = os.getenv("FLYDSL_FLASH_ATTN_FUNC_REDUCE_MODE", "xor").strip().lower()
     if reduce_mode not in ("xor", "ds_bpermute"):
         reduce_mode = "xor"
