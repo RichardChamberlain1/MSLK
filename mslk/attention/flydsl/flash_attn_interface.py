@@ -2286,6 +2286,24 @@ def flydsl_flash_attn_func(
                 f"flydsl_flash_attn_func: split-K requires D=64/128, dtype bf16/f16, seq_len>=384; "
                 f"got D={D}, dtype={dtype_str}, seq_len={Sq}"
             )
+        # The dualwave split-K launcher is built and launched without any of
+        # these, so they would be silently dropped (cross length: wrong result).
+        _dropped = [
+            name
+            for name, on in (
+                ("window_left", window_left >= 0),
+                ("sm_scale", sm_scale is not None),
+                ("bias", bias is not None),
+                ("dropout_mask", dropout_mask is not None),
+                ("seq_len_q != seq_len_kv", cross),
+            )
+            if on
+        ]
+        if _dropped:
+            raise NotImplementedError(
+                "flydsl_flash_attn_func: explicit num_kv_splits>1 (dualwave split-K) "
+                f"does not support {', '.join(_dropped)}; use num_kv_splits=0"
+            )
         ws_elems = dualwave_splitk_workspace_elems(
             B, H, Sq, int(num_kv_splits), head_dim=D
         )
