@@ -217,6 +217,7 @@ def _build_dense(
     has_bias: bool = False,
     has_dropout: bool = False,
     num_kv_splits: int = 1,
+    causal_top_left: bool = False,
 ):
     """Build (and cache) one dense generic launcher variant."""
     from .flash_attn_generic import build_flash_attn_func_module
@@ -239,6 +240,7 @@ def _build_dense(
         has_bias=has_bias,
         has_dropout=has_dropout,
         num_kv_splits=num_kv_splits,
+        causal_top_left=causal_top_left,
     )
 
 
@@ -2447,6 +2449,9 @@ def flydsl_flash_attn_func(
                 _custom_scale = sm_scale is not None
                 _has_bias = bias is not None
                 _has_dropout = dropout_mask is not None
+                # Top-left only differs from the default bottom-right alignment
+                # when the lengths differ; keep self-attention on one build.
+                _top_left = causal and cross and causal_top_left
                 if (
                     not _windowed
                     and not _custom_scale
@@ -2512,6 +2517,7 @@ def flydsl_flash_attn_func(
                             has_bias=_has_bias,
                             has_dropout=_has_dropout,
                             num_kv_splits=_gen_splits,
+                            causal_top_left=_top_left,
                         )
                     else:
                         block_m, flat_work_group_size, path_tag = _dense_generic_tile(
@@ -2534,6 +2540,7 @@ def flydsl_flash_attn_func(
                             sm_scale=sm_scale,
                             has_bias=_has_bias,
                             has_dropout=_has_dropout,
+                            causal_top_left=_top_left,
                         )
 
         # ── allocate output ─────────────────────────────────────────────────
