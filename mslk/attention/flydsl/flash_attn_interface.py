@@ -54,6 +54,8 @@ _DTYPE_MAP = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float8_e4m3fn:
 
 # Short varlen/paged cases use the lightweight generic path.
 _VARLEN_LIGHT_MAX_SEQ = 256
+# Head dims the generic kernel builds (see the check in flydsl_flash_attn_func).
+_GENERIC_HEAD_DIMS = (64, 128, 256)
 _DENSE_LIGHT_CU_FALLBACK = 256
 _DENSE_DUALWAVE_MIN_SEQ = 256
 _DENSE_DUALWAVE_LARGE_BATCH = 8
@@ -2087,6 +2089,15 @@ def flydsl_flash_attn_func(
     if return_lse and dtype_str == "fp8":
         raise NotImplementedError(
             "flydsl_flash_attn_func: return_lse is not supported for fp8"
+        )
+    # The generic kernel's cooperative loads need BLOCK_SIZE % (D / vec) == 0,
+    # which only these head dims meet; other multiples of 32 (96, 160, 192, 224)
+    # die in an assert at build time, and dualwave varlen takes only 64/128.
+    # fmha.flydsl.FwOp pads up to one of these.
+    if q.shape[-1] not in _GENERIC_HEAD_DIMS:
+        raise ValueError(
+            f"flydsl_flash_attn_func: head_dim must be one of {_GENERIC_HEAD_DIMS}, "
+            f"got {q.shape[-1]}; zero-pad Q/K/V up to the next one"
         )
     # LSE support for paged KV depends on which kernel the shape routes to: the
     # generic light path (paged-gappy, or short-q / gfx942 native paged) produces
