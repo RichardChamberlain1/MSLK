@@ -9,8 +9,9 @@
 
 """Common helpers shared by kernel modules.
 
-Keep helper naming consistent with other kernel helpers (e.g. `mfma_preshuffle_pipeline.py`),
-but this module is intentionally small and MLIR-dialect facing.
+Keep helper naming consistent with other kernel helpers (for example,
+`mfma_preshuffle_pipeline.py`), but keep this module small and MLIR-dialect
+facing.
 """
 
 from contextlib import contextmanager
@@ -25,9 +26,33 @@ from flydsl._mlir.dialects import (
     llvm as _llvm,
     scf as _scf,
 )
-from flydsl.expr import arith as _expr_arith, buffer_ops, const_expr
+from flydsl.expr import arith as _expr_arith, const_expr
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
+from mslk.flydsl import buffer_ops
+
+
+def default_f8_type():
+    """The FP8 element type this GPU's MFMAs take: e4m3fn on gfx95*/gfx12*,
+    e4m3fnuz on gfx94*. Stands in for FlyDSL 0.2.4's ``T.f8``, which 0.4.0
+    dropped. gfx11* has no FP8 instructions, so it fails here instead of in
+    instruction selection."""
+    try:
+        arch = str(get_rocm_arch())
+    except Exception as error:
+        raise RuntimeError(
+            "default_f8_type(): unable to determine the ROCm architecture"
+        ) from error
+    if "gfx95" in arch or "gfx12" in arch:
+        return fx.Float8E4M3FN.ir_type
+    if arch.startswith("gfx94"):
+        return fx.Float8E4M3FNUZ.ir_type
+    if arch.startswith("gfx11"):
+        raise RuntimeError(
+            f"default_f8_type(): no native FP8 support on {arch}; FP8 "
+            "instructions are available on gfx94*, gfx95* and gfx12*."
+        )
+    raise RuntimeError(f"default_f8_type(): unsupported ROCm architecture {arch}")
 
 
 def get_llvm_ptr(ptr, offset, dtype_bytes, ptr_type=None):
