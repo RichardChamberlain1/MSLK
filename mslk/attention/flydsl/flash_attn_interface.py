@@ -2206,6 +2206,13 @@ def flydsl_flash_attn_func(
         num_kv_splits = 1
 
     if dtype_str == "fp8":
+        # _build_dense_fp8 compiles a D=128 kernel whatever the input: D=64 reads
+        # and writes past each row, D=256 drops half of it.
+        if q.shape[-1] != 128:
+            raise NotImplementedError(
+                "flydsl_flash_attn_func: fp8 flash_attn supports head_dim=128 only, "
+                f"got {q.shape[-1]}"
+            )
         if varlen:
             raise NotImplementedError(
                 "flydsl_flash_attn_func: fp8 flash_attn does not support varlen"
