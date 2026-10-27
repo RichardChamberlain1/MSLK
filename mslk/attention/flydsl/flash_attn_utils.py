@@ -458,6 +458,24 @@ def _score_pair_sum(v_s, zero_f, fm_fast):
     )
 
 
+def _scaled_sub_score_pair(v_s, scale, row_max, fm_fast):
+    """s * scale - row_max per score, one FMA each (raw scores, scaled row max)."""
+    s_lo, s_hi = v_s
+    neg_max = _fsub(fx.Float32(0.0), row_max, fm_fast)
+    lo = [
+        as_mlir_value(fmath.fma(s_lo[r], scale, neg_max, fastmath=fm_fast))
+        for r in range_constexpr(16)
+    ]
+    hi = [
+        as_mlir_value(fmath.fma(s_hi[r], scale, neg_max, fastmath=fm_fast))
+        for r in range_constexpr(16)
+    ]
+    return (
+        Vec.from_elements(lo, fx.Float32).ir_value(),
+        Vec.from_elements(hi, fx.Float32).ir_value(),
+    )
+
+
 def _sub_score_pair(v_s, row_max, fm_fast):
     s_lo, s_hi = v_s
     lo_sub = []
@@ -1063,8 +1081,8 @@ def _q_pack_global_idx(traits, q_row_in_block, ks, lane_div_32, stride_q_n_v):
     )
 
 
-def _get_q_pack(traits, q_all_scaled_bf16, ks):
-    q_vec = Vec(q_all_scaled_bf16)
+def _get_q_pack(traits, q_all_bf16, ks):
+    q_vec = Vec(q_all_bf16)
     base = ks * traits.MFMA_LANE_K
     return q_vec.shuffle(
         q_vec, [base + i for i in range(traits.MFMA_LANE_K)]
@@ -5170,44 +5188,18 @@ class DualwaveQLoader(DualwaveKernelContext):
         )
         return Vec(q_all, (traits.K_STEPS_QK * traits.MFMA_LANE_K,), self.elem_dtype)
 
-    def scale_all(self, q_all_bf16):
-        traits = self.traits
-        fm_fast_attr = ir.Attribute.parse("#llvm.fastmath<fast>")
-        v64bf16_type = Vec.make_type(
-            traits.K_STEPS_QK * traits.MFMA_LANE_K, self.elem_dtype
-        )
-        v64f32_type = Vec.make_type(traits.K_STEPS_QK * traits.MFMA_LANE_K, fx.Float32)
-        q_all_f32_op = llvm.FPExtOp(v64f32_type, as_mlir_value(q_all_bf16))
-        q_all_f32_op.operation.attributes["fastmathFlags"] = fm_fast_attr
-        q_all_f32 = q_all_f32_op.result
-        scale_vec = Vec.from_elements([self.c_sm_scale_log2e], fx.Float32).broadcast_to(
-            traits.K_STEPS_QK * traits.MFMA_LANE_K
-        )
-        q_all_scaled_f32 = arith.mulf(
-            as_mlir_value(scale_vec),
-            as_mlir_value(q_all_f32),
-            fastmath=self.fm_fast,
-        )
-        q_all_scaled_bf16_op = llvm.FPTruncOp(v64bf16_type, q_all_scaled_f32)
-        q_all_scaled_bf16_op.operation.attributes["fastmathFlags"] = fm_fast_attr
-        q_all_scaled_bf16 = q_all_scaled_bf16_op.result
-        return Vec(
-            q_all_scaled_bf16,
-            (traits.K_STEPS_QK * traits.MFMA_LANE_K,),
-            self.elem_dtype,
-        )
-
 
 class DualwaveGemmHelper(DualwaveKernelContext):
     def __init__(self, ctx):
         super().__init__(ctx)
 
-    def qk(self, v_k, q_all_scaled_bf16):
+    def qk(self, v_k, q_all_bf16):
+        """Raw scores Q·K (fp32): the softmax helper applies sm_scale * log2(e)."""
         k_lo, k_hi = v_k
         v_s_lo = self.c_zero_v16f32
         v_s_hi = self.c_zero_v16f32
         for ks in range_constexpr(self.traits.K_STEPS_QK):
-            q_pack = _get_q_pack(self.traits, q_all_scaled_bf16, ks)
+            q_pack = _get_q_pack(self.traits, q_all_bf16, ks)
             v_s_lo = _mfma_acc(
                 k_lo[ks], q_pack, v_s_lo, self.mma_atom, self.mfma_acc_vec_type
             )
@@ -5236,11 +5228,23 @@ class DualwaveGemmHelper(DualwaveKernelContext):
 
 
 class DualwaveSoftmaxHelper(DualwaveKernelContext):
+    """Online softmax in the log2 domain. Q stays exact in bf16, so scores arrive raw:
+    reduce_max returns the row max already scaled by sm_scale * log2(e) (m_row, the
+    lazy threshold, LSE and split-K partials are all in that domain), and sub_m
+    scales each score in the FMA that subtracts the max. Pre-scaling Q instead
+    rounds sm_scale * log2(e) * Q back to bf16, which costs accuracy at large logits.
+    """
+
     def __init__(self, ctx):
         super().__init__(ctx)
 
     def reduce_max(self, v_s):
-        return _score_pair_max(v_s, self.c_neg_inf, self.fm_fast)
+        # sm_scale * log2(e) > 0, so the max of the scaled scores is the scaled max.
+        return _fmul(
+            _score_pair_max(v_s, self.c_neg_inf, self.fm_fast),
+            self.c_sm_scale_log2e,
+            self.fm_fast,
+        )
 
     def floor_masked_max(self, row_max):
         return _fmax(row_max, self.c_neg_floor, self.fm_fast)
@@ -5260,7 +5264,7 @@ class DualwaveSoftmaxHelper(DualwaveKernelContext):
         )
 
     def sub_m(self, v_s, row_max):
-        return _sub_score_pair(v_s, row_max, self.fm_fast)
+        return _scaled_sub_score_pair(v_s, self.c_sm_scale_log2e, row_max, self.fm_fast)
 
     def cast_p(self, v_p):
         return _pack_p_v8_slices(
@@ -5293,7 +5297,10 @@ class DualwaveSoftmaxHelper(DualwaveKernelContext):
         return v_o, m_new, l_row, v_p
 
     def _lazy_rescale_o_rescale(self, _n, *_st, v_o, m_row, l_row, m_tile_max, v_p):
-        corr = rocdl.exp2(T.f32, as_mlir_value(_fsub(m_row, m_tile_max, self.fm_fast)))
+        # The branch is taken wave-wide (ballot), so a lane can get here with a tile
+        # max far below its running max: never lower it, or exp2 overflows to Inf.
+        m_new = _fmax(m_row, m_tile_max, self.fm_fast)
+        corr = rocdl.exp2(T.f32, as_mlir_value(_fsub(m_row, m_new, self.fm_fast)))
         scaled_accs = list(v_o)
         self.scale_o(scaled_accs, corr)
         out = [as_mlir_value(scaled_accs[dc]) for dc in range(self.traits.D_CHUNKS)]
@@ -5306,7 +5313,7 @@ class DualwaveSoftmaxHelper(DualwaveKernelContext):
         )
         out.append(_v_p_to_vec32(scaled_p))
         out.append(as_mlir_value(_fmul(l_row, corr, self.fm_fast)))
-        out.append(_anchor_scalar_f32(m_tile_max))
+        out.append(_anchor_scalar_f32(m_new))
         return out
 
     def lazy_rescale_o(self, v_o, m_row, l_row, m_tile_max, v_p):
@@ -5846,8 +5853,8 @@ class DualwaveStoreHelper(DualwaveKernelContext):
     def store_lse_from_ml(self, m_row, l_row, q_row):
         """Convert dualwave's log2-domain (m_row, l_row) to natural-log LSE and store it.
 
-        ``m_row`` is already ``sm_scale * log2(e)``-scaled (Q was pre-scaled before the
-        QK matmul), so ``m_row * ln2 + ln(l_row)`` is the natural-log LSE.
+        ``m_row`` is already ``sm_scale * log2(e)``-scaled (DualwaveSoftmaxHelper
+        scales the row max), so ``m_row * ln2 + ln(l_row)`` is the natural-log LSE.
         """
         ln2 = 1.0 / _LOG2E
         lse_val = _fadd(
@@ -6651,8 +6658,10 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
             if fx.Boolean(all_below):
                 pass
             else:
+                # Taken wave-wide (ballot): never lower a lane's running max.
+                m_new = _fmax(m_row, m_tile_max, self.fm_fast)
                 corr = rocdl.exp2(
-                    T.f32, as_mlir_value(_fsub(m_row, m_tile_max, self.fm_fast))
+                    T.f32, as_mlir_value(_fsub(m_row, m_new, self.fm_fast))
                 )
                 scaled_accs = list(v_o)
                 self.scale_o(scaled_accs, corr)
@@ -6664,7 +6673,7 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
                 )
                 vp_out = self.v_p_to_vec32(self.scale_v_p(v_p, corr))
                 l_out = as_mlir_value(_fmul(l_row, corr, self.fm_fast))
-                m_out = self.anchor_scalar_f32(m_tile_max)
+                m_out = self.anchor_scalar_f32(m_new)
             return ([o0, o1, o2, o3], m_out, l_out, self.v_vec32_to_p(vp_out))
 
         return _run(v_o, m_row, l_row, m_tile_max, v_p)
