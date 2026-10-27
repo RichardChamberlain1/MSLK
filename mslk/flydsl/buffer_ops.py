@@ -12,8 +12,9 @@
 
 """AMD Buffer Load/Store Operations - High-level Python API
 
-This module provides high-level Python wrappers for AMD CDNA3/CDNA4 buffer operations.
-Buffer operations use a scalar base pointer and per-thread offsets for efficient memory access.
+This module provides high-level Python wrappers for AMD CDNA3/CDNA4 buffer
+operations. Buffer operations use a scalar base pointer and per-thread offsets
+for efficient memory access.
 
 Example:
     >>> from flydsl._mlir_helpers import buffer_ops
@@ -286,8 +287,8 @@ class BufferResourceDescriptor:
             memref_val: Memref value to create descriptor for
             stride: Stride in elements (0 for contiguous)
             max_size: If True, use max buffer size for flexibility
-            num_records_bytes: Override buffer size (in BYTES) used by hardware OOB checking.
-                              If provided, this takes precedence over `max_size`.
+            num_records_bytes: Override buffer size (in BYTES) used by hardware
+                OOB checking. If provided, this takes precedence over `max_size`.
             base_byte_offset: Optional byte offset added to the descriptor base pointer.
             data_format: Data format ('f32', 'f16', 'i32', etc.)
 
@@ -312,7 +313,7 @@ class BufferResourceDescriptor:
         stride_val = _create_i16_constant(stride)
 
         def _num_records_from_memref_type() -> Optional[int]:
-            """Best-effort: derive logical buffer size (in bytes) from static memref type."""
+            """Derive logical byte size from the static memref type, if possible."""
             try:
                 mt = ir.MemRefType(_unwrap_value(memref_val).type)
                 shape = list(mt.shape)
@@ -493,14 +494,15 @@ def buffer_load(
         dtype: Element data type (None for f32, or ir.F32Type, etc.)
         mask: Optional mask for predicated load (i1 type)
         cache_modifier: Cache control flags (0 for default)
-        soffset_bytes: Optional scalar offset (in BYTES) added by the buffer instruction (soffset).
-                      Use this to fold small constant deltas into the instruction instead of emitting
-                      extra VGPR address arithmetic.
-        is_scalar: Emit a uniform/SGPR scalar load (llvm.amdgcn.s.buffer.load) instead of the
-                      vector buffer load. Use only for wave-uniform addresses to route through the
-                      SMEM cache and land the result directly in SGPRs. Restricted to vec_width 1 or 4;
-                      dtype is forced to i32 (the result is raw i32 dwords). mask and soffset_bytes
-                      are not supported in this mode and raise ValueError if provided.
+        soffset_bytes: Optional scalar offset (in BYTES) added by the buffer
+            instruction (soffset). Use this to fold small constant deltas into
+            the instruction instead of emitting extra VGPR address arithmetic.
+        is_scalar: Emit a uniform/SGPR scalar load
+            (llvm.amdgcn.s.buffer.load) instead of the vector buffer load. Use
+            only for wave-uniform addresses to route through the SMEM cache and
+            land the result directly in SGPRs. Restricted to vec_width 1 or 4;
+            dtype is forced to i32 (the result is raw i32 dwords). mask and
+            soffset_bytes are unsupported and raise ValueError if provided.
 
     Returns:
         Loaded data (scalar or vector depending on vec_width)

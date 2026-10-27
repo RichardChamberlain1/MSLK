@@ -982,10 +982,10 @@ def make_lds_loader(*, lds_a, layout_lds, k_blocks16):
     which loads 16B from LDS with the XOR16 swizzle and returns the two
     i64 halves.
 
-    The load is of 16 raw bytes -- `default_f8_type()` names the LDS arena's byte element
-    type, not the dtype of the data -- so this is the same for every input
-    dtype. What differs downstream is how much of a pack one MFMA consumes:
-    see `make_compute_tile`.
+    The load is of 16 raw bytes -- `default_f8_type()` names the LDS arena's
+    byte element type, not the dtype of the data -- so this is the same for
+    every input dtype. What differs downstream is how much of a pack one MFMA
+    consumes: see `make_compute_tile`.
     """
 
     def lds_load_packs_k64(curr_row_a_lds, col_base_bytes, lds_base):
