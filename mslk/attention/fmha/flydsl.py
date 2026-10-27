@@ -173,7 +173,8 @@ _PAGED_BIAS_TYPES = (
     PagedBlockDiagonalPaddedKeysMask,
     PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
 )
-_PAGED_HEAD_DIMS = (64, 128)
+# 96 runs with only Q padded: the kernel reads the cache at its own head dim.
+_PAGED_HEAD_DIMS = (64, 96, 128)
 # The generic paged kernel tiles KV at PAGE_SIZE == BLOCK_N == 64; paged-gappy
 # reshapes any physical page_size to 64-row sub-pages (see _apply_bmhk).
 _KERNEL_PAGE_SIZE = 64
@@ -545,6 +546,10 @@ class FwOp(AttentionFwOpBase):
             kw["block_table"] = bt
             kw["seqlen_k"] = seqlen_k
             kw["kv_cache_layout"] = "linear"
+            if inp.scale is None:
+                # Not padded here (pad=False), so there is no scale to pin; the
+                # paged kernel applies 1/sqrt(D) of the real head dim itself.
+                kw.pop("sm_scale", None)
             out, lse = _run(q, k, v, pad=False)
         elif isinstance(bias, _PADDED_GAPPY_BIAS_TYPES):
             # Padded/gappy KV: pass the ORIGINAL K/V store (no repack) plus a per-seq

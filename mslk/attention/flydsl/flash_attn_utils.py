@@ -1408,6 +1408,10 @@ class FlashAttnGenericTraits:
     HEAD_STRIDE_VEC: int
     STRIDE_TOKEN_Q: int
     STRIDE_TOKEN_KV: int
+    # Head dim of K/V in memory. Below HEAD_DIM (a padded build, e.g. D=96 run
+    # at 128), K/V are read at this width and the tail columns load as zeros, so
+    # a paged cache never has to be copied out to a padded one.
+    KV_HEAD_DIM: int
     K_STRIDE: int
     K_SWZ_ROWMASK: int
     VT_STRIDE: int
@@ -1519,6 +1523,7 @@ class FlashAttnGenericTraits:
             self.HEAD_STRIDE_VEC,
             self.STRIDE_TOKEN_Q,
             self.STRIDE_TOKEN_KV,
+            self.KV_HEAD_DIM,
             self.K_STRIDE,
             self.K_SWZ_ROWMASK,
             self.VT_STRIDE,
@@ -1593,8 +1598,21 @@ def _make_flash_attn_generic_traits(
     high_concurrency=False,
     fused_combine=False,
     paged_pid_regs=False,
+    kv_head_dim=None,
 ):
     """Build compile-time traits for ``flash_attn_generic``."""
+    kv_head_dim = head_dim if kv_head_dim is None else int(kv_head_dim)
+    # A padded build reads K/V through the plain cooperative loaders only, which
+    # mask the tail columns; the DMA, prefetch and vectorized loaders do not.
+    kv_padded = kv_head_dim != head_dim
+    if kv_padded:
+        assert 0 < kv_head_dim < head_dim and kv_head_dim % 32 == 0, (
+            f"kv_head_dim ({kv_head_dim}) must be a multiple of 32 below head_dim ({head_dim})"
+        )
+        assert kv_cache_layout == "linear", "padded K/V needs the linear layout"
+        path_tag = "N32"
+        paged_kv_dma = False
+        paged_k_prefetch = False
     block_n = 64
     k_sub_n = 32
     warp_size = 64
@@ -1626,6 +1644,7 @@ def _make_flash_attn_generic_traits(
 
     enable_prefetch_3buf = (
         os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_PREFETCH3", "0") == "1"
+        and not kv_padded
     )
     if fused_combine and return_lse:
         raise ValueError("the fused split-K combine does not produce LSE")
@@ -1633,13 +1652,16 @@ def _make_flash_attn_generic_traits(
     enable_gfx942_dma = gpu_arch.startswith("gfx942") and (
         os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_GFX942_DMA", "0") == "1"
     )
-    enable_dma = enable_gfx942_dma or (
-        has_lds_load_b128
-        and (
-            path == "N128"
-            or (os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_DMA", "0") == "1")
+    enable_dma = (
+        enable_gfx942_dma
+        or (
+            has_lds_load_b128
+            and (
+                path == "N128"
+                or (os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_DMA", "0") == "1")
+            )
         )
-    )
+    ) and not kv_padded
     if paged:
         # Paged DMA supports the linear, non-gappy layout only.
         paged_dma_ok = (
@@ -1651,6 +1673,7 @@ def _make_flash_attn_generic_traits(
         enable_dma = paged_dma_ok and (enable_dma or paged_kv_dma)
     enable_gfx942_kv_gpfetch = (
         gpu_arch.startswith("gfx942")
+        and not kv_padded
         and not enable_prefetch_3buf
         and (not enable_dma or enable_gfx942_dma)
         and os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_KV_GPFETCH", "1") == "1"
@@ -1729,11 +1752,11 @@ def _make_flash_attn_generic_traits(
     kv_vectorized = paged and (kv_cache_layout == "vectorized")
     kv_vec_size = 8
     page_size = block_n
-    page_stride_vec = num_kv_heads * head_dim * page_size
-    head_stride_vec = head_dim * page_size
+    page_stride_vec = num_kv_heads * kv_head_dim * page_size
+    head_stride_vec = kv_head_dim * page_size
 
     stride_token_q = num_heads * head_dim
-    stride_token_kv = num_kv_heads * head_dim
+    stride_token_kv = num_kv_heads * kv_head_dim
     _k_pad_default = 4 if (gpu_arch.startswith("gfx942") and not enable_dma) else 0
     _k_pad = int(os.getenv("FLYDSL_FLASH_ATTN_FUNC_K_PAD", str(_k_pad_default)))
     k_stride = head_dim + _k_pad
@@ -1886,6 +1909,7 @@ def _make_flash_attn_generic_traits(
         HEAD_STRIDE_VEC=head_stride_vec,
         STRIDE_TOKEN_Q=stride_token_q,
         STRIDE_TOKEN_KV=stride_token_kv,
+        KV_HEAD_DIM=kv_head_dim,
         K_STRIDE=k_stride,
         K_SWZ_ROWMASK=k_swz_rowmask,
         VT_STRIDE=vt_stride,
@@ -2901,7 +2925,7 @@ class GenericFlashAttnContext:
         traits = self.traits
         return (
             token_idx * traits.STRIDE_TOKEN_KV
-            + self.kv_head_idx * traits.HEAD_DIM
+            + self.kv_head_idx * traits.KV_HEAD_DIM
             + col
         )
 
@@ -3087,6 +3111,22 @@ class GenericKvGmemToLdsLoader:
     def load_f16xN(self, rsrc, base_idx):
         return self.ctx.load_global_f16xN(rsrc, base_idx)
 
+    def load_kv_vec(self, ptr, row_idx, col):
+        """VEC_WIDTH elements of K/V row ``row_idx`` from column ``col``. In a
+        padded build (KV_HEAD_DIM < HEAD_DIM) columns past KV_HEAD_DIM read as
+        zeros: KV_HEAD_DIM is a multiple of 32, so a vector is wholly in or out,
+        and an out vector loads column 0 of the same row, which is in bounds."""
+        traits = self.ctx.traits
+        if const_expr(traits.KV_HEAD_DIM == traits.HEAD_DIM):
+            return self.load_f16xN(ptr, self.global_idx(row_idx, col))
+        inside = col < fx.Index(traits.KV_HEAD_DIM)
+        vec = self.load_f16xN(
+            ptr, self.global_idx(row_idx, inside.select(col, fx.Index(0)))
+        )
+        elem = self.ctx.elem_dtype
+        zero = Vec.filled(traits.VEC_WIDTH, fx.Float32(0.0).to(elem), elem)
+        return arith.select(inside, as_mlir_value(vec), as_mlir_value(zero))
+
     def load_vectorized_k(self, k_ptr, page_id, kv_row, col):
         ctx = self.ctx
         traits = ctx.traits
@@ -3182,14 +3222,15 @@ class GenericKvGmemToLdsLoader:
             row_idx = self._kv_row_idx(pid, tile_start, row + row_offset)
             if const_expr(traits.KV_NEEDS_GUARD):
                 if row < fx.Index(traits.BLOCK_N):
-                    g_idx = self.global_idx(row_idx, col)
                     lds_row = row + row_offset
                     lds_idx = (
                         k_base
                         + lds_row * traits.K_STRIDE
                         + self.k_swizzle(lds_row, col)
                     )
-                    Vec(self.load_f16xN(ctx.k_ptr, g_idx)).store(lds_kv, [lds_idx])
+                    Vec(self.load_kv_vec(ctx.k_ptr, row_idx, col)).store(
+                        lds_kv, [lds_idx]
+                    )
             else:
                 lds_row = row + row_offset
                 lds_idx = (
@@ -3200,7 +3241,7 @@ class GenericKvGmemToLdsLoader:
                         ctx.k_ptr, pid, self.sigma_kv(lds_row), col
                     )
                 else:
-                    vec = self.load_f16xN(ctx.k_ptr, self.global_idx(row_idx, col))
+                    vec = self.load_kv_vec(ctx.k_ptr, row_idx, col)
                 Vec(vec).store(lds_kv, [lds_idx])
 
     def zero_k_global_vecs(self):
@@ -3225,9 +3266,7 @@ class GenericKvGmemToLdsLoader:
             row_idx = self._kv_row_idx(
                 pid, tile_start, ctx.load_row_in_batch + row_offset
             )
-            vecs.append(
-                self.load_f16xN(ctx.k_ptr, self.global_idx(row_idx, ctx.load_col_base))
-            )
+            vecs.append(self.load_kv_vec(ctx.k_ptr, row_idx, ctx.load_col_base))
         return vecs
 
     def coop_store_k_lds(self, vecs, buf_id=0):
@@ -3280,9 +3319,10 @@ class GenericKvGmemToLdsLoader:
             row_idx = self._kv_row_idx(pid, tile_start, row + row_offset)
             if const_expr(traits.KV_NEEDS_GUARD):
                 if row < fx.Index(traits.BLOCK_N):
-                    g_idx = self.global_idx(row_idx, col)
                     self._v_store_to_lds(
-                        v_base, row + row_offset, self.load_f16xN(ctx.v_ptr, g_idx)
+                        v_base,
+                        row + row_offset,
+                        self.load_kv_vec(ctx.v_ptr, row_idx, col),
                     )
             else:
                 lds_row = row + row_offset
@@ -3291,7 +3331,7 @@ class GenericKvGmemToLdsLoader:
                         ctx.v_ptr, pid, self.sigma_kv(lds_row), col
                     )
                 else:
-                    vec = self.load_f16xN(ctx.v_ptr, self.global_idx(row_idx, col))
+                    vec = self.load_kv_vec(ctx.v_ptr, row_idx, col)
                 self._v_store_to_lds(v_base, lds_row, vec)
 
     def coop_load_v_global(self, tile_start, pid=None):
@@ -3325,9 +3365,7 @@ class GenericKvGmemToLdsLoader:
             row_idx = self._kv_row_idx(
                 pid, tile_start, ctx.load_row_in_batch + row_offset
             )
-            vecs.append(
-                self.load_f16xN(ctx.v_ptr, self.global_idx(row_idx, ctx.load_col_base))
-            )
+            vecs.append(self.load_kv_vec(ctx.v_ptr, row_idx, ctx.load_col_base))
         return vecs
 
     def coop_store_v_lds(self, vecs, buf_id=0):
@@ -3367,9 +3405,7 @@ class GenericKvGmemToLdsLoader:
         pid = self._tile_page_id(tile_start) if traits.PAGED else None
         for r in range_constexpr(ctx.vp_rows_per_thread):
             row_idx = self._kv_row_idx(pid, tile_start, ctx.vp_row_base + r)
-            vecs.append(
-                self.load_f16xN(ctx.v_ptr, self.global_idx(row_idx, ctx.vp_col_base))
-            )
+            vecs.append(self.load_kv_vec(ctx.v_ptr, row_idx, ctx.vp_col_base))
         return vecs
 
     def coop_store_v_lds_perm(self, vecs, buf_id=0):

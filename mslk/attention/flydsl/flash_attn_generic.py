@@ -91,12 +91,17 @@ def build_flash_attn_func_module_primary(
     high_concurrency=False,
     fused_combine=False,
     paged_pid_regs=False,
+    kv_head_dim=None,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
     ``num_heads`` is the Q/O head count. For GQA/MQA, pass a smaller
     ``num_kv_heads``; each group of ``num_heads // num_kv_heads`` Q heads shares
     one K/V head. Dense launches accept any positive ``seq_len``.
+
+    ``kv_head_dim`` (default ``head_dim``) is K/V's head dim in memory. A smaller
+    value runs the kernel at ``head_dim`` with Q/O already padded to it, reading
+    K/V at their own width with the tail zeroed (see FlashAttnGenericTraits).
     """
     gpu_arch = get_hip_arch()
 
@@ -145,6 +150,7 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
+            kv_head_dim=kv_head_dim,
         )
         _launcher_m256 = build_flash_attn_func_module_primary(
             num_heads,
@@ -174,6 +180,7 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
+            kv_head_dim=kv_head_dim,
         )
         _bs_threshold = (
             2048 * num_heads if gpu_arch.startswith("gfx942") else 4096 * num_heads
@@ -278,6 +285,7 @@ def build_flash_attn_func_module_primary(
         high_concurrency=high_concurrency,
         fused_combine=fused_combine,
         paged_pid_regs=paged_pid_regs,
+        kv_head_dim=kv_head_dim,
     )
     # Threads per combine block; a block is the unit of CU assignment, so this
     # sets how many workgroups the combine launches. One wave per block spreads
@@ -1194,6 +1202,7 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
+            kv_head_dim=kv_head_dim,
         )
         _launch_mask = build_flash_attn_func_module_primary(
             num_heads,
@@ -1223,6 +1232,7 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
+            kv_head_dim=kv_head_dim,
         )
 
         def _pad_dispatch(*args, **kwargs):
