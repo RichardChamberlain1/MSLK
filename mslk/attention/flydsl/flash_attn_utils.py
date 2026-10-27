@@ -2857,16 +2857,21 @@ class GenericFlashAttnContext:
             )
         else:
             self.kv_upper = self.seqlen_kv_b
+            if const_expr(traits.WINDOW_LEFT >= 0):
+                # A non-causal window keeps only its left bound, at the same
+                # bottom-right alignment: query row i sits at KV position
+                # i + seqlen_kv - seqlen_q.
+                self.delta_i32 = fx.Int32(self.seqlen_kv_b) - fx.Int32(self.seqlen_q_b)
 
         # Sliding-window lower bound: KV tiles whose highest column is still below
         # the window's left edge for the LOWEST q row in this tile are fully masked,
         # so start the KV loop past them. Keep kv_col > q_row + delta - WINDOW_LEFT;
         # the first survivable column across the tile is at q_start (min q row), so
-        # skip whole BLOCK_N_OUT tiles below it. Window implies causal (delta set).
+        # skip whole BLOCK_N_OUT tiles below it. Causal or not, delta is set.
         # Packed rows carry query position t = row % Q_PACK_QLEN, and any tile can
         # hold t = 0, so the lowest q position is 0 rather than q_start.
         self.kv_lower = fx.Index(0)
-        if const_expr(traits.WINDOW_LEFT >= 0 and traits.CAUSAL):
+        if const_expr(traits.WINDOW_LEFT >= 0):
             step_w = fx.Index(traits.BLOCK_N_OUT)
             q_lo_i32 = (
                 fx.Int32(0)
@@ -4110,6 +4115,24 @@ class GenericSoftmaxHelper:
                 masked[2 * r + 1] for r in range(16)
             ]
 
+        # Non-causal window: only the left bound, keep kv_col > q_pos - WINDOW_LEFT
+        # (q_pos = q_row + delta). Tiles wholly right of the block's lowest edge skip
+        # the selects; tiles wholly left of it were never loaded (kv_lower).
+        if const_expr(traits.WINDOW_LEFT >= 0):
+            col_base_i32, moff = self._kv_mask_lane_off(half_start_i32)
+            q_hi_i32 = fx.Int32(ctx.q_start + traits.BLOCK_M) + ctx.delta_i32
+            needs_win = kv_start_i32 < q_hi_i32 - fx.Int32(traits.WINDOW_LEFT)
+            win_edge_i32 = ctx.q_row_i32 + ctx.delta_i32 - fx.Int32(traits.WINDOW_LEFT)
+            for r in range_constexpr(16):
+                kv_col = col_base_i32 + fx.Int32(moff[r])
+                masked_lo = (kv_col <= win_edge_i32).select(ctx.c_neg_inf, s_raw_lo[r])
+                s_raw_lo[r] = needs_win.select(masked_lo, s_raw_lo[r])
+                if const_expr(not half_only):
+                    masked_hi = (
+                        kv_col + fx.Int32(traits.K_SUB_N) <= win_edge_i32
+                    ).select(ctx.c_neg_inf, s_raw_hi[r])
+                    s_raw_hi[r] = needs_win.select(masked_hi, s_raw_hi[r])
+
         # Non-causal: mask physical KV columns outside seqlen so tail rows stay out of softmax.
         seq_len_i32 = fx.Int32(ctx.seqlen_kv_b)
         if const_expr(not traits.SKIP_KV_PAD_MASK):
@@ -4160,8 +4183,9 @@ class GenericSoftmaxHelper:
         m_new_raw = _fmax(m_running, row_max, fm_fast)
         # Clamp the running max off -inf so a fully-masked row (all scores -inf)
         # avoids -inf-(-inf)=NaN; finalize emits 0 for that l_final==0 row. Applies
-        # to causal (below-diagonal rows) and bias (a row of all -inf columns).
-        if const_expr(traits.CAUSAL or traits.HAS_BIAS):
+        # to causal (below-diagonal rows), bias (a row of all -inf columns) and a
+        # window (tiles left of a row's window edge).
+        if const_expr(traits.CAUSAL or traits.HAS_BIAS or traits.WINDOW_LEFT >= 0):
             m_new_raw = _fmax(m_new_raw, ctx.c_neg_floor, fm_fast)
 
         diff_m_scaled = _fmul(
@@ -4587,7 +4611,9 @@ class GenericStoreHelper:
         # Fully-masked row has l_final == 0 -> rcp*0 = NaN; emit 0 instead (matches
         # CK). Rows can be fully masked under causal, an all -inf bias row, or an
         # empty paged request.
-        if const_expr(traits.CAUSAL or traits.HAS_BIAS or traits.PAGED):
+        if const_expr(
+            traits.CAUSAL or traits.HAS_BIAS or traits.PAGED or traits.WINDOW_LEFT >= 0
+        ):
             inv_l = (fx.Float32(l_final) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
         else:
             inv_l = inv_l_rcp

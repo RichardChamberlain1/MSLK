@@ -2083,7 +2083,10 @@ def flydsl_flash_attn_func(
     # shape [B, H, Sq]; varlen: [B, H, max_seqlen_q]). Not supported for fp8/paged KV.
     return_lse: bool = False,
     # Sliding-window, flash-attention convention: keep KV in
-    # [q_row - window_left, q_row] (window_left + 1 keys); -1 disables.
+    # [q_row - window_left, q_row] (window_left + 1 keys); -1 disables. Non-causal
+    # (dense/varlen) keeps only the left bound: KV >= q_row - window_left, i.e.
+    # flash-attention's window_size=(window_left, -1). Rows are bottom-right
+    # aligned (q_row counts from seqlen_kv - seqlen_q).
     window_left: int = -1,
     # Softmax scale (None -> 1/sqrt(head_dim)); non-default forces the generic path.
     sm_scale: Optional[float] = None,
@@ -2218,13 +2221,6 @@ def flydsl_flash_attn_func(
         if paged_kv and not causal:
             raise NotImplementedError(
                 "flydsl_flash_attn_func: sliding-window paged KV requires causal=True"
-            )
-        if not causal:
-            # apply_kv_mask bounds the window inside its causal branch only, so a
-            # non-causal dense/varlen call would silently get full attention.
-            raise NotImplementedError(
-                "flydsl_flash_attn_func: sliding-window (window_left>=0) requires "
-                "causal=True"
             )
         if paged_kv and kv_seqstart is not None:
             # Gappy paged builds a different KV index space; the window bound is
