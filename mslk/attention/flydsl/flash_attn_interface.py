@@ -114,16 +114,12 @@ def _dense_generic_tile(
     head_dim: int,
     dtype_str: str,
     device: torch.device,
-    has_bias: bool = False,
 ):
     if head_dim in (64, 128) and dtype_str in ("bf16", "f16"):
         main_blocks = batch * num_heads * ((seq_len + 127) // 128)
         if main_blocks < _dense_light_cu(device):
-            # Additive bias forces the N32 path and reloads the bias plane per Q
-            # tile; the block_m=64 light tile reloads it twice as often, so prefer
-            # block_m=128 when bias is present (ties at small S, wins at large S).
-            if has_bias:
-                return 128, 256, "N32"
+            # Bias too: block_m=128 halves an already-underfilled grid and is
+            # 1.2-1.5x slower than this tile at every measured shape.
             return 64, 128, "N32"
     if num_heads >= 32 and batch * seq_len >= _DENSE_M256_MIN_TOKENS:
         return 256, 512, "auto"
@@ -135,6 +131,10 @@ _GENERIC_SPLITK_BLOCK_M = 64
 # Cross length splits once the KV walk pays for the combine launch: measured
 # 2.9-3.6x faster at Skv~4096 and ~8us slower at Skv~1000 (2x8 heads, Sq=128).
 _CROSS_SPLITK_MIN_KV = 2048
+# Dropout splits under the same floor, except at D>=128, where the keep-mask
+# gather makes each KV tile dear enough to pay from ~1000 keys (cross 128x1000:
+# 0.53-0.85x at D=128, 1.09x at D=64; Skv=100/384 self-attention 1.02-1.30x).
+_DROPOUT_SPLITK_MIN_KV = 1000
 
 
 def _generic_splitk_list(i: int) -> int:
@@ -2487,12 +2487,18 @@ def flydsl_flash_attn_func(
                     )
                 else:
                     # Generic split-K for short-q dense self-attention that underfills
-                    # the GPU: BLOCK_M=64, gated by CK's occupancy heuristic. Dropout
-                    # disables it (matches CK); bias/window/scale compose fine.
+                    # the GPU: BLOCK_M=64, gated by CK's occupancy heuristic. Bias,
+                    # window, scale and dropout compose: dropout is an explicit keep
+                    # mask indexed by absolute KV column, applied after l/LSE (no
+                    # philox offsets to split, unlike CK), so the combine is exact.
                     _gen_splits = 1
+                    _split_min_kv = 0
+                    if _has_dropout and D >= 128:
+                        _split_min_kv = _DROPOUT_SPLITK_MIN_KV
+                    elif _has_dropout or cross:
+                        _split_min_kv = _CROSS_SPLITK_MIN_KV
                     if (
-                        not _has_dropout
-                        and (not cross or Skv >= _CROSS_SPLITK_MIN_KV)
+                        Skv >= _split_min_kv
                         and D in (64, 128, 256)
                         and dtype_str in ("bf16", "f16")
                     ):
@@ -2528,7 +2534,7 @@ def flydsl_flash_attn_func(
                         )
                     else:
                         block_m, flat_work_group_size, path_tag = _dense_generic_tile(
-                            B, Sq, H, D, dtype_str, q.device, has_bias=_has_bias
+                            B, Sq, H, D, dtype_str, q.device
                         )
                         exe = _build_dense(
                             num_heads=H,
