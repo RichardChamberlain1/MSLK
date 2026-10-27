@@ -2136,6 +2136,8 @@ def flydsl_flash_attn_func(
             except the dense non-paged path, which applies its own occupancy
             heuristic. ``>1`` forces that many splits (gfx950 only, D=64/128,
             bf16/f16; the dense non-paged path additionally requires seq>=384).
+            Dense calls with a window, custom sm_scale, bias, dropout or cross
+            length run the forced count on the generic kernel's split-K.
             Negative values are invalid.
         q_descale / k_descale / v_descale: fp32 shape-[1] descales required
             for dense fp8 e4m3fn inputs.
@@ -2428,6 +2430,9 @@ def flydsl_flash_attn_func(
     # generic_splitk is chosen internally per-shape (below); it uses the generic
     # BLOCK_M=64 kernel + dense combine, distinct from the dualwave `splitk` above.
     generic_splitk = False
+    # An explicit split count the dualwave split-K cannot honour (see below) runs
+    # on the generic split-K instead.
+    _forced_generic_splits = 0
 
     # ── split-K eligibility guard (SKIP analogous to run_splitk_config) ────
     if splitk:
@@ -2449,15 +2454,22 @@ def flydsl_flash_attn_func(
             )
             if on
         ]
-        if _dropped:
+        if _dropped and varlen:
             raise NotImplementedError(
-                "flydsl_flash_attn_func: explicit num_kv_splits>1 (dualwave split-K) "
+                "flydsl_flash_attn_func: explicit num_kv_splits>1 on varlen "
                 f"does not support {', '.join(_dropped)}; use num_kv_splits=0"
             )
-        ws_elems = dualwave_splitk_workspace_elems(
-            B, H, Sq, int(num_kv_splits), head_dim=D
-        )
-        _validate_splitk_workspace_descriptor(H, Sq, D, int(num_kv_splits))
+        if _dropped:
+            # The generic kernel's split-K applies every one of these (its combine
+            # is exact for them), so run the requested count there.
+            _forced_generic_splits = int(num_kv_splits)
+            _validate_splitk_workspace_descriptor(H, Sq, D, _forced_generic_splits)
+            splitk = False
+        else:
+            ws_elems = dualwave_splitk_workspace_elems(
+                B, H, Sq, int(num_kv_splits), head_dim=D
+            )
+            _validate_splitk_workspace_descriptor(H, Sq, D, int(num_kv_splits))
 
     # ── build (cached) ──────────────────────────────────────────────────────
     debug_lazy = debug_counts is not None
@@ -2611,14 +2623,15 @@ def flydsl_flash_attn_func(
                     # window, scale and dropout compose: dropout is an explicit keep
                     # mask indexed by absolute KV column, applied after l/LSE (no
                     # philox offsets to split, unlike CK), so the combine is exact.
-                    _gen_splits = 1
+                    _gen_splits = _forced_generic_splits or 1
                     _split_min_kv = 0
                     if _has_dropout and D >= 128:
                         _split_min_kv = _DROPOUT_SPLITK_MIN_KV
                     elif _has_dropout or cross:
                         _split_min_kv = _CROSS_SPLITK_MIN_KV
                     if (
-                        Skv >= _split_min_kv
+                        not _forced_generic_splits
+                        and Skv >= _split_min_kv
                         and D in (64, 128, 256)
                         and dtype_str in ("bf16", "f16")
                     ):

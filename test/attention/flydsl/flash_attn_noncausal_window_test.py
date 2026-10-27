@@ -86,7 +86,9 @@ def test_dense_noncausal_window_lse_scale_bias():
     kf, vf = k.float(), v.float()
     s = torch.einsum("bqhd,bkhd->bhqk", q.float(), kf) * 0.1 + bias.float()
     pos = torch.arange(384, device="cuda")[:, None]
-    s = s.masked_fill(~(torch.arange(384, device="cuda")[None, :] >= pos - 64), -math.inf)
+    s = s.masked_fill(
+        ~(torch.arange(384, device="cuda")[None, :] >= pos - 64), -math.inf
+    )
     _close(out, torch.einsum("bhqk,bkhd->bqhd", torch.softmax(s, -1), vf))
     assert (lse - torch.logsumexp(s, -1)).abs().max().item() < 1e-2
 
