@@ -1951,12 +1951,21 @@ def _flash_attn_padded_head_dim(call_args: dict, d: int, d_run: int):
             "flydsl_flash_attn_func: explicit num_kv_splits needs head_dim 64 or "
             f"128, got {d}"
         )
+    if a["debug_counts"] is not None:
+        # Only dualwave counts, and it hardcodes 1/sqrt(head_dim): it would
+        # either drop the pinned scale or never fill the counts.
+        raise NotImplementedError(
+            f"flydsl_flash_attn_func: debug_counts needs head_dim 64 or 128, got {d}"
+        )
+    out = a["out"]
     with _on_stream(a["stream"]):
         for name in ("q", "k", "v"):
             a[name] = _pad_head_dim_to(a[name], d_run)
+        # Allocate the scratch output on the launch stream: it is freed on
+        # return, after being written and read only there.
+        a["out"] = torch.empty_like(a["q"])
     if a["sm_scale"] is None:
         a["sm_scale"] = d**-0.5
-    out, a["out"] = a["out"], None
     res = flydsl_flash_attn_func(**a)
     return _unpad_head_dim(res, d, out, a["return_lse"], a["stream"])
 

@@ -77,6 +77,22 @@ def test_dense_padded_head_dim_lse_scale_and_out():
     assert (lse - ref_lse).abs().max().item() < 1e-2
 
 
+def test_dense_padded_head_dim_side_stream():
+    """A caller's noncurrent stream: the padded scratch lives on that stream."""
+    torch.manual_seed(0)
+    q = torch.randn(2, 512, 8, 96, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    out = flydsl_flash_attn_func(q, k, v, causal=True, stream=side)
+    # Churn the current stream's allocator while the side stream may still run.
+    junk = [torch.full_like(q, float("nan")) for _ in range(4)]
+    torch.cuda.current_stream().wait_stream(side)
+    del junk
+    _close(out, _reference(q, k, v, True)[0])
+
+
 def test_varlen_padded_head_dim():
     torch.manual_seed(0)
     lens = [1, 31, 65, 300]
@@ -160,6 +176,7 @@ def test_paged_padded_head_dim_reads_cache_in_place(
     [
         ({}, 80, ValueError),  # not a multiple of 32
         ({}, 288, ValueError),  # above 256
+        ({"debug_counts": True}, 96, NotImplementedError),  # dualwave-only
         ({"paged": "linear"}, 192, NotImplementedError),  # paged runs D <= 128
         ({"paged": "vectorized"}, 96, NotImplementedError),
     ],
@@ -167,8 +184,11 @@ def test_paged_padded_head_dim_reads_cache_in_place(
 def test_head_dim_rejections(kw, D, exc):
     q = torch.randn(1, 4, 8, D, device="cuda", dtype=torch.bfloat16)
     if "paged" not in kw:
+        extra = {}
+        if kw.get("debug_counts"):
+            extra["debug_counts"] = torch.zeros(2, device="cuda")
         with pytest.raises(exc):
-            flydsl_flash_attn_func(q, q, q, causal=True)
+            flydsl_flash_attn_func(q, q, q, causal=True, **extra)
         return
     if kw["paged"] == "vectorized":
         kvs = 8
