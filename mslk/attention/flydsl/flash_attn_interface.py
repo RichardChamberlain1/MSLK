@@ -129,12 +129,10 @@ def _dense_generic_tile(
 
 # Generic split-K uses BLOCK_M=64, so the "mtile" (Q rows per workgroup) is 64.
 _GENERIC_SPLITK_BLOCK_M = 64
-# Cross length splits once the KV walk pays for the combine launch: measured
-# 2.9-3.6x faster at Skv~4096 and ~8us slower at Skv~1000 (2x8 heads, Sq=128).
+# Cross length splits once the KV walk pays for the combine launch
 _CROSS_SPLITK_MIN_KV = 2048
 # Dropout splits under the same floor, except at D>=128, where the keep-mask
-# gather makes each KV tile dear enough to pay from ~1000 keys (cross 128x1000:
-# 0.53-0.85x at D=128, 1.09x at D=64; Skv=100/384 self-attention 1.02-1.30x).
+# gather makes each KV tile dear enough to pay from ~1000 keys.
 _DROPOUT_SPLITK_MIN_KV = 1000
 
 
@@ -2385,11 +2383,6 @@ def flydsl_flash_attn_func(
             )
             if on
         ]
-        if _dropped and varlen:
-            raise NotImplementedError(
-                "flydsl_flash_attn_func: explicit num_kv_splits>1 on varlen "
-                f"does not support {', '.join(_dropped)}; use num_kv_splits=0"
-            )
         if _dropped:
             # The generic kernel's split-K applies every one of these (its combine
             # is exact for them), so run the requested count there.
