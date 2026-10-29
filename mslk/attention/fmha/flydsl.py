@@ -84,10 +84,11 @@ from .utils.op_common import get_operator, register_operator
 
 # ============================ Forward op (flydslF) ============================
 # Wraps ``mslk.attention.flydsl.flydsl_flash_attn_func`` as a drop-in for
-# ``ck.FwOp``: bf16/f16, head_dim in [1, 256] (non-native dims zero-padded to
-# {64,128,256}), causal/non-causal self-attention, additive tensor bias,
-# sliding-window, varlen, padded/gappy keys, paged KV, all 18 attn_bias types,
-# BMHK and BMGHK. Gradients dispatch to the native BwOp below (or ck.BwOp).
+# ``ck.FwOp``: bf16/f16, head dims in [1, 256] (value may differ from query;
+# non-native dims masked in-kernel), causal/non-causal self-attention, additive
+# tensor bias, sliding-window, varlen, padded/gappy keys, paged KV, all 18
+# attn_bias types, BMHK and BMGHK. Gradients dispatch to the native BwOp below
+# (or ck.BwOp).
 
 # Causal mask types (LowerTriangularMaskWithTensorBias is causal + tensor bias).
 _CAUSAL_BIAS_TYPES = (
@@ -132,8 +133,9 @@ _BOTTOM_RIGHT_CAUSAL_TYPES = (
 # Varlen-local (windowed) top-left type; drives causal_top_left.
 _VARLEN_WINDOW_TOPLEFT_TYPES = (BlockDiagonalCausalLocalAttentionMask,)
 
-# Head dims the kernel builds natively; other dims in [1, 256] are zero-padded up to
-# the next value here (padded Q/K add 0 to QK; padded V columns are sliced off O).
+# Head dims the kernel builds natively; other dims in [1, 256] compute at the next
+# value here with the missing columns masked in-kernel (paged-gappy pads them with
+# a copy instead: padded Q/K add 0 to QK; padded V columns are sliced off O).
 _SUPPORTED_HEAD_DIMS = (64, 128, 256)
 
 
@@ -210,7 +212,7 @@ class FwOp(AttentionFwOpBase):
     OPERATOR = staticmethod(_is_flydsl_available)
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.half, torch.bfloat16}
-    # Any dim in [1, 256]; non-native dims are padded (see _pad_head_dim).
+    # Any dims in [1, 256]; non-native dims are masked in-kernel (see _apply_bmhk).
     SUPPORTED_MAX_K = 256
     SUPPORTED_MIN_K = 1
 
@@ -237,7 +239,7 @@ class FwOp(AttentionFwOpBase):
 
     SUPPORTS_DROPOUT = True
     SUPPORTS_CUSTOM_SCALE = True
-    SUPPORTS_DIFFERENT_VALUE_EMBED = False
+    SUPPORTS_DIFFERENT_VALUE_EMBED = True
     SUPPORTS_BMGHK = True
     SUPPORTS_PARTIAL = False
     # The kernel writes padded per-batch LSE [B, H, max_seqlen_q]; _apply_bmhk
@@ -257,7 +259,7 @@ class FwOp(AttentionFwOpBase):
         torch.bfloat16: 2e-2,
     }
 
-    # 96 is non-native, to exercise head-dim padding.
+    # 96 is non-native, to exercise in-kernel head-dim masking.
     _TEST_K: List[int] = [64, 96, 128, 256]
 
     @classmethod
@@ -271,8 +273,8 @@ class FwOp(AttentionFwOpBase):
         Kv = d.value.shape[-1]
         if not (1 <= K <= 256):
             reasons.append(f"query head_dim={K} out of range [1, 256]")
-        if Kv != K:
-            reasons.append("value head_dim must equal query head_dim")
+        if Kv != K and isinstance(d.attn_bias, _PAGED_BIAS_TYPES + _PAGED_GAPPY_TYPES):
+            reasons.append("paged KV needs value head_dim == query head_dim")
 
         # Paged KV kernel fixes PAGE_SIZE 64 and D in {64, 128}; a larger physical
         # page_size (multiple of 64) is remapped to 64-row sub-pages in _apply_bmhk.
@@ -434,14 +436,24 @@ class FwOp(AttentionFwOpBase):
         bias = inp.attn_bias
         causal = isinstance(bias, _CAUSAL_BIAS_TYPES)
 
-        # Head-dim padding: non-native dims are zero-padded to the next of
-        # {64, 128, 256}. Paged KV is never padded (gated to native D upstream).
-        D_native = inp.query.shape[-1]
-        Dpad = _pad_head_dim(D_native)
-        needs_pad = Dpad != D_native
+        # Head dims: the kernel reads Q/K rows Dqk wide and V/O rows Dv wide and
+        # masks the columns up to its compute width, so nothing is copied. It moves
+        # whole dwords, so an odd dim gets one zero column (a copy). Paged-gappy
+        # still pads to the next of {64, 128, 256}; native paged is never padded
+        # (gated to native D upstream).
+        Dqk = inp.query.shape[-1]
+        Dv = inp.value.shape[-1]
+        if isinstance(bias, _PAGED_GAPPY_TYPES):
+            Dqk_pad = Dv_pad = _pad_head_dim(Dqk)
+        else:
+            Dqk_pad, Dv_pad = Dqk + Dqk % 2, Dv + Dv % 2
 
-        def _pad_hd(t: torch.Tensor) -> torch.Tensor:
-            return torch.nn.functional.pad(t, (0, Dpad - D_native)) if needs_pad else t
+        def _pad_to(t: torch.Tensor, d: int) -> torch.Tensor:
+            return (
+                torch.nn.functional.pad(t, (0, d - t.shape[-1]))
+                if d != t.shape[-1]
+                else t
+            )
 
         kw: dict = {"causal": causal, "num_kv_heads": inp.key.shape[-2]}
 
@@ -455,12 +467,12 @@ class FwOp(AttentionFwOpBase):
         elif isinstance(bias, LowerTriangularMaskWithTensorBias):
             kw["bias"] = bias._bias
 
-        # Dense/varlen fold sm_scale at build time; when padding, pin the native
-        # scale so the padded 1/sqrt(Dpad) does not change the result.
+        # Dense/varlen fold sm_scale at build time; when padding Q/K, pin the
+        # native scale so the padded 1/sqrt(Dqk_pad) does not change the result.
         if inp.scale is not None:
             kw["sm_scale"] = float(inp.scale)
-        elif needs_pad:
-            kw["sm_scale"] = 1.0 / math.sqrt(D_native)
+        elif Dqk_pad != Dqk:
+            kw["sm_scale"] = 1.0 / math.sqrt(Dqk)
 
         kw["return_lse"] = needs_gradient
 
@@ -483,14 +495,14 @@ class FwOp(AttentionFwOpBase):
             # (a constant factor, so it factors out of the per-(q,k) sum).
             kw["dropout_mask"] = keep.to(torch.uint8)
 
-        # Shared tail: pad the head dim, call, unpack LSE, slice padded columns off O,
-        # restore input shape (slice/reshape are no-ops when a path didn't pad).
+        # Shared tail: pad odd head dims, call, unpack LSE, slice padded columns
+        # off O, restore input shape (slice/reshape are no-ops without padding).
         def _run(q, k, v, pad=True):
             if pad:
-                q, k, v = _pad_hd(q), _pad_hd(k), _pad_hd(v)
+                q, k, v = _pad_to(q, Dqk_pad), _pad_to(k, Dqk_pad), _pad_to(v, Dv_pad)
             result = flydsl_flash_attn_func(q, k, v, **kw)
             out, lse = result if needs_gradient else (result, None)
-            out = out[..., :D_native].reshape(inp.query.shape)
+            out = out[..., :Dv].reshape(*inp.query.shape[:-1], Dv)
             if inp.p != 0.0:
                 # Inverted-dropout output scale (the uint8 mask carries no scale).
                 out = out * (1.0 / (1.0 - inp.p))
@@ -577,7 +589,7 @@ class FwOp(AttentionFwOpBase):
             H = inp.query.shape[-2]
             Hkv = inp.key.shape[-2]
             Dk = inp.key.shape[-1]
-            q = _pad_hd(inp.query.reshape(-1, H, Dk))
+            q = _pad_to(inp.query.reshape(-1, H, Dk), Dqk_pad)
             page_size = int(bias.page_size)
             # The generic paged kernel fixes PAGE_SIZE == BLOCK_N == 64. Reshape the
             # physical cache to 64-row sub-pages and expand block_table so each
@@ -585,8 +597,8 @@ class FwOp(AttentionFwOpBase):
             # in-kernel per-row page lookup valid at any physical page_size. Head dim
             # is zero-padded (last axis) like the other paths.
             sub = page_size // _KERNEL_PAGE_SIZE
-            k = _pad_hd(inp.key.reshape(-1, _KERNEL_PAGE_SIZE, Hkv, Dk))
-            v = _pad_hd(inp.value.reshape(-1, _KERNEL_PAGE_SIZE, Hkv, Dk))
+            k = _pad_to(inp.key.reshape(-1, _KERNEL_PAGE_SIZE, Hkv, Dk), Dqk_pad)
+            v = _pad_to(inp.value.reshape(-1, _KERNEL_PAGE_SIZE, Hkv, Dk), Dv_pad)
             # sm_scale (native, pinned above when padding) is folded by the generic
             # paged kernel, so no Q pre-scale is needed.
             bt = bias.block_tables.to(torch.int32).to(q.device)

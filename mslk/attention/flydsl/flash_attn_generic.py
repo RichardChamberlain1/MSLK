@@ -91,7 +91,8 @@ def build_flash_attn_func_module_primary(
     high_concurrency=False,
     fused_combine=False,
     paged_pid_regs=False,
-    kv_head_dim=None,
+    head_dim_qk=None,
+    head_dim_v=None,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
@@ -99,9 +100,10 @@ def build_flash_attn_func_module_primary(
     ``num_kv_heads``; each group of ``num_heads // num_kv_heads`` Q heads shares
     one K/V head. Dense launches accept any positive ``seq_len``.
 
-    ``kv_head_dim`` (default ``head_dim``) is K/V's head dim in memory. A smaller
-    value runs the kernel at ``head_dim`` with Q/O already padded to it, reading
-    K/V at their own width with the tail zeroed (see FlashAttnGenericTraits).
+    ``head_dim`` is the compute width. Q/K rows may be stored ``head_dim_qk``
+    wide and V/O rows ``head_dim_v`` wide (both even and <= head_dim): the
+    missing columns read as zero and are never written. The default scale is
+    1/sqrt(head_dim_qk).
     """
     gpu_arch = get_hip_arch()
 
@@ -150,7 +152,8 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
-            kv_head_dim=kv_head_dim,
+            head_dim_qk=head_dim_qk,
+            head_dim_v=head_dim_v,
         )
         _launcher_m256 = build_flash_attn_func_module_primary(
             num_heads,
@@ -180,7 +183,8 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
-            kv_head_dim=kv_head_dim,
+            head_dim_qk=head_dim_qk,
+            head_dim_v=head_dim_v,
         )
         _bs_threshold = (
             2048 * num_heads if gpu_arch.startswith("gfx942") else 4096 * num_heads
@@ -285,7 +289,8 @@ def build_flash_attn_func_module_primary(
         high_concurrency=high_concurrency,
         fused_combine=fused_combine,
         paged_pid_regs=paged_pid_regs,
-        kv_head_dim=kv_head_dim,
+        head_dim_qk=head_dim_qk,
+        head_dim_v=head_dim_v,
     )
     # Threads per combine block; a block is the unit of CU assignment, so this
     # sets how many workgroups the combine launches. One wave per block spreads
@@ -320,7 +325,7 @@ def build_flash_attn_func_module_primary(
         return _guarded
 
     if sm_scale is None:
-        sm_scale = 1.0 / host_math.sqrt(head_dim)
+        sm_scale = 1.0 / host_math.sqrt(traits.HEAD_DIM_QK)
 
     allocator = SmemAllocator(
         None,
@@ -1037,7 +1042,7 @@ def build_flash_attn_func_module_primary(
         bias_t = bias if bias is not None else Out
         drop_t = dropout if dropout is not None else Out
         skv = seq_len if seq_len_kv is None else seq_len_kv
-        sqn = traits.STRIDE_TOKEN_Q if stride_q_n is None else stride_q_n
+        sqn = traits.STRIDE_TOKEN_O if stride_q_n is None else stride_q_n
         stream_arg = fx.Stream(stream)
 
         tensor_args = (Q, K, V, Out, lse_t, ws_t, cq, ck, kvs, bt, bias_t, drop_t)
@@ -1149,7 +1154,7 @@ def build_flash_attn_func_module_primary(
                 batch_size,
                 seq_len,
                 skv,
-                traits.STRIDE_TOKEN_Q,
+                traits.STRIDE_TOKEN_O,
                 bias_t,
                 0,
                 0,
@@ -1202,7 +1207,8 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
-            kv_head_dim=kv_head_dim,
+            head_dim_qk=head_dim_qk,
+            head_dim_v=head_dim_v,
         )
         _launch_mask = build_flash_attn_func_module_primary(
             num_heads,
@@ -1232,7 +1238,8 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
-            kv_head_dim=kv_head_dim,
+            head_dim_qk=head_dim_qk,
+            head_dim_v=head_dim_v,
         )
 
         def _pad_dispatch(*args, **kwargs):

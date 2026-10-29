@@ -1035,31 +1035,77 @@ def _q_pack_group(traits):
     return getattr(traits, "Q_PACK_GROUP", 0)
 
 
-def _qo_head_stride(traits):
+def _head_dim_v(traits):
+    """Stored width of V/O rows (``HEAD_DIM`` for traits without the field)."""
+    return getattr(traits, "HEAD_DIM_V", traits.HEAD_DIM)
+
+
+def _qo_head_stride(traits, head_dim):
     """Element distance between two KV heads in the caller's Q/O buffer.
 
-    Packed-by-stride reads the group's rows HEAD_DIM apart, so the next KV head
-    starts Q_PACK_GROUP rows further on. Unpacked layouts keep one head per row.
+    ``head_dim`` is the buffer's stored row width. Packed-by-stride reads the
+    group's rows head_dim apart, so the next KV head starts Q_PACK_GROUP rows
+    further on. Unpacked layouts keep one head per row.
     """
     if _q_pack_group(traits) > 0:
-        return traits.HEAD_DIM * _q_pack_group(traits)
-    return traits.HEAD_DIM
+        return head_dim * _q_pack_group(traits)
+    return head_dim
 
 
-def _qo_row_offset(traits, token_idx, stride_token_q):
+def _hd_mask_piece(n, head_dim, full_dim):
+    """Elements per masked access when ``n`` consecutive columns are moved.
+
+    Rows stored ``head_dim < full_dim`` wide end mid-vector; split vectors into
+    pieces that never straddle the row end, so each piece is wholly in or out.
+    """
+    return n if head_dim == full_dim else host_math.gcd(n, head_dim)
+
+
+def store_o_dwords(words, rsrc, elem_idx, col, head_dim, full_dim):
+    """Buffer-store dwords holding O columns ``col .. col + 2*len(words)``.
+
+    Columns at or past ``head_dim`` (the stored width) are dropped.
+    """
+    n = 2 * len(words)
+    piece = _hd_mask_piece(n, head_dim, full_dim)
+    w = piece // 2
+    for p in range_constexpr(n // piece):
+        chunk = words[p * w : (p + 1) * w]
+        data = chunk[0] if w == 1 else Vec.from_elements(chunk, fx.Int32)
+        mask = None
+        if const_expr(head_dim != full_dim):
+            mask = as_mlir_value(col + fx.Index(p * piece) < fx.Index(head_dim))
+        buffer_ops.buffer_store(
+            data,
+            rsrc,
+            as_mlir_value(fx.Int32((elem_idx + fx.Index(p * piece)) * fx.Index(2))),
+            mask=mask,
+            offset_is_bytes=True,
+        )
+
+
+def _concat_vecs(parts, elem_dtype):
+    """Concatenate equal-width vectors (or a single one) into one vector."""
+    if len(parts) == 1:
+        return parts[0]
+    elems = [e for v in parts for e in Vec(v)]
+    return Vec.from_elements(elems, elem_dtype).ir_value()
+
+
+def _qo_row_offset(traits, token_idx, stride_token_q, head_dim):
     """Element offset of M row ``token_idx`` in the caller's Q/O buffer.
 
     Unpacked, a row is a whole query token: one stride.
 
     Packed-by-stride it is a (group member, token) pair laid out head-major as
     ``row = g * Q_PACK_QLEN + t``, and the two move along different axes of the
-    caller's [.., q_len, H_q, D] buffer -- g by HEAD_DIM, t by every query head.
+    caller's [.., q_len, H_q, D=head_dim] buffer -- g by D, t by every query head.
     That is not affine in the row index, so it takes two terms; both divisors
     are compile-time constants, and Q_PACK_QLEN is a power of two on the shapes
     that reach here, so the divide and modulo fold into shifts.
 
     The per-batch span is unchanged either way: rows * stride_token_q ==
-    Q_PACK_QLEN * NUM_HEADS_Q * Q_PACK_GROUP * HEAD_DIM, exactly the query heads
+    Q_PACK_QLEN * NUM_HEADS_Q * Q_PACK_GROUP * D, exactly the query heads
     one batch item holds. Only how that span splits across the row and head axes
     differs, so nothing outside these offsets needs to know.
     """
@@ -1068,8 +1114,8 @@ def _qo_row_offset(traits, token_idx, stride_token_q):
         return token_idx * stride_token_q
     qlen = max(getattr(traits, "Q_PACK_QLEN", 0), 1)
     if qlen == 1:  # degenerate: the row *is* the group member
-        return token_idx * fx.Index(traits.HEAD_DIM)
-    return (token_idx // fx.Index(qlen)) * fx.Index(traits.HEAD_DIM) + (
+        return token_idx * fx.Index(head_dim)
+    return (token_idx // fx.Index(qlen)) * fx.Index(head_dim) + (
         token_idx % fx.Index(qlen)
     ) * fx.Index(group * stride_token_q)
 
@@ -1329,7 +1375,12 @@ class FlashAttnGenericTraits:
     NUM_HEADS_Q: int
     NUM_HEADS_KV: int
     GQA_GROUP_SIZE: int
+    # Compute width. Q/K rows are stored HEAD_DIM_QK wide and V/O rows
+    # HEAD_DIM_V wide (both <= HEAD_DIM); the columns past them load as zero
+    # and are never stored.
     HEAD_DIM: int
+    HEAD_DIM_QK: int
+    HEAD_DIM_V: int
     DTYPE_STR: str
     CAUSAL: bool
     # Top-left causal (kv_col <= q_row, delta=0) vs default bottom-right
@@ -1407,11 +1458,9 @@ class FlashAttnGenericTraits:
     PAGE_STRIDE_VEC: int
     HEAD_STRIDE_VEC: int
     STRIDE_TOKEN_Q: int
-    STRIDE_TOKEN_KV: int
-    # Head dim of K/V in memory. Below HEAD_DIM (a padded build, e.g. D=96 run
-    # at 128), K/V are read at this width and the tail columns load as zeros, so
-    # a paged cache never has to be copied out to a padded one.
-    KV_HEAD_DIM: int
+    STRIDE_TOKEN_K: int
+    STRIDE_TOKEN_V: int
+    STRIDE_TOKEN_O: int
     K_STRIDE: int
     K_SWZ_ROWMASK: int
     VT_STRIDE: int
@@ -1473,6 +1522,8 @@ class FlashAttnGenericTraits:
             self.NUM_HEADS_KV,
             self.GQA_GROUP_SIZE,
             self.HEAD_DIM,
+            self.HEAD_DIM_QK,
+            self.HEAD_DIM_V,
             self.DTYPE_STR,
             self.CAUSAL,
             self.CAUSAL_TOP_LEFT,
@@ -1522,8 +1573,9 @@ class FlashAttnGenericTraits:
             self.PAGE_STRIDE_VEC,
             self.HEAD_STRIDE_VEC,
             self.STRIDE_TOKEN_Q,
-            self.STRIDE_TOKEN_KV,
-            self.KV_HEAD_DIM,
+            self.STRIDE_TOKEN_K,
+            self.STRIDE_TOKEN_V,
+            self.STRIDE_TOKEN_O,
             self.K_STRIDE,
             self.K_SWZ_ROWMASK,
             self.VT_STRIDE,
@@ -1598,24 +1650,34 @@ def _make_flash_attn_generic_traits(
     high_concurrency=False,
     fused_combine=False,
     paged_pid_regs=False,
-    kv_head_dim=None,
+    head_dim_qk=None,
+    head_dim_v=None,
 ):
     """Build compile-time traits for ``flash_attn_generic``."""
-    kv_head_dim = head_dim if kv_head_dim is None else int(kv_head_dim)
-    # A padded build reads K/V through the plain cooperative loaders only, which
-    # mask the tail columns; the DMA, prefetch and vectorized loaders do not.
-    kv_padded = kv_head_dim != head_dim
-    if kv_padded:
-        assert 0 < kv_head_dim < head_dim and kv_head_dim % 32 == 0, (
-            f"kv_head_dim ({kv_head_dim}) must be a multiple of 32 below head_dim ({head_dim})"
-        )
-        assert kv_cache_layout == "linear", "padded K/V needs the linear layout"
-        path_tag = "N32"
-        paged_kv_dma = False
-        paged_k_prefetch = False
     block_n = 64
     k_sub_n = 32
     warp_size = 64
+    head_dim_qk = head_dim if head_dim_qk is None else int(head_dim_qk)
+    head_dim_v = head_dim if head_dim_v is None else int(head_dim_v)
+    if not (0 < head_dim_qk <= head_dim and 0 < head_dim_v <= head_dim):
+        raise ValueError(
+            f"stored head dims ({head_dim_qk}, {head_dim_v}) must be in "
+            f"[1, head_dim={head_dim}]"
+        )
+    if head_dim_qk % 2 or head_dim_v % 2:
+        # Masked loads/stores move whole dwords.
+        raise ValueError(f"stored head dims ({head_dim_qk}, {head_dim_v}) must be even")
+    if (head_dim_qk, head_dim_v) != (head_dim, head_dim) and (
+        kv_cache_layout == "vectorized"
+    ):
+        raise ValueError("stored head dims < head_dim need a linear KV layout")
+    # A masked paged build reads K/V through the cooperative loaders only; the
+    # paged DMA, K prefetch and prefetch pipelines do not mask the tail columns.
+    masked_paged = bool(paged) and (head_dim_qk, head_dim_v) != (head_dim, head_dim)
+    if masked_paged:
+        path_tag = "N32"
+        paged_kv_dma = False
+        paged_k_prefetch = False
 
     block_m = 128 if block_m is None else block_m
     if flat_work_group_size is None:
@@ -1644,7 +1706,7 @@ def _make_flash_attn_generic_traits(
 
     enable_prefetch_3buf = (
         os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_PREFETCH3", "0") == "1"
-        and not kv_padded
+        and not masked_paged
     )
     if fused_combine and return_lse:
         raise ValueError("the fused split-K combine does not produce LSE")
@@ -1652,16 +1714,19 @@ def _make_flash_attn_generic_traits(
     enable_gfx942_dma = gpu_arch.startswith("gfx942") and (
         os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_GFX942_DMA", "0") == "1"
     )
+    # A 16-byte DMA lane is masked whole, so stored dims must cover whole lanes.
     enable_dma = (
         enable_gfx942_dma
         or (
             has_lds_load_b128
+            and head_dim_qk % 8 == 0
+            and head_dim_v % 8 == 0
             and (
                 path == "N128"
                 or (os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_DMA", "0") == "1")
             )
         )
-    ) and not kv_padded
+    ) and not masked_paged
     if paged:
         # Paged DMA supports the linear, non-gappy layout only.
         paged_dma_ok = (
@@ -1673,7 +1738,7 @@ def _make_flash_attn_generic_traits(
         enable_dma = paged_dma_ok and (enable_dma or paged_kv_dma)
     enable_gfx942_kv_gpfetch = (
         gpu_arch.startswith("gfx942")
-        and not kv_padded
+        and not masked_paged
         and not enable_prefetch_3buf
         and (not enable_dma or enable_gfx942_dma)
         and os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_KV_GPFETCH", "1") == "1"
@@ -1752,11 +1817,13 @@ def _make_flash_attn_generic_traits(
     kv_vectorized = paged and (kv_cache_layout == "vectorized")
     kv_vec_size = 8
     page_size = block_n
-    page_stride_vec = num_kv_heads * kv_head_dim * page_size
-    head_stride_vec = kv_head_dim * page_size
+    page_stride_vec = num_kv_heads * head_dim * page_size
+    head_stride_vec = head_dim * page_size
 
-    stride_token_q = num_heads * head_dim
-    stride_token_kv = num_kv_heads * kv_head_dim
+    stride_token_q = num_heads * head_dim_qk
+    stride_token_k = num_kv_heads * head_dim_qk
+    stride_token_v = num_kv_heads * head_dim_v
+    stride_token_o = num_heads * head_dim_v
     _k_pad_default = 4 if (gpu_arch.startswith("gfx942") and not enable_dma) else 0
     _k_pad = int(os.getenv("FLYDSL_FLASH_ATTN_FUNC_K_PAD", str(_k_pad_default)))
     k_stride = head_dim + _k_pad
@@ -1859,6 +1926,8 @@ def _make_flash_attn_generic_traits(
         NUM_HEADS_KV=num_kv_heads,
         GQA_GROUP_SIZE=num_heads // num_kv_heads,
         HEAD_DIM=head_dim,
+        HEAD_DIM_QK=head_dim_qk,
+        HEAD_DIM_V=head_dim_v,
         DTYPE_STR=dtype_str,
         CAUSAL=bool(causal),
         CAUSAL_TOP_LEFT=bool(causal_top_left),
@@ -1908,8 +1977,9 @@ def _make_flash_attn_generic_traits(
         PAGE_STRIDE_VEC=page_stride_vec,
         HEAD_STRIDE_VEC=head_stride_vec,
         STRIDE_TOKEN_Q=stride_token_q,
-        STRIDE_TOKEN_KV=stride_token_kv,
-        KV_HEAD_DIM=kv_head_dim,
+        STRIDE_TOKEN_K=stride_token_k,
+        STRIDE_TOKEN_V=stride_token_v,
+        STRIDE_TOKEN_O=stride_token_o,
         K_STRIDE=k_stride,
         K_SWZ_ROWMASK=k_swz_rowmask,
         VT_STRIDE=vt_stride,
@@ -2745,41 +2815,34 @@ class GenericFlashAttnContext:
         # Dense/varlen fold batch into raw K/V pointers; paged adds page_id per tile.
         traits = self.traits
         if const_expr(not traits.PAGED):
-            off = self.kv_tok_base * fx.Index(traits.STRIDE_TOKEN_KV)
             self.k_ptr = buffer_ops.get_element_ptr(
-                self.k_ptr, off, elem_type=self.elem_type
+                self.k_ptr,
+                self.kv_tok_base * fx.Index(traits.STRIDE_TOKEN_K),
+                elem_type=self.elem_type,
             )
             self.v_ptr = buffer_ops.get_element_ptr(
-                self.v_ptr, off, elem_type=self.elem_type
+                self.v_ptr,
+                self.kv_tok_base * fx.Index(traits.STRIDE_TOKEN_V),
+                elem_type=self.elem_type,
             )
 
     def init_descriptors(self, Q, O):  # noqa: E741
         # Per-batch descriptors keep global indices 0-based and bounded to one batch,
         # keeping 32-bit offsets small while preserving arbitrary-seqlen OOB behavior.
         traits = self.traits
-        self.kv_nrec_bytes = as_mlir_value(
-            self.seqlen_kv_b * fx.Index(traits.STRIDE_TOKEN_KV * 2)
+        self.q_rsrc = self.batch_rsrc(
+            Q, self.seqlen_q_b, self.q_tok_base, traits.STRIDE_TOKEN_Q
         )
-        self.kv_batch_byte_off = as_mlir_value(
-            self.kv_tok_base * fx.Index(traits.STRIDE_TOKEN_KV * 2)
+        self.o_rsrc = self.batch_rsrc(
+            O, self.seqlen_q_b, self.q_tok_base, traits.STRIDE_TOKEN_O
         )
-        q_nrec_bytes = as_mlir_value(
-            self.seqlen_q_b * fx.Index(traits.STRIDE_TOKEN_Q * 2)
-        )
-        q_batch_byte_off = as_mlir_value(
-            self.q_tok_base * fx.Index(traits.STRIDE_TOKEN_Q * 2)
-        )
-        self.q_rsrc = buffer_ops.create_buffer_resource(
-            Q,
+
+    def batch_rsrc(self, T, seqlen, tok_base, stride_token):
+        return buffer_ops.create_buffer_resource(
+            T,
             max_size=False,
-            num_records_bytes=q_nrec_bytes,
-            base_byte_offset=q_batch_byte_off,
-        )
-        self.o_rsrc = buffer_ops.create_buffer_resource(
-            O,
-            max_size=False,
-            num_records_bytes=q_nrec_bytes,
-            base_byte_offset=q_batch_byte_off,
+            num_records_bytes=as_mlir_value(seqlen * fx.Index(stride_token * 2)),
+            base_byte_offset=as_mlir_value(tok_base * fx.Index(stride_token * 2)),
         )
 
     def init_bias(self, Bias, bias_stride_b, bias_stride_h, bias_stride_q):
@@ -2909,30 +2972,95 @@ class GenericFlashAttnContext:
             # This split is empty when its window has no KV positions.
             self.split_empty = self.kv_lower >= self.kv_upper
 
-    def global_idx_q(self, token_idx, col):
+    def _global_idx_qo(self, token_idx, col, stride_token, head_dim):
         traits = self.traits
         idx = (
-            _qo_row_offset(traits, token_idx, traits.STRIDE_TOKEN_Q)
-            + self.q_head_idx * _qo_head_stride(traits)
+            _qo_row_offset(traits, token_idx, stride_token, head_dim)
+            + self.q_head_idx * _qo_head_stride(traits, head_dim)
             + col
         )
         if const_expr(_q_pack_group(traits) > 0):
             # Unpacked, a padding row past seqlen_q_b lands beyond the per-batch
             # Q/O resource and the hardware drops it. Stride-packed rows sit
-            # HEAD_DIM apart, so padding rows alias the next KV heads' rows and
+            # head_dim apart, so padding rows alias the next KV heads' rows and
             # would overwrite their output. Send them to the resource end instead.
             idx = (token_idx < self.seqlen_q_b).select(
-                idx, self.seqlen_q_b * fx.Index(traits.STRIDE_TOKEN_Q)
+                idx, self.seqlen_q_b * fx.Index(stride_token)
             )
         return idx
 
-    def global_idx_kv(self, token_idx, col):
+    def global_idx_q(self, token_idx, col):
+        traits = self.traits
+        return self._global_idx_qo(
+            token_idx, col, traits.STRIDE_TOKEN_Q, traits.HEAD_DIM_QK
+        )
+
+    def global_idx_o(self, token_idx, col):
+        traits = self.traits
+        return self._global_idx_qo(
+            token_idx, col, traits.STRIDE_TOKEN_O, traits.HEAD_DIM_V
+        )
+
+    def global_idx_k(self, token_idx, col):
         traits = self.traits
         return (
-            token_idx * traits.STRIDE_TOKEN_KV
-            + self.kv_head_idx * traits.KV_HEAD_DIM
+            token_idx * traits.STRIDE_TOKEN_K
+            + self.kv_head_idx * traits.HEAD_DIM_QK
             + col
         )
+
+    def global_idx_v(self, token_idx, col):
+        traits = self.traits
+        return (
+            token_idx * traits.STRIDE_TOKEN_V
+            + self.kv_head_idx * traits.HEAD_DIM_V
+            + col
+        )
+
+    def load_q_pack(self, q_rsrc, q_row, col):
+        """MFMA_LANE_K Q values of row ``q_row`` from ``col``; zero past HEAD_DIM_QK."""
+        traits = self.traits
+        n = traits.MFMA_LANE_K
+        piece = _hd_mask_piece(n, traits.HEAD_DIM_QK, traits.HEAD_DIM)
+        idx = self.global_idx_q(q_row, col)
+        parts = []
+        for p in range_constexpr(n // piece):
+            mask = None
+            if const_expr(traits.HEAD_DIM_QK != traits.HEAD_DIM):
+                mask = as_mlir_value(
+                    col + fx.Index(p * piece) < fx.Index(traits.HEAD_DIM_QK)
+                )
+            # A masked-off offset is past the resource end, which reads zero.
+            parts.append(
+                buffer_ops.buffer_load(
+                    q_rsrc,
+                    idx + fx.Index(p * piece),
+                    vec_width=piece,
+                    dtype=self.elem_dtype,
+                    mask=mask,
+                )
+            )
+        return _concat_vecs(parts, self.elem_dtype)
+
+    def load_kv_vec(self, ptr, token_idx, col, is_v):
+        """VEC_WIDTH K (or V) values of a row from ``col``; zero past its stored dim."""
+        traits = self.traits
+        n = traits.VEC_WIDTH
+        dim = traits.HEAD_DIM_V if is_v else traits.HEAD_DIM_QK
+        idx = (self.global_idx_v if is_v else self.global_idx_k)(token_idx, col)
+        if const_expr(dim == traits.HEAD_DIM):
+            return self.load_global_f16xN(ptr, idx)
+        # K/V are raw pointer loads with no bounds check: point masked-off pieces
+        # at the row start (always in bounds) and zero what they return.
+        piece = _hd_mask_piece(n, dim, traits.HEAD_DIM)
+        zero = Vec.filled(piece, 0.0, self.elem_dtype)
+        parts = []
+        for p in range_constexpr(n // piece):
+            ok = col + fx.Index(p * piece) < fx.Index(dim)
+            src = fx.Index(ok.select(idx + fx.Index(p * piece), idx - col))
+            vec = self.load_global_half_vec(ptr, src, piece)
+            parts.append(arith.select(ok, vec, zero))
+        return _concat_vecs(parts, self.elem_dtype)
 
     def kv_row_clamp(self, row_idx):
         last = self.seqlen_kv_b - fx.Index(1)
@@ -3104,33 +3232,17 @@ class GenericKvGmemToLdsLoader:
         self.ctx = ctx
         self.page_ids = None
 
-    def global_idx(self, token_idx, col):
-        return self.ctx.global_idx_kv(token_idx, col)
+    def load_k(self, token_idx, col):
+        return self.ctx.load_kv_vec(self.ctx.k_ptr, token_idx, col, is_v=False)
+
+    def load_v(self, token_idx, col):
+        return self.ctx.load_kv_vec(self.ctx.v_ptr, token_idx, col, is_v=True)
 
     def row_clamp(self, row_idx):
         return self.ctx.kv_row_clamp(row_idx)
 
     def load_half_vec(self, ptr, base_idx, vec_elems: int):
         return self.ctx.load_global_half_vec(ptr, base_idx, vec_elems)
-
-    def load_f16xN(self, rsrc, base_idx):
-        return self.ctx.load_global_f16xN(rsrc, base_idx)
-
-    def load_kv_vec(self, ptr, row_idx, col):
-        """VEC_WIDTH elements of K/V row ``row_idx`` from column ``col``. In a
-        padded build (KV_HEAD_DIM < HEAD_DIM) columns past KV_HEAD_DIM read as
-        zeros: KV_HEAD_DIM is a multiple of 32, so a vector is wholly in or out,
-        and an out vector loads column 0 of the same row, which is in bounds."""
-        traits = self.ctx.traits
-        if const_expr(traits.KV_HEAD_DIM == traits.HEAD_DIM):
-            return self.load_f16xN(ptr, self.global_idx(row_idx, col))
-        inside = col < fx.Index(traits.KV_HEAD_DIM)
-        vec = self.load_f16xN(
-            ptr, self.global_idx(row_idx, inside.select(col, fx.Index(0)))
-        )
-        elem = self.ctx.elem_dtype
-        zero = Vec.filled(traits.VEC_WIDTH, fx.Float32(0.0).to(elem), elem)
-        return arith.select(inside, as_mlir_value(vec), as_mlir_value(zero))
 
     def load_vectorized_k(self, k_ptr, page_id, kv_row, col):
         ctx = self.ctx
@@ -3233,9 +3345,7 @@ class GenericKvGmemToLdsLoader:
                         + lds_row * traits.K_STRIDE
                         + self.k_swizzle(lds_row, col)
                     )
-                    Vec(self.load_kv_vec(ctx.k_ptr, row_idx, col)).store(
-                        lds_kv, [lds_idx]
-                    )
+                    Vec(self.load_k(row_idx, col)).store(lds_kv, [lds_idx])
             else:
                 lds_row = row + row_offset
                 lds_idx = (
@@ -3246,7 +3356,7 @@ class GenericKvGmemToLdsLoader:
                         ctx.k_ptr, pid, self.sigma_kv(lds_row), col
                     )
                 else:
-                    vec = self.load_kv_vec(ctx.k_ptr, row_idx, col)
+                    vec = self.load_k(row_idx, col)
                 Vec(vec).store(lds_kv, [lds_idx])
 
     def zero_k_global_vecs(self):
@@ -3271,7 +3381,7 @@ class GenericKvGmemToLdsLoader:
             row_idx = self._kv_row_idx(
                 pid, tile_start, ctx.load_row_in_batch + row_offset
             )
-            vecs.append(self.load_kv_vec(ctx.k_ptr, row_idx, ctx.load_col_base))
+            vecs.append(self.load_k(row_idx, ctx.load_col_base))
         return vecs
 
     def coop_store_k_lds(self, vecs, buf_id=0):
@@ -3327,7 +3437,7 @@ class GenericKvGmemToLdsLoader:
                     self._v_store_to_lds(
                         v_base,
                         row + row_offset,
-                        self.load_kv_vec(ctx.v_ptr, row_idx, col),
+                        self.load_v(row_idx, col),
                     )
             else:
                 lds_row = row + row_offset
@@ -3336,7 +3446,7 @@ class GenericKvGmemToLdsLoader:
                         ctx.v_ptr, pid, self.sigma_kv(lds_row), col
                     )
                 else:
-                    vec = self.load_kv_vec(ctx.v_ptr, row_idx, col)
+                    vec = self.load_v(row_idx, col)
                 self._v_store_to_lds(v_base, lds_row, vec)
 
     def coop_load_v_global(self, tile_start, pid=None):
@@ -3370,7 +3480,7 @@ class GenericKvGmemToLdsLoader:
             row_idx = self._kv_row_idx(
                 pid, tile_start, ctx.load_row_in_batch + row_offset
             )
-            vecs.append(self.load_kv_vec(ctx.v_ptr, row_idx, ctx.load_col_base))
+            vecs.append(self.load_v(row_idx, ctx.load_col_base))
         return vecs
 
     def coop_store_v_lds(self, vecs, buf_id=0):
@@ -3410,7 +3520,7 @@ class GenericKvGmemToLdsLoader:
         pid = self._tile_page_id(tile_start) if traits.PAGED else None
         for r in range_constexpr(ctx.vp_rows_per_thread):
             row_idx = self._kv_row_idx(pid, tile_start, ctx.vp_row_base + r)
-            vecs.append(self.load_kv_vec(ctx.v_ptr, row_idx, ctx.vp_col_base))
+            vecs.append(self.load_v(row_idx, ctx.vp_col_base))
         return vecs
 
     def coop_store_v_lds_perm(self, vecs, buf_id=0):
@@ -3539,21 +3649,31 @@ class GenericKvGmemToLdsLoader:
             )
             self._dma_page_bytes = fx.Int64(traits.PAGE_STRIDE_VEC * 2)
         else:
-            self.k_rsrc = buffer_ops.create_buffer_resource(
-                ctx.K,
-                max_size=False,
-                num_records_bytes=ctx.kv_nrec_bytes,
-                base_byte_offset=ctx.kv_batch_byte_off,
+            self.k_rsrc = ctx.batch_rsrc(
+                ctx.K, ctx.seqlen_kv_b, ctx.kv_tok_base, traits.STRIDE_TOKEN_K
             )
-            self.v_rsrc = buffer_ops.create_buffer_resource(
-                ctx.V,
-                max_size=False,
-                num_records_bytes=ctx.kv_nrec_bytes,
-                base_byte_offset=ctx.kv_batch_byte_off,
+            self.v_rsrc = ctx.batch_rsrc(
+                ctx.V, ctx.seqlen_kv_b, ctx.kv_tok_base, traits.STRIDE_TOKEN_V
             )
         self.NUM_DMA_V = (traits.BLOCK_N * traits.V_STRIDE * 2) // self.DMA_BATCH_BYTES
         self.LANES_PER_V_ROW = traits.HEAD_DIM * 2 // self.DMA_BYTES
         self.ROWS_PER_DMA_BATCH_V = self.DMA_BATCH_BYTES // (traits.HEAD_DIM * 2)
+
+    def _dma_global_byte(self, global_row, global_col, is_v):
+        """K/V resource byte offset of one DMA lane (row-relative to the batch)."""
+        ctx = self.ctx
+        traits = ctx.traits
+        dim = traits.HEAD_DIM_V if is_v else traits.HEAD_DIM_QK
+        stride = traits.STRIDE_TOKEN_V if is_v else traits.STRIDE_TOKEN_K
+        byte = (
+            global_row * fx.Index(stride * 2)
+            + ctx.kv_head_idx * fx.Index(dim * 2)
+            + global_col * 2
+        )
+        if const_expr(dim != traits.HEAD_DIM):
+            # Lanes past the stored dim fetch out of range, which fills LDS with 0.
+            byte = (global_col < fx.Index(dim)).select(byte, fx.Index(0x7FFFFFFF))
+        return fx.Int32(byte)
 
     def _coop_dma_row(
         self,
@@ -3564,6 +3684,7 @@ class GenericKvGmemToLdsLoader:
         rows_per_batch,
         tile_start,
         xor_and,
+        is_v,
         paged_base=None,
     ):
         ctx = self.ctx
@@ -3590,18 +3711,13 @@ class GenericKvGmemToLdsLoader:
             row_in_tile = ctx.tid // lanes_per_row + fx.Index(d * rows_per_batch)
             swiz_col_f16 = (ctx.tid % lanes_per_row) * (self.DMA_BYTES // 2)
             xor_mask = (row_in_tile & fx.Index(xor_and)) << fx.Index(4)
-            col_byte = (swiz_col_f16 ^ xor_mask) * 2
+            global_col = swiz_col_f16 ^ xor_mask
             global_row = row_base + row_in_tile
-            global_byte = (
-                global_row * fx.Index(traits.STRIDE_TOKEN_KV * 2)
-                + ctx.kv_head_idx * fx.Index(traits.HEAD_DIM * 2)
-                + col_byte
-            )
             _buffer_load_to_lds(
                 rsrc,
                 lds_ptr,
                 self._dma_size,
-                fx.Int32(global_byte),
+                self._dma_global_byte(global_row, global_col, is_v),
                 self._dma_soff,
                 self._dma_off,
                 self._dma_aux,
@@ -3628,20 +3744,14 @@ class GenericKvGmemToLdsLoader:
                 lds_elem = ctx.k_vec_elem_idx(row_in_tile, col_f16)
                 lds_addr = k_lds_byte_base + lds_elem * 2
                 global_row = tile_start + ctx.sigma_kv(row_in_tile)
-                col_byte = col_f16 * 2
                 lds_ptr = buffer_ops.create_llvm_ptr(
                     fx.Int64(lds_addr), address_space=3
-                )
-                global_byte = (
-                    global_row * fx.Index(traits.STRIDE_TOKEN_KV * 2)
-                    + ctx.kv_head_idx * fx.Index(traits.HEAD_DIM * 2)
-                    + col_byte
                 )
                 _buffer_load_to_lds(
                     self.k_rsrc,
                     lds_ptr,
                     self._dma_size,
-                    fx.Int32(global_byte),
+                    self._dma_global_byte(global_row, col_f16, is_v=False),
                     self._dma_soff,
                     self._dma_off,
                     self._dma_aux,
@@ -3655,6 +3765,7 @@ class GenericKvGmemToLdsLoader:
                 self.ROWS_PER_DMA_BATCH,
                 tile_start,
                 traits.K_SWZ_ROWMASK,
+                is_v=False,
                 paged_base=self._k_dma_base_i64 if traits.PAGED else None,
             )
 
@@ -3672,6 +3783,7 @@ class GenericKvGmemToLdsLoader:
             self.ROWS_PER_DMA_BATCH_V,
             tile_start,
             0x3,
+            is_v=True,
             paged_base=self._v_dma_base_i64 if traits.PAGED else None,
         )
 
@@ -3851,14 +3963,7 @@ class GenericQLoader:
             q_col = (
                 fx.Index(ks * traits.K_STEP_QK) + ctx.lane_div_32 * traits.MFMA_LANE_K
             )
-            q_b_packs.append(
-                buffer_ops.buffer_load(
-                    q_rsrc,
-                    ctx.global_idx_q(q_row, q_col),
-                    vec_width=traits.MFMA_LANE_K,
-                    dtype=ctx.elem_dtype,
-                )
-            )
+            q_b_packs.append(ctx.load_q_pack(q_rsrc, q_row, q_col))
         return q_b_packs
 
 
@@ -4550,18 +4655,13 @@ class GenericStoreHelper:
         if const_expr(traits.RETURN_LSE):
             self.store_lse(ctx.c_neg_inf, q_row)
         if const_expr(traits.USE_PERMLANE_OSTORE):
-            zero_pack = Vec.filled(4, 0, fx.Int32)
             for dc in range_constexpr(traits.D_CHUNKS):
                 for g in range_constexpr(2):
                     d_col = fx.Index(dc * traits.D_CHUNK) + (
                         fx.Index(2 * g) + ctx.lane_div_32
                     ) * fx.Index(8)
-                    o_global = ctx.global_idx_q(q_row, d_col)
-                    buffer_ops.buffer_store(
-                        zero_pack, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True
-                    )
+                    self.store_o_words([fx.Int32(0)] * 4, o_rsrc, q_row, d_col)
         else:
-            zero_pack = Vec.filled(2, 0, fx.Int32)
             for dc in range_constexpr(traits.D_CHUNKS):
                 for grp in range_constexpr(4):
                     d_col = (
@@ -4569,10 +4669,19 @@ class GenericStoreHelper:
                         + ctx.lane_div_32 * fx.Index(4)
                         + fx.Index(grp * 8)
                     )
-                    o_global = ctx.global_idx_q(q_row, d_col)
-                    buffer_ops.buffer_store(
-                        zero_pack, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True
-                    )
+                    self.store_o_words([fx.Int32(0)] * 2, o_rsrc, q_row, d_col)
+
+    def store_o_words(self, words, o_rsrc, q_row, d_col):
+        """Store dwords holding O columns from ``d_col``; drops those past HEAD_DIM_V."""
+        traits = self.ctx.traits
+        store_o_dwords(
+            words,
+            o_rsrc,
+            self.ctx.global_idx_o(q_row, d_col),
+            d_col,
+            traits.HEAD_DIM_V,
+            traits.HEAD_DIM,
+        )
 
     def finalize_o(self, loop_results):
         # Normalize and store O (128-bit buffer_store_dwordx4); cross-seqlen zeroes
@@ -4666,15 +4775,14 @@ class GenericStoreHelper:
                 w1 = is_hi_half.select(y1_b, as_mlir_value(d1_a))
                 w2 = is_hi_half.select(as_mlir_value(d0_b), y0_a)
                 w3 = is_hi_half.select(as_mlir_value(d1_b), y1_a)
-                o_pack = Vec.from_elements(
-                    [fx.Int32(w0), fx.Int32(w1), fx.Int32(w2), fx.Int32(w3)], fx.Int32
-                )
                 d_col = fx.Index(dc * traits.D_CHUNK) + (
                     fx.Index(2 * g) + ctx.lane_div_32
                 ) * fx.Index(8)
-                o_global = ctx.global_idx_q(q_row, d_col)
-                buffer_ops.buffer_store(
-                    o_pack, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True
+                self.store_o_words(
+                    [fx.Int32(w0), fx.Int32(w1), fx.Int32(w2), fx.Int32(w3)],
+                    o_rsrc,
+                    q_row,
+                    d_col,
                 )
 
     def _store_fallback_o(self, v_o, o_rsrc, q_row):
@@ -4688,17 +4796,13 @@ class GenericStoreHelper:
                     for i in range_constexpr(4)
                 ]
                 pack = Vec.from_elements(o_f16, ctx.elem_dtype).bitcast(fx.Int32)
-                o2 = Vec.from_elements(
-                    [as_mlir_value(pack[0]), as_mlir_value(pack[1])], fx.Int32
-                )
                 d_col = (
                     fx.Index(dc * traits.D_CHUNK)
                     + ctx.lane_div_32 * fx.Index(4)
                     + fx.Index(grp * 8)
                 )
-                o_global = ctx.global_idx_q(q_row, d_col)
-                buffer_ops.buffer_store(
-                    o2, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True
+                self.store_o_words(
+                    [fx.Int32(pack[0]), fx.Int32(pack[1])], o_rsrc, q_row, d_col
                 )
 
 
@@ -7225,21 +7329,22 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         return Vec.from_elements(words, fx.Int32)
 
     def store_output(self, o_pack):
+        traits = self.traits
+        dim = _head_dim_v(traits)
         o_global = (
-            _qo_row_offset(self.traits, self.seq_idx, self.stride_q_n_v)
-            + self.q_head_idx * fx.Index(_qo_head_stride(self.traits))
+            _qo_row_offset(traits, self.seq_idx, self.stride_q_n_v, dim)
+            + self.q_head_idx * fx.Index(_qo_head_stride(traits, dim))
             + self.col
         )
         # Mirror the load: 2 i32 (4 values, 8 bytes) at a time.
         for w in range_constexpr(self.chunk() // 4):
-            pair = Vec.from_elements(
-                [fx.Int32(o_pack[2 * w]), fx.Int32(o_pack[2 * w + 1])], fx.Int32
-            )
-            buffer_ops.buffer_store(
-                pair.ir_value(),
+            store_o_dwords(
+                [fx.Int32(o_pack[2 * w]), fx.Int32(o_pack[2 * w + 1])],
                 self.o_rsrc,
-                as_mlir_value(fx.Int32((o_global + fx.Index(4 * w)) * fx.Index(2))),
-                offset_is_bytes=True,
+                o_global + fx.Index(4 * w),
+                self.col + fx.Index(4 * w),
+                dim,
+                traits.HEAD_DIM,
             )
 
     def store_lse(self, m_max, den):
