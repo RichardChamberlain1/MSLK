@@ -86,6 +86,7 @@ def compile_fmha_bwd_preprocess(*, D: int, dtype_str: str = "bf16"):
             D_rsrc = _bops.create_buffer_resource(D_out)
 
             full = THREADS_PER_ROW * VEC_WIDTH == D
+            acc = None
             for p in range_constexpr(VEC_WIDTH // PIECE):
                 col = col_thread * VEC_WIDTH + p * PIECE
                 if const_expr(not full):
@@ -103,7 +104,7 @@ def compile_fmha_bwd_preprocess(*, D: int, dtype_str: str = "bf16"):
                 part = prod.reduce(ReductionOp.ADD, fastmath=fm)
                 if const_expr(not full):
                     part = ok.select(part, fx.Float32(0.0))
-                acc = part if p == 0 else acc.addf(part, fastmath=fm)
+                acc = part if acc is None else acc.addf(part, fastmath=fm)
 
             # Warp shuffle reduce across THREADS_PER_ROW lanes
             w = acc

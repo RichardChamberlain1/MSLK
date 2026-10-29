@@ -7574,11 +7574,14 @@ class GenericFusedSplitKCombine:
             halves = [fx.Float32(out[i]).to(ctx.elem_dtype) for i in range_constexpr(n)]
             pack = Vec.from_elements(halves, ctx.elem_dtype).bitcast(fx.Int32)
             words = [fx.Int32(as_mlir_value(pack[i])) for i in range_constexpr(n // 2)]
-        buffer_ops.buffer_store(
-            Vec.from_elements(words, fx.Int32).ir_value(),
+        # Columns past the stored V/O width are dropped, as in the combine kernel.
+        store_o_dwords(
+            words,
             ctx.o_rsrc,
-            as_mlir_value(fx.Int32(ctx.global_idx_q(row, col) * fx.Index(2))),
-            offset_is_bytes=True,
+            ctx.global_idx_o(row, col),
+            col,
+            traits.HEAD_DIM_V,
+            traits.HEAD_DIM,
         )
 
 
