@@ -3042,8 +3042,13 @@ class GenericFlashAttnContext:
             )
         return _concat_vecs(parts, self.elem_dtype)
 
-    def load_kv_vec(self, ptr, token_idx, col, is_v):
-        """VEC_WIDTH K (or V) values of a row from ``col``; zero past its stored dim."""
+    def load_kv_vec(self, ptr, token_idx, col, is_v, zero_tail=True):
+        """VEC_WIDTH K (or V) values of a row from ``col``; zero past its stored dim.
+
+        With ``zero_tail=False`` the columns past the stored dim hold row-start
+        data; the caller zeroes them with ``zero_kv_tail`` where it consumes the
+        vector, so a register-prefetched load is not waited on at issue.
+        """
         traits = self.traits
         n = traits.VEC_WIDTH
         dim = traits.HEAD_DIM_V if is_v else traits.HEAD_DIM_QK
@@ -3053,14 +3058,30 @@ class GenericFlashAttnContext:
         # K/V are raw pointer loads with no bounds check: point masked-off pieces
         # at the row start (always in bounds) and zero what they return.
         piece = _hd_mask_piece(n, dim, traits.HEAD_DIM)
-        zero = Vec.filled(piece, 0.0, self.elem_dtype)
         parts = []
         for p in range_constexpr(n // piece):
             ok = col + fx.Index(p * piece) < fx.Index(dim)
             src = fx.Index(ok.select(idx + fx.Index(p * piece), idx - col))
-            vec = self.load_global_half_vec(ptr, src, piece)
-            parts.append(arith.select(ok, vec, zero))
-        return _concat_vecs(parts, self.elem_dtype)
+            parts.append(self.load_global_half_vec(ptr, src, piece))
+        vec = _concat_vecs(parts, self.elem_dtype)
+        return self.zero_kv_tail(vec, col, is_v) if zero_tail else vec
+
+    def zero_kv_tail(self, vec, col, is_v):
+        """Zero the columns of a ``load_kv_vec`` vector past the stored dim."""
+        traits = self.traits
+        dim = traits.HEAD_DIM_V if is_v else traits.HEAD_DIM_QK
+        if const_expr(dim == traits.HEAD_DIM):
+            return vec
+        n = traits.VEC_WIDTH
+        piece = _hd_mask_piece(n, dim, traits.HEAD_DIM)
+        w = piece // 2
+        words = Vec(vec).bitcast(fx.Int32)
+        out = []
+        for p in range_constexpr(n // piece):
+            ok = col + fx.Index(p * piece) < fx.Index(dim)
+            for i in range_constexpr(w):
+                out.append(ok.select(fx.Int32(words[p * w + i]), fx.Int32(0)))
+        return Vec.from_elements(out, fx.Int32).bitcast(self.elem_dtype).ir_value()
 
     def kv_row_clamp(self, row_idx):
         last = self.seqlen_kv_b - fx.Index(1)
@@ -3232,11 +3253,15 @@ class GenericKvGmemToLdsLoader:
         self.ctx = ctx
         self.page_ids = None
 
-    def load_k(self, token_idx, col):
-        return self.ctx.load_kv_vec(self.ctx.k_ptr, token_idx, col, is_v=False)
+    def load_k(self, token_idx, col, zero_tail=True):
+        return self.ctx.load_kv_vec(
+            self.ctx.k_ptr, token_idx, col, is_v=False, zero_tail=zero_tail
+        )
 
-    def load_v(self, token_idx, col):
-        return self.ctx.load_kv_vec(self.ctx.v_ptr, token_idx, col, is_v=True)
+    def load_v(self, token_idx, col, zero_tail=True):
+        return self.ctx.load_kv_vec(
+            self.ctx.v_ptr, token_idx, col, is_v=True, zero_tail=zero_tail
+        )
 
     def row_clamp(self, row_idx):
         return self.ctx.kv_row_clamp(row_idx)
@@ -3381,13 +3406,14 @@ class GenericKvGmemToLdsLoader:
             row_idx = self._kv_row_idx(
                 pid, tile_start, ctx.load_row_in_batch + row_offset
             )
-            vecs.append(self.load_k(row_idx, ctx.load_col_base))
+            vecs.append(self.load_k(row_idx, ctx.load_col_base, zero_tail=False))
         return vecs
 
     def coop_store_k_lds(self, vecs, buf_id=0):
         ctx = self.ctx
         traits = ctx.traits
         k_base = self.k_buf_base(buf_id)
+        vecs = [ctx.zero_kv_tail(v, ctx.load_col_base, is_v=False) for v in vecs]
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
             if const_expr(traits.KV_NEEDS_GUARD):
@@ -3480,7 +3506,7 @@ class GenericKvGmemToLdsLoader:
             row_idx = self._kv_row_idx(
                 pid, tile_start, ctx.load_row_in_batch + row_offset
             )
-            vecs.append(self.load_v(row_idx, ctx.load_col_base))
+            vecs.append(self.load_v(row_idx, ctx.load_col_base, zero_tail=False))
         return vecs
 
     def coop_store_v_lds(self, vecs, buf_id=0):
@@ -3501,6 +3527,7 @@ class GenericKvGmemToLdsLoader:
                 )
                 Vec(vecs[j]).store(ctx.lds_kv, [dst])
             return
+        vecs = [ctx.zero_kv_tail(v, ctx.load_col_base, is_v=True) for v in vecs]
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
             if const_expr(traits.KV_NEEDS_GUARD):
@@ -3520,7 +3547,7 @@ class GenericKvGmemToLdsLoader:
         pid = self._tile_page_id(tile_start) if traits.PAGED else None
         for r in range_constexpr(ctx.vp_rows_per_thread):
             row_idx = self._kv_row_idx(pid, tile_start, ctx.vp_row_base + r)
-            vecs.append(self.load_v(row_idx, ctx.vp_col_base))
+            vecs.append(self.load_v(row_idx, ctx.vp_col_base, zero_tail=False))
         return vecs
 
     def coop_store_v_lds_perm(self, vecs, buf_id=0):
@@ -3540,6 +3567,7 @@ class GenericKvGmemToLdsLoader:
         ctx = self.ctx
         traits = ctx.traits
         v_base = self.v_buf_base(buf_id)
+        vecs = [ctx.zero_kv_tail(v, ctx.vp_col_base, is_v=True) for v in vecs]
         dwords = [
             Vec(vecs[r]).bitcast(fx.Int32)
             for r in range_constexpr(ctx.vp_rows_per_thread)
