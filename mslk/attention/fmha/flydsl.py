@@ -133,19 +133,6 @@ _BOTTOM_RIGHT_CAUSAL_TYPES = (
 # Varlen-local (windowed) top-left type; drives causal_top_left.
 _VARLEN_WINDOW_TOPLEFT_TYPES = (BlockDiagonalCausalLocalAttentionMask,)
 
-# Head dims the kernel builds natively; other dims in [1, 256] compute at the next
-# value here with the missing columns masked in-kernel (paged-gappy pads them with
-# a copy instead: padded Q/K add 0 to QK; padded V columns are sliced off O).
-_SUPPORTED_HEAD_DIMS = (64, 128, 256)
-
-
-def _pad_head_dim(d: int) -> int:
-    """Smallest natively-buildable head dim >= d (one of _SUPPORTED_HEAD_DIMS)."""
-    for hd in _SUPPORTED_HEAD_DIMS:
-        if d <= hd:
-            return hd
-    return d
-
 
 def _pack_varlen_lse(lse: torch.Tensor, q_seqinfo: Any) -> torch.Tensor:
     """Padded per-batch LSE [B, H, max_seqlen_q] -> packed [1, H, total_q].
@@ -288,8 +275,8 @@ class FwOp(AttentionFwOpBase):
                 reasons.append(
                     f"paged head_dim={K} unsupported (kernel paged: {_PAGED_HEAD_DIMS})"
                 )
-        # Paged-gappy uses the generic paged kernel (per-row page lookup). D is
-        # padded to {64,128,256}; page_size must be a multiple of the kernel's 64.
+        # Paged-gappy uses the generic paged kernel (per-row page lookup), which
+        # masks non-native head dims; page_size must be a multiple of the kernel's 64.
         if isinstance(d.attn_bias, _PAGED_GAPPY_TYPES):
             if d.attn_bias.page_size % _KERNEL_PAGE_SIZE != 0:
                 reasons.append(
@@ -437,16 +424,12 @@ class FwOp(AttentionFwOpBase):
         causal = isinstance(bias, _CAUSAL_BIAS_TYPES)
 
         # Head dims: the kernel reads Q/K rows Dqk wide and V/O rows Dv wide and
-        # masks the columns up to its compute width, so nothing is copied. It moves
-        # whole dwords, so an odd dim gets one zero column (a copy). Paged-gappy
-        # still pads to the next of {64, 128, 256}; native paged is never padded
-        # (gated to _PAGED_HEAD_DIMS upstream, all even).
+        # masks the columns up to its compute width, so nothing is copied, paged
+        # caches included. It moves whole dwords, so an odd dim gets one zero
+        # column (a copy).
         Dqk = inp.query.shape[-1]
         Dv = inp.value.shape[-1]
-        if isinstance(bias, _PAGED_GAPPY_TYPES):
-            Dqk_pad = Dv_pad = _pad_head_dim(Dqk)
-        else:
-            Dqk_pad, Dv_pad = Dqk + Dqk % 2, Dv + Dv % 2
+        Dqk_pad, Dv_pad = Dqk + Dqk % 2, Dv + Dv % 2
 
         def _pad_to(t: torch.Tensor, d: int) -> torch.Tensor:
             return (
@@ -524,7 +507,8 @@ class FwOp(AttentionFwOpBase):
 
         if isinstance(bias, _PAGED_BIAS_TYPES):
             # Paged KV: Q packed [1, total_q, H, D], K/V the physical page cache.
-            # Drives the kernel's varlen+paged path. Native-D only, so pad=False.
+            # Drives the kernel's varlen+paged path. Head dims are even
+            # (_PAGED_HEAD_DIMS), so pad=False.
             H = inp.query.shape[-2]
             Hkv = inp.key.shape[-2]
             Dk = inp.key.shape[-1]
@@ -590,12 +574,12 @@ class FwOp(AttentionFwOpBase):
             # The generic paged kernel fixes PAGE_SIZE == BLOCK_N == 64. Reshape the
             # physical cache to 64-row sub-pages and expand block_table so each
             # logical page p maps to sub-pages [p*sub, p*sub+sub); this keeps the
-            # in-kernel per-row page lookup valid at any physical page_size. Head dim
-            # is zero-padded (last axis) like the other paths.
+            # in-kernel per-row page lookup valid at any physical page_size. An odd
+            # head dim gets one zero column, as on the other paths.
             sub = page_size // _KERNEL_PAGE_SIZE
             k = _pad_to(inp.key.reshape(-1, _KERNEL_PAGE_SIZE, Hkv, Dk), Dqk_pad)
             v = _pad_to(inp.value.reshape(-1, _KERNEL_PAGE_SIZE, Hkv, Dk), Dv_pad)
-            # sm_scale (native, pinned above when padding) is folded by the generic
+            # sm_scale (pinned above for an odd head dim) is folded by the generic
             # paged kernel, so no Q pre-scale is needed.
             bt = bias.block_tables.to(torch.int32).to(q.device)
             bt64 = (

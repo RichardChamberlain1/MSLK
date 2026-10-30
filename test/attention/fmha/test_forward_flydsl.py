@@ -139,3 +139,33 @@ def test_forward_flydsl_head_dims_match_padding(K, route):
         qp, kp, vp, bias, scale=K**-0.5, op=flydsl.FwOp
     )
     assert torch.equal(out, padded[..., :K])
+
+
+@rocm_only
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("K", [72, 96, 160])
+def test_forward_flydsl_paged_gappy_head_dims(monkeypatch, K, dtype):
+    # Paged-gappy at a non-native head dim reads the cache in place: the light
+    # kernel is built at the next native width and masks the rest, rather than
+    # the op copying the cache out to a padded one.
+    if not is_flydsl_available():
+        pytest.skip("FlyDSL is not available")
+    from mslk.attention.flydsl import flash_attn_interface as fai
+
+    builds = []
+    real = fai._build_paged_light
+
+    def spy(*args, **kwargs):
+        builds.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(fai, "_build_paged_light", spy)
+    bias_type = fmha.attn_bias.PagedBlockDiagonalGappyKeysMask
+    # kv_len < 256 keeps a numerical mismatch a failure (no precision-floor xfail).
+    test_forward_flydsl(
+        (flydsl.FwOp, "cuda", dtype, bias_type, 2, 32, 192, 1, K, K, False, "BMHK")
+    )
+    D = 128 if K <= 128 else 256
+    assert builds and all(
+        c["head_dim"] == D and c["head_dim_qk"] == K for c in builds
+    ), builds
