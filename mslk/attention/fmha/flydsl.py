@@ -773,8 +773,8 @@ _dqdkdv_kernel_cache: dict = {}
 _gfx950_kernel_cache: dict = {}
 _preprocess_kernel_cache: dict = {}
 _convert_dq_kernel_cache: dict = {}
-# Compute head dims of the gfx950 backward; others (e.g. 96, 224) are slower than
-# masking up to the next of these.
+# Compute head dims of the gfx950 backward; other head dims (e.g. 96, 224) run
+# masked at the next of these.
 _BWD_GFX950_HEAD_DIMS = (32, 64, 128, 160, 256)
 
 
@@ -812,8 +812,8 @@ def _flydsl_bwd(
     # group-mode). Non-varlen: B == query.shape[0].
     varlen = seqstart_q is not None
     H = query.shape[2]
-    # Stored head dims; the gfx950 kernel computes at the fastest D that covers
-    # them (see _BWD_GFX950_HEAD_DIMS) and masks the rest.
+    # Stored head dims; the gfx950 kernel computes at the smallest D in
+    # _BWD_GFX950_HEAD_DIMS that covers them and masks the rest.
     Dqk, Dv = query.shape[3], value.shape[3]
     D = Dqk
     if "gfx950" in torch.cuda.get_device_properties(query.device).gcnArchName:

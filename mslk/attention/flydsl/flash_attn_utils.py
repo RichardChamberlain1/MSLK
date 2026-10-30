@@ -1673,11 +1673,14 @@ def _make_flash_attn_generic_traits(
         raise ValueError("stored head dims < head_dim need a linear KV layout")
     # A masked paged build reads K/V through the cooperative loaders only; the
     # paged DMA, K prefetch and prefetch pipelines do not mask the tail columns.
+    # The caller picks paged features, so reject them here; the env-driven ones
+    # are gated below.
     masked_paged = bool(paged) and (head_dim_qk, head_dim_v) != (head_dim, head_dim)
-    if masked_paged:
-        path_tag = "N32"
-        paged_kv_dma = False
-        paged_k_prefetch = False
+    if masked_paged and (paged_kv_dma or paged_k_prefetch):
+        raise ValueError(
+            f"stored head dims ({head_dim_qk}, {head_dim_v}) < head_dim={head_dim} "
+            "do not support paged KV DMA or K prefetch"
+        )
 
     block_m = 128 if block_m is None else block_m
     if flat_work_group_size is None:

@@ -57,6 +57,14 @@ _VARLEN_LIGHT_MAX_SEQ = 256
 # Head dims the generic kernel builds; others compute at the next of these with
 # the missing columns masked in-kernel.
 _GENERIC_HEAD_DIMS = (64, 128, 256)
+
+
+def _run_head_dim(d: int) -> int:
+    """The head dim a call with stored head dim ``d`` computes at: the smallest of
+    _GENERIC_HEAD_DIMS >= d, or 0 when ``d`` is above them all."""
+    return next((hd for hd in _GENERIC_HEAD_DIMS if hd >= d), 0)
+
+
 _DENSE_LIGHT_CU_FALLBACK = 256
 _DENSE_DUALWAVE_MIN_SEQ = 256
 _DENSE_DUALWAVE_LARGE_BATCH = 8
@@ -119,8 +127,7 @@ def _dense_generic_tile(
     if head_dim in (64, 128) and dtype_str in ("bf16", "f16"):
         main_blocks = batch * num_heads * ((seq_len + 127) // 128)
         if main_blocks < _dense_light_cu(device):
-            # Bias too: block_m=128 halves an already-underfilled grid and is
-            # 1.2-1.5x slower than this tile at every measured shape.
+            # Bias too: block_m=128 would halve an already-underfilled grid.
             return 64, 128, "N32"
     if num_heads >= 32 and batch * seq_len >= _DENSE_M256_MIN_TOKENS:
         return 256, 512, "auto"
@@ -129,7 +136,7 @@ def _dense_generic_tile(
 
 # Generic split-K uses BLOCK_M=64, so the "mtile" (Q rows per workgroup) is 64.
 _GENERIC_SPLITK_BLOCK_M = 64
-# Cross length splits once the KV walk pays for the combine launch
+# Cross length splits once the KV walk pays for the combine launch.
 _CROSS_SPLITK_MIN_KV = 2048
 # Dropout splits under the same floor, except at D>=128, where the keep-mask
 # gather makes each KV tile dear enough to pay from ~1000 keys.
@@ -1323,7 +1330,7 @@ def _flydsl_flash_attn_paged(
     # which reads Q/K/V at their stored width D -- the cache in place -- and masks
     # the missing columns.
     _masked_hd = D not in _GENERIC_HEAD_DIMS
-    D_run = next((d for d in _GENERIC_HEAD_DIMS if d >= D), 0) if _masked_hd else D
+    D_run = _run_head_dim(D)
     if _masked_hd and (D % 2 or not D_run):
         raise ValueError(
             f"flydsl_flash_attn_func: head_dim ({D}) must be even and <= 256"
@@ -2341,9 +2348,9 @@ def flydsl_flash_attn_func(
         raise ValueError(
             f"flydsl_flash_attn_func: k head_dim ({k.shape[-1]}) must match q ({Dqk})"
         )
-    masked_hd = Dv != Dqk or D not in (64, 128, 256)
+    masked_hd = Dv != Dqk or D not in _GENERIC_HEAD_DIMS
     if masked_hd:
-        D = next((d for d in (64, 128, 256) if d >= max(Dqk, Dv)), 0)
+        D = _run_head_dim(max(Dqk, Dv))
         if not D or Dqk % 2 or Dv % 2:
             raise ValueError(
                 f"flydsl_flash_attn_func: head dims (qk={Dqk}, v={Dv}) must be "

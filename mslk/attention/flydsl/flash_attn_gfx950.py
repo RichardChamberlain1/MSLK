@@ -240,7 +240,8 @@ def build_flash_attn_dualwave_swp_module(
             _sched_barrier(0)
             _s_barrier()
 
-            # Load this wave's Q rows and pre-scale by the 1/sqrt(D) softmax
+            # Load this wave's Q rows unscaled; the softmax helper applies the
+            # 1/sqrt(D) * log2(e) scale to the fp32 scores.
             q_all_bf16 = q_loader.load_all()
 
             # Pipeline ahead: prefetch K tile1 (buf1) + V tile0 (buf0) as background
