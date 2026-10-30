@@ -47,7 +47,7 @@ def is_flydsl_available() -> bool:
     if importlib.util.find_spec("flydsl") is None:
         return False
     try:
-        from flydsl.runtime.device import (  # pyre-ignore[21]  # pyre-ignore[21]
+        from flydsl.runtime.device import (  # pyre-ignore[21]
             get_rocm_arch,
             SMEM_CAPACITY_MAP,
         )

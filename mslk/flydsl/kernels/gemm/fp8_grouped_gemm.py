@@ -481,9 +481,9 @@ def compile_fp8_grouped_gemm(
 
         # LDS setup: ping-pong A buffers (preshuffle) or A ping-pong + single B
         # buffer (plain). B LDS is only needed for the plain path.
-        # The A/B arena is addressed as raw bytes -- default_f8_type() is its byte element
-        # type, not the dtype of the operands -- so its shapes, strides and
-        # column coordinates are all byte quantities. That is what lets the
+        # The A/B arena is addressed as raw bytes -- default_f8_type() is its
+        # byte element type, not the dtype of the operands -- so its shapes,
+        # strides and column coordinates are all byte quantities. That lets the
         # XOR16 swizzle and the LDS pack loads be shared across input dtypes.
         base_ptr = allocator.get_base()
         lds_a = SmemPtr(

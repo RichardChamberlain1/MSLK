@@ -9,8 +9,9 @@
 
 """Common helpers shared by kernel modules.
 
-Keep helper naming consistent with other kernel helpers (e.g. `mfma_preshuffle_pipeline.py`),
-but this module is intentionally small and MLIR-dialect facing.
+Keep helper naming consistent with other kernel helpers (for example,
+`mfma_preshuffle_pipeline.py`), but keep this module small and MLIR-dialect
+facing.
 """
 
 from contextlib import contextmanager
@@ -38,16 +39,20 @@ def default_f8_type():
     instruction selection."""
     try:
         arch = str(get_rocm_arch())
-    except Exception:
-        arch = ""
+    except Exception as error:
+        raise RuntimeError(
+            "default_f8_type(): unable to determine the ROCm architecture"
+        ) from error
     if "gfx95" in arch or "gfx12" in arch:
         return fx.Float8E4M3FN.ir_type
+    if arch.startswith("gfx94"):
+        return fx.Float8E4M3FNUZ.ir_type
     if arch.startswith("gfx11"):
         raise RuntimeError(
             f"default_f8_type(): no native FP8 support on {arch}; FP8 "
             "instructions are available on gfx94*, gfx95* and gfx12*."
         )
-    return fx.Float8E4M3FNUZ.ir_type
+    raise RuntimeError(f"default_f8_type(): unsupported ROCm architecture {arch}")
 
 
 def get_llvm_ptr(ptr, offset, dtype_bytes, ptr_type=None):
