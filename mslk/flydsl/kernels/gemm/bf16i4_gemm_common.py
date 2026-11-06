@@ -209,8 +209,8 @@ def make_int4_dequantizer(*, is_gfx950):
                 static_position=[0],
                 dynamic_position=[],
             )
-        low_bits = ArithValue(arith.bitcast(T.i32, low))
-        high_bits = ArithValue(arith.bitcast(T.i32, high))
+        low_bits = ArithValue(arith.bitcast(T.i32, arith._to_raw(low)))
+        high_bits = ArithValue(arith.bitcast(T.i32, arith._to_raw(high)))
         return (low_bits >> c16) | (high_bits & upper_half_mask)
 
     def pack_four_bf16(weights):
