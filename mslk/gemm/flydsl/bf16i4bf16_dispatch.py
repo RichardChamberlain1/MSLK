@@ -49,11 +49,19 @@ SCALE_DTYPES = {torch.bfloat16: "bf16", torch.float32: "f32"}
 #: buffer_load adds are both 32-bit, so every operand must stay below this.
 BUFFER_LIMIT_BYTES = 1 << 32
 
-# PENDING fork 2 (Deferred D4): provisional per-architecture tile_k for
-# tile_m >= 32. To be set from the unit 7 tile_k x roll_k sweep
-# (designs/probes/bf16i4bf16-flydsl-port/unit7_tilek_roll).
-DEFAULT_TILE_K_BY_ARCH = {"gfx950": 128, "gfx942": 64}
+# tile_k for tile_m >= 32 on both architectures: at M >= 256, tile_k 64 ran
+# faster than 128 in every measured K, rolled or unrolled.
+DEFAULT_TILE_K = 64
 DEFAULT_TILE_N = 128
+
+# Where an unrolled K loop has been measured to beat a rolled one: tile_m 256,
+# tile_k 64, M from this value up, per architecture. On gfx950 unrolled ran
+# 16-25% faster from M = 2048 at K = 2048 and 16384 and slower below; at
+# K = 8192 rolled won at every M, which autotune finds per shape. On gfx942
+# rolled was faster or level everywhere, so it has no entry.
+UNROLLED_K_LOOP_MIN_M = {"gfx950": 2048}
+UNROLLED_K_LOOP_TILE_M = 256
+UNROLLED_K_LOOP_TILE_K = 64
 
 # The A loader copies the tile into LDS with all 256 threads in whole 16-byte
 # loads, so a bf16 A tile must hold a multiple of 4096 bytes: tile_m = 16 reaches
@@ -71,7 +79,7 @@ _CANDIDATE_TILE_K = (64, 128)
 _CANDIDATE_WAVES_PER_EU = (0, 2)
 _CANDIDATE_WAVE_GRIDS = ((1, 4), (2, 2), (4, 1))
 MFMA_TILE = 16
-CANDIDATE_TILES = tuple(
+_ROLLED_CANDIDATE_TILES = tuple(
     {
         "tile_m": tile_m,
         "tile_n": tile_n,
@@ -79,6 +87,7 @@ CANDIDATE_TILES = tuple(
         "waves_m": waves_m,
         "waves_n": waves_n,
         "waves_per_eu": waves_per_eu,
+        "roll_k": True,
     }
     for tile_m in _CANDIDATE_TILE_M
     for tile_n in _CANDIDATE_TILE_N
@@ -91,23 +100,57 @@ CANDIDATE_TILES = tuple(
     and tile_m % (waves_m * MFMA_TILE) == 0
     and tile_n % (waves_n * MFMA_TILE) == 0
 )
+# Unrolled twins only of the tile shape where unrolling has been measured to
+# win: an unrolled candidate's compile grows with K (over a minute at K = 16384),
+# so the sweep stays small. _prune keeps them only for the M and architecture
+# that unrolled_k_loop_measured_faster allows.
+_UNROLLED_CANDIDATE_TILES = tuple(
+    {**tile, "roll_k": False}
+    for tile in _ROLLED_CANDIDATE_TILES
+    if tile["tile_m"] == UNROLLED_K_LOOP_TILE_M
+    and tile["tile_k"] == UNROLLED_K_LOOP_TILE_K
+)
+CANDIDATE_TILES = _ROLLED_CANDIDATE_TILES + _UNROLLED_CANDIDATE_TILES
 
 # A tile that overruns N or K still compiles, masked, but wastes part of its work;
 # when nothing divides, prune_by_divisibility falls back to the whole list.
-_PRUNE = prune_by_divisibility({"tile_n": "n", "tile_k": "k"})
-# roll_k is policy (should_roll_k), not tuned, as in grouped_dispatch: a fully
-# unrolled candidate costs a compile that grows with K. The architecture is not
-# in the key because FlyDSL's tuning cache already records the device.
+_prune_by_divisibility = prune_by_divisibility({"tile_n": "n", "tile_k": "k"})
+# The architecture is not in the key because FlyDSL's tuning cache already
+# records the device.
 _KEY = ["m_bucket", "n", "k", "group_size", "scale_dtype"]
 
 
-def should_roll_k(k: int, tile_k: int) -> bool:
-    """Whether to compile the K loop rolled rather than unrolled.
+def unrolled_k_loop_measured_faster(
+    m: int, arch: str, tile_m: int, tile_k: int
+) -> bool:
+    """True where an unrolled K loop has been measured to beat a rolled one.
 
-    PENDING fork 3: provisional policy, always unrolled (the kernel factory's
-    default). To be set from the unit 7 tile_k x roll_k sweep.
+    Everywhere else the loop stays rolled: its code size does not grow with K,
+    and it compiles in about a second. M, not tile_m, decides, because M = 256
+    and M = 4096 share tile_m 256 but not the faster loop.
     """
-    return False
+    min_m_for_unrolled = UNROLLED_K_LOOP_MIN_M.get(arch)
+    return (
+        min_m_for_unrolled is not None
+        and m >= min_m_for_unrolled
+        and tile_m == UNROLLED_K_LOOP_TILE_M
+        and tile_k == UNROLLED_K_LOOP_TILE_K
+    )
+
+
+def _prune(configs, named_args, **kwargs):
+    """Divisibility pruning, then unrolled candidates only where they can win."""
+    divisible = _prune_by_divisibility(configs, named_args, **kwargs)
+    m_bucket = named_args["m_bucket"]
+    arch = _device_arch(named_args["x"].device)
+    return [
+        config
+        for config in divisible
+        if config.kwargs["roll_k"]
+        or unrolled_k_loop_measured_faster(
+            m_bucket, arch, config.kwargs["tile_m"], config.kwargs["tile_k"]
+        )
+    ]
 
 
 def default_tile_config(m: int, arch: str) -> dict:
@@ -120,8 +163,14 @@ def default_tile_config(m: int, arch: str) -> dict:
     if tile_m == SMALLEST_TILE_M:
         tile_k = SMALLEST_TILE_M_TILE_K
     else:
-        tile_k = DEFAULT_TILE_K_BY_ARCH[arch]
-    return {"tile_m": tile_m, "tile_n": DEFAULT_TILE_N, "tile_k": tile_k}
+        tile_k = DEFAULT_TILE_K
+    unrolled = unrolled_k_loop_measured_faster(m, arch, tile_m, tile_k)
+    return {
+        "tile_m": tile_m,
+        "tile_n": DEFAULT_TILE_N,
+        "tile_k": tile_k,
+        "roll_k": not unrolled,
+    }
 
 
 @functools.lru_cache(maxsize=8)
@@ -207,13 +256,15 @@ def launch(
     waves_m=1,
     waves_n=4,
     waves_per_eu=0,
+    roll_k=True,
 ):
     """Compile (cached) and launch the kernel for one tile config.
 
     ``x`` is [M, K] and ``out`` [M, N]. ``m_bucket``, ``n``, ``k``,
     ``group_size`` and ``scale_dtype`` form the autotune key; ``m_bucket``
     also selects the default tile. The wave defaults (a 1x4 grid, occupancy
-    left to the compiler) are what the untuned path runs.
+    left to the compiler) are what the untuned path runs; ``roll_k`` comes
+    from the tile config, defaulting to the rolled loop.
     """
     from mslk.flydsl.kernels.gemm.bf16i4_gemm import compile_bf16i4_gemm
 
@@ -234,7 +285,7 @@ def launch(
         waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
         layout="batched",
         n_padding=(n % tile_n != 0),
-        roll_k=should_roll_k(k, tile_k),
+        roll_k=roll_k,
     )
     # Every operand is addressed as flat bytes by the kernel, so each is handed
     # over as an int8 view in its natural shape (a flattened view would overflow
@@ -262,7 +313,7 @@ def _default_for_call(args) -> dict:
 
 
 _tuned_launch = tunable(
-    configs=CANDIDATE_TILES, default=_default_for_call, key=_KEY, prune=_PRUNE
+    configs=CANDIDATE_TILES, default=_default_for_call, key=_KEY, prune=_prune
 )(launch)
 
 
