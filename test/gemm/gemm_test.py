@@ -7,6 +7,7 @@
 # pyre-ignore-all-errors[56]
 
 import contextlib
+import gc
 import os
 import unittest
 from math import prod
@@ -1961,9 +1962,10 @@ class BF16Int4TritonROCmTests(unittest.TestCase):
         group_size: int,
     ) -> None:
         """
-        Verifies that torch.ops.mslk.bf16i4bf16_rowwise dispatches to the
-        Triton kernel on ROCm (requires mslk C++ library and int4_gemm.py
-        both to be loaded).
+        Verifies that torch.ops.mslk.bf16i4bf16_rowwise is registered on ROCm
+        and returns the GEMM. It is served by FlyDSL where that backend is
+        installed and supports the call, and by Triton otherwise, so it is
+        checked against the reference rather than against either kernel.
         """
         if not hasattr(torch.ops, "mslk") or not hasattr(
             torch.ops.mslk, "bf16i4bf16_rowwise"
@@ -1979,8 +1981,204 @@ class BF16Int4TritonROCmTests(unittest.TestCase):
         w_zp = w_zp.contiguous().to(device=self.device)
 
         y_op = torch.ops.mslk.bf16i4bf16_rowwise(x, wq, w_scale, w_zp)
-        y_direct = self.matmul_rowwise(x, wq, w_scale, w_zp)
-        torch.testing.assert_close(y_op, y_direct, atol=0.0, rtol=0.0)
+        y_ref = (x.float() @ w.float().T).to(torch.bfloat16)
+        self.assertEqual(y_op.dtype, torch.bfloat16)
+        torch.testing.assert_close(y_op, y_ref, atol=1.0e-1, rtol=8.0e-2)
+
+
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx942", "gfx950")
+@unittest.skipUnless(
+    is_flydsl_version_at_least(),
+    f"requires FlyDSL >= {MIN_FLYDSL_VERSION}, found {flydsl_version()}",
+)
+class BF16Int4FlyDSLROCmTests(unittest.TestCase):
+    """
+    Tests for the FlyDSL BF16xINT4 rowwise GEMM behind
+    torch.ops.mslk.bf16i4bf16_rowwise and bf16i4bf16_shuffled.
+
+    The accuracy cases compare against the unquantised x @ w.T at the tolerance
+    of the Triton tests above. The weight-cache test compares against
+    x @ dequant(wq).T at a tight tolerance, with the weights rounded to bf16 as
+    the kernel rounds them (to nearest on gfx950, towards zero on gfx942), since
+    serving another weight's cached copy could hide inside the quantisation
+    error.
+    """
+
+    # Against the unquantised weights: the Triton tests' tolerance.
+    QUANTISED_ATOL = 1.0e-1
+    QUANTISED_RTOL = 8.0e-2
+    # Against the dequantised weights: PyTorch's bf16 default rtol (about two
+    # bf16 spacings) with an absolute floor for outputs near zero.
+    DEQUANTISED_ATOL = 1.0e-2
+    DEQUANTISED_RTOL = 1.6e-2
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.device = "cuda"
+        from mslk.gemm.flydsl.bf16i4bf16_dispatch import _device_arch, is_supported
+        from mslk.gemm.flydsl.bf16i4bf16_gemm import reordered_weight
+        from mslk.gemm.triton.int4_gemm import matmul_bf16i4_rowwise
+
+        cls.arch = _device_arch(torch.device(cls.device))
+        cls.is_supported = staticmethod(is_supported)
+        cls.reordered_weight = staticmethod(reordered_weight)
+        cls.matmul_triton = staticmethod(matmul_bf16i4_rowwise)
+
+    def _make_operands(
+        self,
+        x_shape: tuple[int, ...],
+        N: int,
+        group_size: int,
+        scale_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """x, the unquantised w, and its packed INT4 weights, scales and zeros."""
+        K = x_shape[-1]
+        x = torch.randn(*x_shape, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+        wq, w_scale, w_zp = int4_row_quantize(w, group_size)
+        wq = pack_int4(wq).contiguous().to(device=self.device)
+        w_scale = w_scale.to(dtype=scale_dtype, device=self.device).contiguous()
+        w_zp = w_zp.to(dtype=scale_dtype, device=self.device).contiguous()
+        return x, w, wq, w_scale, w_zp
+
+    def _dequantised_weight(
+        self,
+        wq: torch.Tensor,
+        w_scale: torch.Tensor,
+        w_zp: torch.Tensor,
+    ) -> torch.Tensor:
+        """[N, K] fp32 weights as the kernel builds them before the MFMA."""
+        N, packed_k = wq.shape
+        K = 2 * packed_k
+        group_size = K // w_scale.shape[0]
+        packed_bytes = wq.view(torch.uint8).to(torch.int32)
+        low_nibbles = packed_bytes & 0xF
+        high_nibbles = packed_bytes >> 4
+        nibbles = torch.stack((low_nibbles, high_nibbles), dim=-1).reshape(N, K)
+        signed_q = ((nibbles ^ 8) - 8).float()
+        group_of_k = torch.arange(K, device=wq.device) // group_size
+        scale_per_k = w_scale.float()[group_of_k].T
+        zero_per_k = w_zp.float()[group_of_k].T
+        w_fp32 = signed_q * scale_per_k + zero_per_k
+        if self.arch == "gfx950":
+            return w_fp32.to(torch.bfloat16).float()
+        upper_16_bits = w_fp32.view(torch.int32) & ~0xFFFF
+        return upper_16_bits.view(torch.float32)
+
+    def _check_against_unquantised(
+        self, y: torch.Tensor, x: torch.Tensor, w: torch.Tensor
+    ) -> None:
+        """y against x @ w.T with the original weights, at the Triton tests' tolerance."""
+        K = x.shape[-1]
+        N = w.shape[0]
+        x_rows = x.reshape(-1, K).float()
+        y_ref = (x_rows @ w.float().T).reshape(*x.shape[:-1], N)
+        self.assertEqual(y.dtype, torch.bfloat16)
+        self.assertEqual(y.shape, y_ref.shape)
+        torch.testing.assert_close(
+            y.float(), y_ref, atol=self.QUANTISED_ATOL, rtol=self.QUANTISED_RTOL
+        )
+
+    def _check_against_dequantised(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        wq: torch.Tensor,
+        w_scale: torch.Tensor,
+        w_zp: torch.Tensor,
+    ) -> None:
+        """y against x @ dequant(wq).T, at the tight tolerance."""
+        K = x.shape[-1]
+        N = wq.shape[0]
+        x_rows = x.reshape(-1, K).float()
+        w_dequantised = self._dequantised_weight(wq, w_scale, w_zp)
+        y_ref = (x_rows @ w_dequantised.T).reshape(*x.shape[:-1], N)
+        self.assertEqual(y.dtype, torch.bfloat16)
+        self.assertEqual(y.shape, y_ref.shape)
+        torch.testing.assert_close(
+            y.float(), y_ref, atol=self.DEQUANTISED_ATOL, rtol=self.DEQUANTISED_RTOL
+        )
+
+    @parameterized.expand(
+        [
+            # (name, x_shape, N, group_size, scale_dtype, op_name)
+            ("small", (1, 256), 256, 128, torch.float32, "bf16i4bf16_rowwise"),
+            ("medium", (512, 512), 1024, 128, torch.float32, "bf16i4bf16_rowwise"),
+            ("large", (2048, 1024), 4096, 128, torch.float32, "bf16i4bf16_rowwise"),
+            ("m_zero", (0, 512), 256, 128, torch.float32, "bf16i4bf16_rowwise"),
+            ("m_17", (17, 1024), 512, 128, torch.float32, "bf16i4bf16_rowwise"),
+            ("n_not_16", (64, 512), 1000, 128, torch.float32, "bf16i4bf16_rowwise"),
+            ("k_half_window", (64, 1088), 256, 64, torch.float32, "bf16i4bf16_rowwise"),
+            ("group_64", (64, 1024), 512, 64, torch.float32, "bf16i4bf16_rowwise"),
+            ("bf16_scales", (64, 1024), 512, 128, torch.bfloat16, "bf16i4bf16_rowwise"),
+            ("x_3d", (2, 33, 512), 384, 128, torch.float32, "bf16i4bf16_rowwise"),
+            ("shuffled", (64, 1024), 512, 128, torch.float32, "bf16i4bf16_shuffled"),
+        ]
+    )
+    def test_op_accuracy(
+        self,
+        name: str,
+        x_shape: tuple[int, ...],
+        N: int,
+        group_size: int,
+        scale_dtype: torch.dtype,
+        op_name: str,
+    ) -> None:
+        x, w, wq, w_scale, w_zp = self._make_operands(
+            x_shape, N, group_size, scale_dtype
+        )
+        self.assertTrue(
+            self.is_supported(x, wq, w_scale, w_zp, group_size),
+            f"{name}: expected the FlyDSL kernel to serve this call",
+        )
+        op = getattr(torch.ops.mslk, op_name)
+        y = op(x, wq, w_scale, w_zp)
+        self._check_against_unquantised(y, x, w)
+
+    def test_unsupported_shape_falls_back_to_triton(self) -> None:
+        # N not a multiple of 8 is outside the FlyDSL kernel, so the op must
+        # return exactly what the Triton kernel does.
+        x, _, wq, w_scale, w_zp = self._make_operands(
+            (64, 512), 100, 128, torch.float32
+        )
+        self.assertFalse(self.is_supported(x, wq, w_scale, w_zp, 128))
+        y_op = torch.ops.mslk.bf16i4bf16_rowwise(x, wq, w_scale, w_zp)
+        y_triton = self.matmul_triton(x, wq, w_scale, w_zp)
+        torch.testing.assert_close(y_op, y_triton, atol=0.0, rtol=0.0)
+
+    def test_weight_cache_reused_address(self) -> None:
+        # A freed weight's address is handed to the next allocation of the same
+        # size; the cache must serve the new weight, not the old one's copy.
+        # The new weight is built as a new tensor over the old one's storage,
+        # which gives it the old address on every allocator.
+        x_shape, N, group_size = (64, 1024), 512, 128
+        x, _, first_wq, first_scale, first_zp = self._make_operands(
+            x_shape, N, group_size, torch.float32
+        )
+        torch.ops.mslk.bf16i4bf16_rowwise(x, first_wq, first_scale, first_zp)
+
+        torch.manual_seed(1)
+        x, w, new_values, w_scale, w_zp = self._make_operands(
+            x_shape, N, group_size, torch.float32
+        )
+        first_address = first_wq.data_ptr()
+        storage = first_wq.untyped_storage()
+        shape, stride = first_wq.shape, first_wq.stride()
+        del first_wq
+        gc.collect()
+        second_wq = torch.empty(0, dtype=torch.int8, device=self.device)
+        second_wq.set_(storage, 0, shape, stride)
+        second_wq.copy_(new_values)
+        self.assertEqual(second_wq.data_ptr(), first_address)
+
+        y = torch.ops.mslk.bf16i4bf16_rowwise(x, second_wq, w_scale, w_zp)
+        self._check_against_dequantised(y, x, second_wq, w_scale, w_zp)
+
+        # A second call with the same weight is served from the cache.
+        self.assertIs(
+            self.reordered_weight(second_wq), self.reordered_weight(second_wq)
+        )
 
 
 @skipUnlessRocm()
