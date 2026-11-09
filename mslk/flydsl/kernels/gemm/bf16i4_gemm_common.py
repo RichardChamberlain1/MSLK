@@ -185,15 +185,18 @@ def make_int4_dequantizer(*, is_gfx950):
     this MFMA's SrcC reads to 3 wait states). With the dequant interleaved with
     the MFMAs, the inline forms overwrote a live accumulator.
 
-    WORKAROUND (gfx950 packed FP32 hazard): the FMAs are written as two-wide
-    vector FMAs that pair column block ni with ni + 1, so that the multiplier is
-    a genuine pair (16 * s of each block) rather than one scalar shared by both
-    halves. Written as scalars, LLVM pairs them itself into v_pk_fma_f32 and can
+    WORKAROUND (gfx950 hardware bug in v_pk_{add,mul,fma}_f32 with invalid
+    op_sel, fixed in LLVM by https://github.com/llvm/llvm-project/pull/233970):
+    remove once FlyDSL's bundled LLVM includes that fix.
+
+    The FMAs are written as two-wide vector FMAs that pair column block ni
+    with ni + 1, so that the multiplier is a genuine pair (16 * s of each
+    block) rather than one scalar shared by both halves. Written as scalars, LLVM pairs them itself into v_pk_fma_f32 and can
     address a shared scalar held in an odd VGPR as the high half of a pair, with
     op_sel selecting that high half for the low result. On gfx950, a packed FP32
     op of that form issued while an MFMA executes and followed by another MFMA
     within 2 wait states reads that operand as 0 on lanes 48-63, in about half
-    the runs; LLVM does not model it and the CDNA4 ISA does not list it. A block
+    the runs; the LLVM bundled with FlyDSL 0.4.0 predates the fix. A block
     with no partner (an odd number of blocks per wave) still pairs consecutive
     weights over one shared multiplier, which leaves that form possible.
     """
