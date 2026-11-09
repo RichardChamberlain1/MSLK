@@ -108,6 +108,42 @@ if torch.version.hip is not None:
         except RuntimeError:
             pass  # already registered (e.g. module imported more than once)
 
+    def _bf16i4bf16_rowwise_arbitrated(
+        X: torch.Tensor,
+        W: torch.Tensor,
+        w_scale_group: torch.Tensor,
+        w_zero_group: torch.Tensor,
+    ) -> torch.Tensor:
+        """FlyDSL where it is opted into and accepts this call, Triton otherwise.
+
+        Unlike the ops above, the choice is made per call, not once per GPU: the
+        FlyDSL kernel covers only some shapes (N a multiple of 8, a group size it
+        supports, operands one buffer descriptor can address), and every other
+        call keeps Triton.
+        """
+        mod = _flydsl_gemm_module("bf16i4bf16_dispatch")
+        if mod is not None:
+            num_scale_groups = w_scale_group.shape[0]
+            group_size = X.shape[-1] // num_scale_groups if num_scale_groups else 0
+            if mod.is_supported(X, W, w_scale_group, w_zero_group, group_size):
+                return mod.bf16i4bf16_rowwise_flydsl(
+                    X, W, w_scale_group, w_zero_group, group_size
+                )
+        from .triton.int4_gemm import matmul_bf16i4_rowwise
+
+        return matmul_bf16i4_rowwise(X, W, w_scale_group, w_zero_group)
+
+    # On ROCm the CUTLASS shuffle layout does not exist (preshuffle_i4 is the
+    # identity), so the shuffled op takes the same weights and the same path.
+    for _bf16i4_op in ("bf16i4bf16_rowwise", "bf16i4bf16_shuffled"):
+        if hasattr(torch.ops, "mslk") and hasattr(torch.ops.mslk, _bf16i4_op):
+            try:
+                torch.library.impl(f"mslk::{_bf16i4_op}", "CUDA")(
+                    _bf16i4bf16_rowwise_arbitrated
+                )
+            except RuntimeError:
+                pass  # already registered (e.g. module imported more than once)
+
     if hasattr(torch.ops, "mslk") and hasattr(
         torch.ops.mslk, "f8f8bf16_groupwise_grouped"
     ):
