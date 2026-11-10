@@ -49,10 +49,18 @@ SCALE_DTYPES = {torch.bfloat16: "bf16", torch.float32: "f32"}
 #: buffer_load adds are both 32-bit, so every operand must stay below this.
 BUFFER_LIMIT_BYTES = 1 << 32
 
-# tile_k for tile_m >= 32 on both architectures: at M >= 256, tile_k 64 ran
-# faster than 128 in every measured K, rolled or unrolled.
-DEFAULT_TILE_K = 64
-DEFAULT_TILE_N = 128
+# Untuned tiles, measured on gfx950 at N = 13312, K 6656 and 16384.
+# Decode (M <= 128) has too few output tiles for 256 CUs, so its default takes
+# more, narrower workgroups: tile_n 64 and half the rows of next_pow2(M). That
+# tile with tile_k 128 was the fastest of 21 variants at every measured M, and
+# the autotuner's choice as well.
+DECODE_MAX_M = 128
+DECODE_TILE_N = 64
+DECODE_TILE_K = 128
+# From M = 256 the grid is full; at tile_m 256 tile_k 64 ran faster than 128 at
+# every measured M and K.
+LARGE_M_TILE_N = 128
+LARGE_M_TILE_K = 64
 
 # Where an unrolled K loop has been measured to beat a rolled one: tile_m 256,
 # tile_k 64, M from this value up, per architecture. On gfx950 unrolled ran
@@ -164,18 +172,20 @@ def _prune(configs, named_args, **kwargs):
 def default_tile_config(m: int, arch: str) -> dict:
     """The untuned tile for M rows on ``arch``.
 
-    tile_m follows M up to the largest tile, so a decode-sized M pads at most to
-    16 rows. The smallest tile needs tile_k = 128 (see SMALLEST_TILE_M_TILE_K).
+    Decode (M <= DECODE_MAX_M) splits M over two row tiles of at least 16 rows,
+    so a decode-sized M pads at most to 16 rows; larger M uses the largest tile.
     """
-    tile_m = min(LARGEST_TILE_M, max(SMALLEST_TILE_M, next_pow2(m)))
-    if tile_m == SMALLEST_TILE_M:
-        tile_k = SMALLEST_TILE_M_TILE_K
+    rows = next_pow2(m)
+    if rows <= DECODE_MAX_M:
+        tile_m = max(SMALLEST_TILE_M, rows // 2)
+        tile_n, tile_k = DECODE_TILE_N, DECODE_TILE_K
     else:
-        tile_k = DEFAULT_TILE_K
+        tile_m = min(LARGEST_TILE_M, rows)
+        tile_n, tile_k = LARGE_M_TILE_N, LARGE_M_TILE_K
     unrolled = unrolled_k_loop_measured_faster(m, arch, tile_m, tile_k)
     return {
         "tile_m": tile_m,
-        "tile_n": DEFAULT_TILE_N,
+        "tile_n": tile_n,
         "tile_k": tile_k,
         "roll_k": not unrolled,
     }
