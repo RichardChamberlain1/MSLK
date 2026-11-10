@@ -83,6 +83,14 @@ SCALE_BYTES = {"f32": 4, "bf16": 2}
 BF16_BYTES = 2
 
 
+def lds_bytes(tile_m: int, tile_n: int, tile_k: int) -> int:
+    """LDS one block uses: B never touches LDS, the K loop uses one bf16 A
+    buffer, and the bf16 epilogue output aliases the same arena afterwards."""
+    a_tile_bytes = tile_m * tile_k * BF16_BYTES
+    epilogue_bytes = tile_m * tile_n * BF16_BYTES
+    return max(a_tile_bytes, epilogue_bytes)
+
+
 @functools.lru_cache(maxsize=128)
 def compile_bf16i4_gemm(
     *,
@@ -191,14 +199,12 @@ def compile_bf16i4_gemm(
     k_unroll = _c.k_unroll
     tile_k_bytes = _c.tile_k_bytes
 
-    # B never touches LDS, and the K loop uses one A buffer; the epilogue output
-    # aliases the same arena once the loop is done. Checked before tracing: an
-    # overflow during tracing kills the process.
+    # Checked before tracing: an overflow during tracing kills the process.
     lds_a_bytes = tile_m * tile_k_bytes
     lds_out_bytes = tile_m * tile_n * BF16_BYTES
     _check_lds_budget(
         variant="bf16i4",
-        total=max(lds_a_bytes, lds_out_bytes),
+        total=lds_bytes(tile_m, tile_n, tile_k),
         detail=f"A {lds_a_bytes}, epilogue {lds_out_bytes}",
         tile_m=tile_m,
         tile_n=tile_n,
@@ -207,7 +213,7 @@ def compile_bf16i4_gemm(
     )
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem_bf16i4_gemm")
     lds_alloc_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_alloc_offset + max(lds_a_bytes, lds_out_bytes)
+    allocator.ptr = lds_alloc_offset + lds_bytes(tile_m, tile_n, tile_k)
     out_mlir = out_mlir_for(out_dtype)
 
     n_padded = -(-n // ROWS_PER_BLOCK) * ROWS_PER_BLOCK

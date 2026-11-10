@@ -139,18 +139,26 @@ def unrolled_k_loop_measured_faster(
 
 
 def _prune(configs, named_args, **kwargs):
-    """Divisibility pruning, then unrolled candidates only where they can win."""
+    """Divisibility pruning, then drop tiles that overflow this device's LDS
+    (they would only fail to compile) and unrolled candidates where they cannot
+    win."""
+    from mslk.flydsl.common import lds_capacity_bytes
+    from mslk.flydsl.kernels.gemm.bf16i4_gemm import lds_bytes
+
     divisible = _prune_by_divisibility(configs, named_args, **kwargs)
     m_bucket = named_args["m_bucket"]
     arch = _device_arch(named_args["x"].device)
-    return [
-        config
-        for config in divisible
-        if config.kwargs["roll_k"]
-        or unrolled_k_loop_measured_faster(
-            m_bucket, arch, config.kwargs["tile_m"], config.kwargs["tile_k"]
-        )
-    ]
+    capacity = lds_capacity_bytes(arch)
+    kept = []
+    for config in divisible:
+        tile = config.kwargs
+        if lds_bytes(tile["tile_m"], tile["tile_n"], tile["tile_k"]) > capacity:
+            continue
+        if tile["roll_k"] or unrolled_k_loop_measured_faster(
+            m_bucket, arch, tile["tile_m"], tile["tile_k"]
+        ):
+            kept.append(config)
+    return kept
 
 
 def default_tile_config(m: int, arch: str) -> dict:
