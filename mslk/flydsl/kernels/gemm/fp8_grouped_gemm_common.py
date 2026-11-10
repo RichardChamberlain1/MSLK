@@ -1265,8 +1265,14 @@ def make_compute_tile(
     group_m_size=None,
     scaling=SCALING_ROW,
     in_dtype="fp8",
+    prefetch_next_a_rows=False,
 ):
     """Build the per-K-tile compute closure.
+
+    ``prefetch_next_a_rows`` (the path that issues one MFMA pair per A read; the
+    gfx950 wide-MFMA and hardware-scale FP8 paths ignore it): issue the LDS read
+    of the next row block's A operand before the MFMAs of the current one, so the
+    read overlaps them instead of being waited for right before use.
 
     Returns `compute_tile(accs_in, k_tile_idx_py, lds_base, b_tile_in,
     scales_pf, *, a0_prefetch=None)` which advances the accumulators by
@@ -1515,22 +1521,31 @@ def make_compute_tile(
                     k_offset_bytes = ku * 64
                     b_packs0, b_packs1 = b_tile_in[ku]
 
-                    for mi in range_constexpr(m_repeat):
+                    def load_a_rows(
+                        mi, ku_local=ku_local, k_offset_bytes=k_offset_bytes
+                    ):
                         if (
                             a0_prefetch is not None
                             and sb == 0
                             and ku_local == 0
                             and mi == 0
                         ):
-                            a0, a1 = a0_prefetch
+                            return a0_prefetch
+                        row_a_lds = lane_mod_16 + _mfma_row_off(mi, m_wave_base)
+                        col_a_base_bytes = lane_div_16 * fx.Index(16) + fx.Index(
+                            k_offset_bytes
+                        )
+                        return lds_load_packs_k64(row_a_lds, col_a_base_bytes, lds_base)
+
+                    if prefetch_next_a_rows:
+                        next_a_rows = load_a_rows(0)
+                    for mi in range_constexpr(m_repeat):
+                        if prefetch_next_a_rows:
+                            a0, a1 = next_a_rows
+                            if mi + 1 < m_repeat:
+                                next_a_rows = load_a_rows(mi + 1)
                         else:
-                            row_a_lds = lane_mod_16 + _mfma_row_off(mi, m_wave_base)
-                            col_a_base_bytes = lane_div_16 * fx.Index(16) + fx.Index(
-                                k_offset_bytes
-                            )
-                            a0, a1 = lds_load_packs_k64(
-                                row_a_lds, col_a_base_bytes, lds_base
-                            )
+                            a0, a1 = load_a_rows(mi)
 
                         for ni in range_constexpr(num_acc_n):
                             acc_idx = mi * num_acc_n + ni

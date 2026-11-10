@@ -388,6 +388,10 @@ def compile_bf16i4_gemm(
                 acc_init=acc_init,
                 scaling=SCALING_NONE,
                 in_dtype="bf16",
+                # Two MFMAs per A read are shorter than an LDS read: without the
+                # prefetch each read was waited for (s_waitcnt lgkmcnt(0)) just
+                # before its MFMAs, about half of all stall cycles in ATT.
+                prefetch_next_a_rows=True,
             )
 
             load_b_window = make_int4_b_window_loader(
