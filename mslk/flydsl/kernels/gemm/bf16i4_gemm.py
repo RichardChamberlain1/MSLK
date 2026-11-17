@@ -402,7 +402,7 @@ def compile_bf16i4_gemm(
                 lane_id=lane_id,
                 num_acc_n=num_acc_n,
             )
-            load_group_params = make_group_param_loader(
+            load_group_params_raw, to_group_params = make_group_param_loader(
                 scale_rsrc=scale_rsrc,
                 zero_rsrc=zero_rsrc,
                 scale_dtype=scale_dtype,
@@ -424,13 +424,14 @@ def compile_bf16i4_gemm(
                 store_a_tile_to_lds=store_a_tile_to_lds,
                 compute_tile=compute_tile,
                 dequantize_b_tile=dequantize_b_tile,
+                to_group_params=to_group_params,
                 lds_base=lds_base,
             )
 
             def load_window(window, half_window=False):
                 return (
                     load_b_window(window, half_window=half_window),
-                    load_group_params(window, half_window=half_window),
+                    load_group_params_raw(window, half_window=half_window),
                 )
 
             # The window after `window`, as loaded by the step before it.
@@ -443,7 +444,7 @@ def compile_bf16i4_gemm(
                 return None
 
             a_regs = prefetch_a_tile(0)
-            b_raw, params = load_window(0, half_window=(full_windows == 0))
+            b_raw, params_raw = load_window(0, half_window=(full_windows == 0))
 
             # Windows whose successor is a full window, then the last full one,
             # then the half window. The rolled form iterates over the first
@@ -456,7 +457,7 @@ def compile_bf16i4_gemm(
                     0,
                     steady_windows,
                     1,
-                    init=list(accs) + list(a_regs) + flatten_window(b_raw, params),
+                    init=list(accs) + list(a_regs) + flatten_window(b_raw, params_raw),
                 ):
                     _accs = [Vector(v) for v in _st[:_n_acc]]
                     _a_cur = [Vector(v) for v in _st[_n_acc : _n_acc + _n_a]]
@@ -474,7 +475,7 @@ def compile_bf16i4_gemm(
                     )
                 accs = [Vector(v) for v in _res[:_n_acc]]
                 a_regs = [Vector(v) for v in _res[_n_acc : _n_acc + _n_a]]
-                b_raw, params = unflatten_window(_res[_n_acc + _n_a :], num_acc_n)
+                b_raw, params_raw = unflatten_window(_res[_n_acc + _n_a :], num_acc_n)
                 first_unrolled_window = steady_windows
             else:
                 first_unrolled_window = 0
@@ -485,19 +486,19 @@ def compile_bf16i4_gemm(
                     accs,
                     a_regs,
                     b_raw,
-                    params,
+                    params_raw,
                     window * tiles_per_window,
                     is_last_window=is_last,
                     load_next_window=next_window_loader(window),
                 )
                 if const_expr(following is not None):
-                    b_raw, params = following
+                    b_raw, params_raw = following
             if const_expr(has_half_window):
                 accs, a_regs, _ = window_step(
                     accs,
                     a_regs,
                     b_raw,
-                    params,
+                    params_raw,
                     full_windows * tiles_per_window,
                     half_window=True,
                     is_last_window=True,

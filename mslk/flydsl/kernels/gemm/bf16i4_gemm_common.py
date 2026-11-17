@@ -44,6 +44,11 @@ SCALE_DTYPES = ("f32", "bf16")
 # into the scale makes fma(q / 16, 16 * s, z) = q * s + z with one rounding.
 GroupParams = namedtuple("GroupParams", ["scale", "zero", "scale_x16"])
 
+# The loaded bits of a scale and a zero, as i32: a bf16 in the low 16 bits, or an
+# f32 whole. The K loop carries these to the next window and converts them there,
+# so the loads issued for a window are not waited for in the step that issues them.
+RawGroupParams = namedtuple("RawGroupParams", ["scale_bits", "zero_bits"])
+
 
 def make_int4_b_window_loader(
     *,
@@ -110,10 +115,18 @@ def make_group_param_loader(
     lies inside one group: dwords 0 and 1 of a lane share the first half's
     group, dwords 2 and 3 the second's.
 
-    Returns ``load_group_params(window, *, half_window=False)``, which gives,
-    per 16-column block, a list indexed by window half of ``GroupParams`` holding
-    f32 values. When ``group_size`` is a multiple of 128 both halves are one
-    group, loaded once and listed twice. A half window has only the first half.
+    Returns ``(load_group_params_raw, to_group_params)``, split so that loading
+    and converting can sit in different iterations of the K loop:
+
+    - ``load_group_params_raw(window, *, half_window=False)`` issues the loads
+      and gives, per 16-column block, a list indexed by window half of
+      ``RawGroupParams``. Nothing reads the loaded registers.
+    - ``to_group_params(raw_params, *, half_window=False)`` turns that into the
+      same structure of ``GroupParams`` holding f32 values, which is where the
+      loads are waited for.
+
+    When ``group_size`` is a multiple of 128 both halves are one group, loaded
+    and converted once and listed twice. A half window has only the first half.
     """
     if scale_dtype not in SCALE_DTYPES:
         raise ValueError(
@@ -128,40 +141,66 @@ def make_group_param_loader(
         for ni in range_constexpr(num_acc_n)
     ]
 
-    def load_as_f32(rsrc, element_index):
+    def distinct_halves(half_window):
+        return 1 if (half_window or one_group_per_window) else HALVES_PER_WINDOW
+
+    def load_as_i32_bits(rsrc, element_index):
         if scale_dtype == "f32":
-            return buffer_ops.buffer_load(rsrc, element_index, vec_width=1, dtype=T.f32)
-        # A bf16 is the upper half of the f32 with the same value.
+            return buffer_ops.buffer_load(rsrc, element_index, vec_width=1, dtype=T.i32)
+        # buffer_load_ushort zero-fills the upper 16 bits, so the extension is free.
         bf16_bits = buffer_ops.buffer_load(
             rsrc, element_index, vec_width=1, dtype=T.i16
         )
-        f32_bits = ArithValue(bf16_bits).extui(T.i32) << fx.Int32(16)
-        return arith.bitcast(T.f32, f32_bits)
+        return ArithValue(bf16_bits).extui(T.i32)
 
-    def load_group_params(window, *, half_window=False):
+    def bits_to_f32(bits):
+        if scale_dtype == "f32":
+            return ArithValue(arith.bitcast(T.f32, bits))
+        # A bf16 is the upper half of the f32 with the same value.
+        f32_bits = ArithValue(bits) << fx.Int32(16)
+        return ArithValue(arith.bitcast(T.f32, f32_bits))
+
+    def load_group_params_raw(window, *, half_window=False):
         window_first_k = fx.Index(window) * fx.Index(K_PER_WINDOW)
-        loaded_halves = 1 if (half_window or one_group_per_window) else 2
-        params = []
+        loaded_halves = distinct_halves(half_window)
+        raw_params = []
         for ni in range_constexpr(num_acc_n):
             per_half = []
             for half in range_constexpr(loaded_halves):
                 half_first_k = window_first_k + fx.Index(half * K_PER_HALF_WINDOW)
                 group = half_first_k // fx.Index(group_size)
                 element_index = group * n_in + columns[ni]
-                scale = ArithValue(load_as_f32(scale_rsrc, element_index))
                 per_half.append(
-                    GroupParams(
-                        scale=scale,
-                        zero=ArithValue(load_as_f32(zero_rsrc, element_index)),
-                        scale_x16=scale * fx.Float32(16.0),
+                    RawGroupParams(
+                        scale_bits=load_as_i32_bits(scale_rsrc, element_index),
+                        zero_bits=load_as_i32_bits(zero_rsrc, element_index),
                     )
                 )
             if not half_window and loaded_halves == 1:
                 per_half.append(per_half[0])
+            raw_params.append(per_half)
+        return raw_params
+
+    def to_group_params(raw_params, *, half_window=False):
+        converted_halves = distinct_halves(half_window)
+        params = []
+        for raw_per_half in raw_params:
+            per_half = []
+            for half in range_constexpr(converted_halves):
+                scale = bits_to_f32(raw_per_half[half].scale_bits)
+                per_half.append(
+                    GroupParams(
+                        scale=scale,
+                        zero=bits_to_f32(raw_per_half[half].zero_bits),
+                        scale_x16=scale * fx.Float32(16.0),
+                    )
+                )
+            if not half_window and converted_halves == 1:
+                per_half.append(per_half[0])
             params.append(per_half)
         return params
 
-    return load_group_params
+    return load_group_params_raw, to_group_params
 
 
 def make_int4_dequantizer(*, is_gfx950):
@@ -288,8 +327,8 @@ def make_b_tile_dequantizer(*, dequantize_dwords, num_acc_n):
     """Build the assembler of one A tile's B operand from a loaded window.
 
     Returns ``dequantize_b_tile(raw_window, params, first_dword, dwords_in_tile)``.
-    ``raw_window`` and ``params`` are what ``load_b_window`` and
-    ``load_group_params`` returned for the window this A tile lies in;
+    ``raw_window`` is what ``load_b_window`` returned, and ``params`` what
+    ``to_group_params`` made, for the window this A tile lies in;
     ``first_dword`` is the window dword holding the tile's first k (0, or 2 for
     the second 64-k tile of a window). The result is a list over the tile's
     64-byte steps ``ku`` of ``(packs0[ni], packs1[ni])``, the form
@@ -327,11 +366,12 @@ def make_window_step(
     store_a_tile_to_lds,
     compute_tile,
     dequantize_b_tile,
+    to_group_params,
     lds_base,
 ):
     """Build the K-loop body for one window of B.
 
-    Returns ``window_step(accs, a_regs, b_raw, params, first_tile, *,
+    Returns ``window_step(accs, a_regs, b_raw, params_raw, first_tile, *,
     half_window=False, is_last_window=False, load_next_window=None)``, which
     walks the A tiles the window spans and returns ``(accs, a_regs,
     next_window)``.
@@ -339,9 +379,15 @@ def make_window_step(
     The A side is the grouped GEMM's plain K loop, tile by tile: publish the
     tile already in registers to the single LDS buffer, issue the next tile's
     global loads, compute, and fence before the buffer is overwritten. B differs
-    in where it comes from: the window's dwords are already in registers, and
-    ``load_next_window`` issues the next window's loads first, so they overlap
-    this window's tiles as the next A tile's loads do.
+    in where it comes from: the window's dwords and the raw bits of its scales
+    and zeros are already in registers, and ``load_next_window`` issues the next
+    window's loads first, so they overlap this window's tiles as the next A
+    tile's loads do.
+
+    The scales and zeros are converted to f32 here, from ``params_raw``, and not
+    when they are loaded. Vector-memory loads are counted down in issue order, so
+    waiting for a scale issued in this step would also wait for the next
+    window's weights issued just before it.
 
     A window spans ``tiles_per_window`` A tiles of ``k_unroll`` dwords each. The
     half window spans one tile; where that tile is wider than the 64 k left, the
@@ -352,7 +398,7 @@ def make_window_step(
         accs,
         a_regs,
         b_raw,
-        params,
+        params_raw,
         first_tile,
         *,
         half_window=False,
@@ -360,6 +406,7 @@ def make_window_step(
         load_next_window=None,
     ):
         next_window = load_next_window() if load_next_window is not None else None
+        params = to_group_params(params_raw, half_window=half_window)
         tiles = 1 if half_window else tiles_per_window
         dwords_in_window = DWORDS_PER_LANE_HALF if half_window else DWORDS_PER_LANE_FULL
         zero_pack = fx.Int64(arith.constant(0, type=T.i64))
@@ -382,12 +429,12 @@ def make_window_step(
     return window_step
 
 
-def flatten_window(b_raw, params):
-    """List a window's B registers and group parameters as loop state."""
+def flatten_window(b_raw, params_raw):
+    """List a window's B registers and raw group parameters as loop state."""
     values = list(b_raw)
-    for per_half in params:
-        for group_params in per_half:
-            values.extend(group_params)
+    for per_half in params_raw:
+        for raw_group_params in per_half:
+            values.extend(raw_group_params)
     return values
 
 
@@ -395,14 +442,14 @@ def unflatten_window(values, num_acc_n):
     """Inverse of ``flatten_window`` for a full window's state."""
     b_raw = [Vector(v) for v in values[:num_acc_n]]
     rest = values[num_acc_n:]
-    fields = len(GroupParams._fields)
-    params = []
+    fields = len(RawGroupParams._fields)
+    params_raw = []
     for ni in range_constexpr(num_acc_n):
         per_half = []
         for half in range_constexpr(HALVES_PER_WINDOW):
             start = (ni * HALVES_PER_WINDOW + half) * fields
             per_half.append(
-                GroupParams(*[ArithValue(v) for v in rest[start : start + fields]])
+                RawGroupParams(*[ArithValue(v) for v in rest[start : start + fields]])
             )
-        params.append(per_half)
-    return b_raw, params
+        params_raw.append(per_half)
+    return b_raw, params_raw
