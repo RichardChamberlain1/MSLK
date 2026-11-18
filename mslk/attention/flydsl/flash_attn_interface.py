@@ -125,6 +125,10 @@ def _dense_generic_tile(
     device: torch.device,
     has_bias: bool = False,
 ):
+    # Short-query tile: single-wave 32-row Q tile for Lq <= 32.
+    # Halves padding waste for W1/W2 cross-attention shapes.
+    if seq_len <= 32 and dtype_str in ("bf16", "f16"):
+        return 32, 64, "N32"
     if head_dim in (64, 128) and dtype_str in ("bf16", "f16"):
         main_blocks = batch * num_heads * ((seq_len + 127) // 128)
         if main_blocks < _dense_light_cu(device):
@@ -382,6 +386,8 @@ def _build_varlen_light(
     num_kv_splits: int = 1,
     head_dim_qk: Optional[int] = None,
     head_dim_v: Optional[int] = None,
+    block_m: int = 64,
+    flat_work_group_size: int = 128,
 ):
     """Build a lightweight packed-varlen launcher for short attention."""
     from .flash_attn_generic import build_flash_attn_func_module
@@ -397,8 +403,8 @@ def _build_varlen_light(
         num_kv_heads=num_kv_heads,
         cross_seqlen=cross_seqlen,
         varlen=True,
-        block_m=64,
-        flat_work_group_size=128,
+        block_m=block_m,
+        flat_work_group_size=flat_work_group_size,
         waves_per_eu=waves_per_eu,
         daz=daz,
         return_lse=return_lse,
@@ -2466,6 +2472,8 @@ def flydsl_flash_attn_func(
                 )
             )
             if _prefer_light:
+                _vl_bm = 32 if Sq <= 32 else 64
+                _vl_fwgs = _vl_bm * 2
                 exe = _build_varlen_light(
                     num_heads=H,
                     num_kv_heads=num_kv_heads,
@@ -2486,6 +2494,8 @@ def flydsl_flash_attn_func(
                     gappy_kv=kv_seqstart is not None,
                     head_dim_qk=Dqk,
                     head_dim_v=Dv,
+                    block_m=_vl_bm,
+                    flat_work_group_size=_vl_fwgs,
                 )
             else:
                 exe = _build_varlen(
