@@ -30,6 +30,7 @@ import torch
 from mslk.flydsl.autotune import next_pow2, prune_by_divisibility, tunable
 from mslk.flydsl.jit import run_compiled
 from mslk.gemm.flydsl.bf16i4bf16_gemm import reordered_weight
+from mslk.gemm.flydsl.bf16i4bf16_layout import cached_layout
 
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
@@ -134,8 +135,10 @@ def unrolled_k_loop_measured_faster(
     """True where an unrolled K loop has been measured to beat a rolled one.
 
     Everywhere else the loop stays rolled: its code size does not grow with K,
-    and it compiles in about a second. M, not tile_m, decides, because M = 256
-    and M = 4096 share tile_m 256 but not the faster loop.
+    and it compiles in about a second. The M bucket (next_pow2(M)), not
+    tile_m, decides, because M = 256 and M = 4096 share tile_m 256 but not the
+    faster loop. Both callers pass the bucket, so M from 1025 to 2047 counts as
+    2048.
     """
     min_m_for_unrolled = UNROLLED_K_LOOP_MIN_M.get(arch)
     return (
@@ -172,8 +175,9 @@ def _prune(configs, named_args, **kwargs):
 def default_tile_config(m: int, arch: str) -> dict:
     """The untuned tile for M rows on ``arch``.
 
-    Decode (M <= DECODE_MAX_M) splits M over two row tiles of at least 16 rows,
-    so a decode-sized M pads at most to 16 rows; larger M uses the largest tile.
+    Decode (M <= DECODE_MAX_M) uses tile_m = next_pow2(M) / 2, at least 16, so
+    a call computes next_pow2(M) rows or 16, whichever is more (M = 65 computes
+    128); larger M uses the largest tile.
     """
     rows = next_pow2(m)
     if rows <= DECODE_MAX_M:
@@ -305,14 +309,18 @@ def launch(
         n_padding=(n % tile_n != 0),
         roll_k=roll_k,
     )
-    # Every operand is addressed as flat bytes by the kernel, so each is handed
-    # over as an int8 view in its natural shape (a flattened view would overflow
-    # the int32 extents the argument marshalling packs).
+    # Every operand is addressed as flat bytes by the kernel, so its shape only
+    # has to keep each extent below 2^31: the argument marshalling packs extents
+    # as int32. x, out, scale and zero go in their natural shape; the reordered
+    # weight, flat as built, goes as one row per 16-row block.
+    weight_row_blocks = w_reordered.view(torch.int8).view(
+        -1, cached_layout(n, k).row_block_bytes
+    )
     run_compiled(
         launcher,
         out.view(torch.int8),
         x.view(torch.int8),
-        w_reordered.view(torch.int8),
+        weight_row_blocks,
         scale.view(torch.int8),
         zero.view(torch.int8),
         _unused_m_sizes(x.device),
