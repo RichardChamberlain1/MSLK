@@ -2016,12 +2016,23 @@ class BF16Int4FlyDSLROCmTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.device = "cuda"
-        from mslk.gemm.flydsl.bf16i4bf16_dispatch import _device_arch, is_supported
+        from mslk.gemm.flydsl.bf16i4bf16_dispatch import (
+            _device_arch,
+            default_tile_config,
+            is_supported,
+            launch,
+            next_pow2,
+            SCALE_DTYPES,
+        )
         from mslk.gemm.flydsl.bf16i4bf16_gemm import reordered_weight
         from mslk.gemm.triton.int4_gemm import matmul_bf16i4_rowwise
 
         cls.arch = _device_arch(torch.device(cls.device))
         cls.is_supported = staticmethod(is_supported)
+        cls.default_tile_config = staticmethod(default_tile_config)
+        cls.launch = staticmethod(launch)
+        cls.next_pow2 = staticmethod(next_pow2)
+        cls.scale_dtypes = SCALE_DTYPES
         cls.reordered_weight = staticmethod(reordered_weight)
         cls.matmul_triton = staticmethod(matmul_bf16i4_rowwise)
 
@@ -2246,6 +2257,101 @@ class BF16Int4FlyDSLROCmTests(unittest.TestCase):
             w_scale[:, checked_rows],
             w_zp[:, checked_rows],
         )
+
+    @parameterized.expand(
+        [
+            # (name, M, N, K, group_size, tile config; None runs the default for M)
+            ("m1_default", 1, 13312, 6656, 128, None),
+            ("m100_n_padded_k_tail_default", 100, 13320, 6720, 64, None),
+            (
+                "m100_waves_4x1",
+                100,
+                13320,
+                6720,
+                64,
+                {"tile_m": 64, "tile_n": 64, "tile_k": 128, "waves_m": 4, "waves_n": 1},
+            ),
+            (
+                "m100_waves_per_eu_2",
+                100,
+                13320,
+                6720,
+                64,
+                {"tile_m": 64, "tile_n": 64, "tile_k": 128, "waves_per_eu": 2},
+            ),
+            (
+                "m300_waves_2x2_k_tail",
+                300,
+                1024,
+                1088,
+                64,
+                {
+                    "tile_m": 128,
+                    "tile_n": 128,
+                    "tile_k": 64,
+                    "waves_m": 2,
+                    "waves_n": 2,
+                },
+            ),
+            (
+                "m2048_rolled",
+                2048,
+                16384,
+                16384,
+                128,
+                {"tile_m": 256, "tile_n": 128, "tile_k": 64, "roll_k": True},
+            ),
+            (
+                "m2048_unrolled",
+                2048,
+                16384,
+                16384,
+                128,
+                {"tile_m": 256, "tile_n": 128, "tile_k": 64, "roll_k": False},
+            ),
+            (
+                "m2048_unrolled_k_half_window",
+                2048,
+                1024,
+                2112,
+                64,
+                {"tile_m": 256, "tile_n": 128, "tile_k": 64, "roll_k": False},
+            ),
+        ]
+    )
+    def test_tile_config_edges(
+        self,
+        name: str,
+        M: int,
+        N: int,
+        K: int,
+        group_size: int,
+        tile: Optional[dict],
+    ) -> None:
+        # Explicit tile configs the default path may never pick, launched
+        # directly so each wave grid, padding and loop shape runs.
+        if tile is not None and tile.get("roll_k") is False and self.arch == "gfx942":
+            self.skipTest("the dispatch never picks the unrolled K loop on gfx942")
+        if tile is None:
+            tile = self.default_tile_config(M, self.arch)
+        x, _, wq, w_scale, w_zp = self._make_operands(
+            (M, K), N, group_size, torch.float32
+        )
+        y = torch.empty((M, N), dtype=torch.bfloat16, device=self.device)
+        self.launch(
+            x,
+            self.reordered_weight(wq),
+            w_scale,
+            w_zp,
+            y,
+            self.next_pow2(M),
+            N,
+            K,
+            group_size,
+            self.scale_dtypes[w_scale.dtype],
+            **tile,
+        )
+        self._check_against_dequantised(y, x, wq, w_scale, w_zp)
 
 
 @skipUnlessRocm()
