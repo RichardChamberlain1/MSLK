@@ -2180,6 +2180,31 @@ class BF16Int4FlyDSLROCmTests(unittest.TestCase):
             self.reordered_weight(second_wq), self.reordered_weight(second_wq)
         )
 
+    def test_inference_mode_weight(self) -> None:
+        # Serving code builds weights under inference mode; such a tensor has
+        # no version counter for the cache to check.
+        with torch.inference_mode():
+            x, _, wq, w_scale, w_zp = self._make_operands(
+                (64, 1024), 512, 128, torch.float32
+            )
+            self.assertTrue(wq.is_inference())
+            y = torch.ops.mslk.bf16i4bf16_rowwise(x, wq, w_scale, w_zp)
+            self._check_against_dequantised(y, x, wq, w_scale, w_zp)
+
+    def test_weight_updated_in_place(self) -> None:
+        # Writing new values into a cached weight must not serve the copy
+        # reordered from the old values.
+        x_shape, N, group_size = (64, 1024), 512, 128
+        x, _, wq, _, _ = self._make_operands(x_shape, N, group_size, torch.float32)
+        _, _, new_values, w_scale, w_zp = self._make_operands(
+            x_shape, N, group_size, torch.float32
+        )
+        torch.ops.mslk.bf16i4bf16_rowwise(x, wq, w_scale, w_zp)
+
+        wq.copy_(new_values)
+        y = torch.ops.mslk.bf16i4bf16_rowwise(x, wq, w_scale, w_zp)
+        self._check_against_dequantised(y, x, wq, w_scale, w_zp)
+
 
 @skipUnlessRocm()
 class FP8Int4TritonROCmTest(unittest.TestCase):

@@ -34,9 +34,10 @@ from mslk.gemm.flydsl.bf16i4bf16_layout import reorder_int4_for_mfma
 # is handed to the next allocation of the same size, which would otherwise be
 # served the old weight's copy. The version counter catches in-place updates,
 # and an entry is dropped once its weight is collected so the cache does not pin
-# the copies. Same policy as the FP8 preshuffle cache (preshuffle_gemm.py),
-# including under graph capture: a miss there records the reorder into the graph
-# and caches its result.
+# the copies. An inference tensor has no version counter, so it is reordered on
+# every call and never cached. Same policy as the FP8 preshuffle cache
+# (preshuffle_gemm.py), including under graph capture: a miss there records the
+# reorder into the graph and caches its result.
 _reordered_cache: dict[int, tuple[weakref.ref, int, torch.Size, torch.Tensor]] = {}
 
 
@@ -48,6 +49,8 @@ def _evict(ref: weakref.ref, key: int) -> None:
 
 def reordered_weight(W: torch.Tensor) -> torch.Tensor:
     """Return the reordered copy of ``W``, building and caching it on a miss."""
+    if W.is_inference():
+        return reorder_int4_for_mfma(W)
     key = id(W)
     entry = _reordered_cache.get(key)
     if entry is not None:
