@@ -2205,6 +2205,48 @@ class BF16Int4FlyDSLROCmTests(unittest.TestCase):
         y = torch.ops.mslk.bf16i4bf16_rowwise(x, wq, w_scale, w_zp)
         self._check_against_dequantised(y, x, wq, w_scale, w_zp)
 
+    def test_weight_larger_than_2gib(self) -> None:
+        # A reordered weight past 2^31 bytes: the output columns whose weight
+        # rows lie past that byte are compared against the reference.
+        N, K, group_size = 16400, 262144, 128
+        packed_row_bytes = K // 2
+        weight_bytes = N * packed_row_bytes
+        # The reorder holds the weight unpacked to one byte per nibble, plus
+        # padded and permuted copies of that, on top of the weight and its
+        # reordered copy.
+        required_bytes = 10 * weight_bytes
+        free_bytes, _ = torch.cuda.mem_get_info()
+        if free_bytes < required_bytes:
+            self.skipTest(
+                f"needs {required_bytes / 2**30:.0f} GiB free, {free_bytes / 2**30:.0f} GiB available"
+            )
+
+        # Random packed bytes stand in for quantised weights: the kernel reads
+        # any byte pattern, and quantising a 16400 x 262144 bf16 weight would
+        # need several times more memory.
+        wq = torch.randint(
+            -128, 128, (N, packed_row_bytes), dtype=torch.int8, device=self.device
+        )
+        num_groups = K // group_size
+        w_scale = (
+            torch.rand(num_groups, N, device=self.device) * 0.01 + 0.001
+        ).contiguous()
+        w_zp = (torch.randn(num_groups, N, device=self.device) * 0.01).contiguous()
+        x = torch.randn(1, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        self.assertTrue(self.is_supported(x, wq, w_scale, w_zp, group_size))
+
+        y = torch.ops.mslk.bf16i4bf16_rowwise(x, wq, w_scale, w_zp)
+
+        first_row_past_2gib = 2**31 // packed_row_bytes
+        checked_rows = slice(first_row_past_2gib - 16, N)
+        self._check_against_dequantised(
+            y[:, checked_rows],
+            x,
+            wq[checked_rows],
+            w_scale[:, checked_rows],
+            w_zp[:, checked_rows],
+        )
+
 
 @skipUnlessRocm()
 class FP8Int4TritonROCmTest(unittest.TestCase):
