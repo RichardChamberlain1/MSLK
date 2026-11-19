@@ -50,6 +50,11 @@ SCALE_DTYPES = {torch.bfloat16: "bf16", torch.float32: "f32"}
 #: buffer_load adds are both 32-bit, so every operand must stay below this.
 BUFFER_LIMIT_BYTES = 1 << 32
 
+# FlyDSL's argument marshalling packs each tensor extent as int32. The reordered
+# weight goes to the kernel as one row per 16-row block (16 * K / 2 bytes), so
+# that row must stay below this.
+EXTENT_LIMIT = 1 << 31
+
 # Untuned tiles, measured on gfx950 at N = 13312, K 6656 and 16384.
 # Decode (M <= 128) has too few output tiles for 256 CUs, so its default takes
 # more, narrower workgroups: tile_n 64 and half the rows of next_pow2(M). That
@@ -255,6 +260,8 @@ def is_supported(
         or tuple(zero.shape) != expected_scale_shape
     ):
         return False
+    if cached_layout(n, k).row_block_bytes >= EXTENT_LIMIT:
+        return False
     scale_bytes = scale.element_size()
     operand_bytes = _operand_bytes(m, n, k, group_size, scale_bytes)
     return all(nbytes < BUFFER_LIMIT_BYTES for nbytes in operand_bytes.values())
@@ -310,9 +317,9 @@ def launch(
         roll_k=roll_k,
     )
     # Every operand is addressed as flat bytes by the kernel, so its shape only
-    # has to keep each extent below 2^31: the argument marshalling packs extents
-    # as int32. x, out, scale and zero go in their natural shape; the reordered
-    # weight, flat as built, goes as one row per 16-row block.
+    # has to keep each extent below EXTENT_LIMIT. x, out, scale and zero go in
+    # their natural shape; the reordered weight, flat as built, goes as one row
+    # per 16-row block, which is_supported keeps below the limit.
     weight_row_blocks = w_reordered.view(torch.int8).view(
         -1, cached_layout(n, k).row_block_bytes
     )

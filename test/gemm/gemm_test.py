@@ -2158,6 +2158,17 @@ class BF16Int4FlyDSLROCmTests(unittest.TestCase):
         y_triton = self.matmul_triton(x, wq, w_scale, w_zp)
         torch.testing.assert_close(y_op, y_triton, atol=0.0, rtol=0.0)
 
+    def test_weight_row_block_past_int32_extent_unsupported(self) -> None:
+        # At K = 2^28 one 16-row block of the reordered weight is 2^31 bytes, an
+        # extent FlyDSL cannot pass, although every operand is below 4 GiB.
+        # Only is_supported is called, so the tensors are never read.
+        N, K, group_size = 8, 2**28, 128
+        x = torch.empty((1, K), dtype=torch.bfloat16, device=self.device)
+        wq = torch.empty((N, K // 2), dtype=torch.int8, device=self.device)
+        w_scale = torch.empty((K // group_size, N), device=self.device)
+        w_zp = torch.empty((K // group_size, N), device=self.device)
+        self.assertFalse(self.is_supported(x, wq, w_scale, w_zp, group_size))
+
     def test_weight_cache_reused_address(self) -> None:
         # A freed weight's address is handed to the next allocation of the same
         # size; the cache must serve the new weight, not the old one's copy.
