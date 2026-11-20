@@ -27,6 +27,7 @@ class LazyAiterImportTest(unittest.TestCase):
             "mslk.gemm.dispatch.f4f4bf16",
             "mslk.gemm.aiter.fp8_rowwise",
             "mslk.gemm.dispatch.fp8_rowwise",
+            "mslk.gemm.dispatch.fp8_rowwise_batched",
         ):
             importlib.import_module(module)
 

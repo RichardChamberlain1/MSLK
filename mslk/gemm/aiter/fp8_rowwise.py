@@ -7,7 +7,8 @@
 # pyre-strict
 
 """aiter backends of MSLK's FP8 rowwise GEMM ops on ROCm
-(``mslk::f8f8bf16_rowwise``, ``f8f8bf16_rowwise_out`` and ``f8f8f16_rowwise``).
+(``mslk::f8f8bf16_rowwise``, ``f8f8bf16_rowwise_out``, ``f8f8f16_rowwise`` and
+``f8f8bf16_rowwise_batched``).
 
 aiter's ``gemm_a8w8`` computes these ops: ``out = (XQ @ WQ^T) * x_scale *
 w_scale`` with one FP32 scale per row of each operand. It takes the scales as
@@ -23,9 +24,12 @@ exposes it twice, with different kernels behind each:
   check every M in a bucket for it.
 - ``gemm_triton``: aiter's Triton ``gemm_a8w8``, which writes into a given
   output, so it also serves ``f8f8bf16_rowwise_out``.
+- ``gemm_triton_batched``: aiter's Triton ``batched_gemm_a8w8``, for
+  ``f8f8bf16_rowwise_batched``. aiter's CK ``batched_gemm_a8w8`` takes INT8
+  operands only, so it is not a backend.
 
 Which calls these backends serve is decided in
-``mslk/gemm/dispatch/fp8_rowwise.py``.
+``mslk/gemm/dispatch/fp8_rowwise.py`` and ``fp8_rowwise_batched.py``.
 """
 
 import math
@@ -78,3 +82,31 @@ def gemm_triton(
         output.view(m, n),
     )
     return output
+
+
+def gemm_triton_batched(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """The batched rowwise GEMM computed by aiter's Triton ``batched_gemm_a8w8``,
+    into ``output`` if given."""
+    batched_gemm_a8w8 = import_aiter_module(
+        "aiter.ops.triton.gemm.batched.batched_gemm_a8w8"
+    ).batched_gemm_a8w8
+    # The op takes the scales as [B, M] and [B, N]; aiter as [B, M, 1] and
+    # [B, 1, N].
+    b, m, _ = XQ.shape
+    n = WQ.shape[1]
+    return batched_gemm_a8w8(
+        XQ,
+        WQ,
+        x_scale.reshape(b, m, 1),
+        w_scale.reshape(b, 1, n),
+        None,
+        torch.bfloat16,
+        None,
+        output,
+    )
