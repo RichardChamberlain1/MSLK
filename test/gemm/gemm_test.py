@@ -24,6 +24,7 @@ from mslk.flydsl.common import (
     MIN_FLYDSL_VERSION,
 )
 from mslk.gemm.dispatch.f4f4bf16 import OP as F4F4BF16_OP, ROUTING as F4F4BF16_ROUTING
+from mslk.gemm.dispatch.fp8_rowwise import ROUTINGS as FP8_ROWWISE_ROUTINGS
 from mslk.quantize.triton.fp4_quantize import (
     _to_blocked,
     calculate_group_max,
@@ -4480,6 +4481,20 @@ class FlyDSLRowwisePreshuffleTest(unittest.TestCase):
         )
 
 
+# Shapes that the FP8 rowwise ops' tuning table routes to each aiter backend on
+# gfx950, so that the ops' tests cover aiter's kernels as well as MSLK's.
+_FP8_ROWWISE_AITER_SHAPES: dict[tuple[int, int, int], str] = {
+    (1, 1280, 8192): "aiter_triton",
+    (3, 2112, 7168): "aiter_triton",
+    (8192, 1280, 8192): "aiter_ck",
+}
+# The same for f8f8bf16_rowwise_out, which has its own table.
+_FP8_ROWWISE_OUT_AITER_SHAPES: dict[tuple[int, int, int], str] = {
+    (1, 1280, 8192): "aiter_triton",
+    (2, 2112, 7168): "aiter_triton",
+}
+
+
 @skipUnlessRocm()
 @skipUnlessGfxArch("gfx942", "gfx950")
 @unittest.skipUnless(
@@ -4512,9 +4527,9 @@ class FlyDSLRowwiseTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            (M, N, K, op, dtype)
+            (M, N, K, op, dtype, backend)
             # All but the first two stop mid-tile in N and/or K; the last four
-            # stop mid-load or mid-store too.
+            # stop mid-load or mid-store too. Then the shapes routed to aiter.
             for M, N, K in [
                 (1, 4096, 4096),
                 (300, 2048, 7168),
@@ -4523,28 +4538,78 @@ class FlyDSLRowwiseTest(unittest.TestCase):
                 (16, 1028, 514),
                 (3, 100, 8),
                 (16, 7, 33),
+                *_FP8_ROWWISE_AITER_SHAPES,
             ]
             for op, dtype in [
                 ("f8f8bf16_rowwise", torch.bfloat16),
                 ("f8f8f16_rowwise", torch.float16),
             ]
+            # "default" uses the op's routing, which sends the shapes in its
+            # tuning table to aiter or MSLK's kernel; "mslk" forces MSLK's
+            # kernel, the fallback, on every shape.
+            for backend in ("default", "mslk")
         ]
     )
-    def test_gemm(self, M: int, N: int, K: int, op: str, dtype: torch.dtype) -> None:
+    def test_gemm(
+        self, M: int, N: int, K: int, op: str, dtype: torch.dtype, backend: str
+    ) -> None:
         xq, wq, x_scale, w_scale = self._quantized(M, K, n=N)
-        out = getattr(torch.ops.mslk, op)(xq, wq, x_scale, w_scale)
+        with (
+            force_backend(op, backend)
+            if backend != "default"
+            else contextlib.nullcontext()
+        ):
+            out = getattr(torch.ops.mslk, op)(xq, wq, x_scale, w_scale)
         self.assertEqual(out.dtype, dtype)
         ref = self._reference(xq, wq, x_scale, w_scale)
         torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+        expected = _FP8_ROWWISE_AITER_SHAPES.get((M, N, K))
+        # The table covers gfx950 only; elsewhere MSLK's kernel serves every shape.
+        if (
+            backend == "default"
+            and expected
+            and gfx_arch_in(("gfx950",))
+            and is_aiter_available()
+        ):
+            self.assertEqual(
+                FP8_ROWWISE_ROUTINGS[op].backend_for(xq, wq, x_scale, w_scale),
+                expected,
+                "the tuning table no longer routes this shape to that aiter "
+                "backend; replace it in _FP8_ROWWISE_AITER_SHAPES with one it does",
+            )
 
-    def test_out(self) -> None:
-        xq, wq, x_scale, w_scale = self._quantized(33, 1104, n=1040)
-        out = torch.full(
-            (33, 1040), float("nan"), dtype=torch.bfloat16, device=self.device
-        )
-        torch.ops.mslk.f8f8bf16_rowwise_out(xq, wq, x_scale, w_scale, out)
+    @parameterized.expand(
+        [
+            (M, N, K, backend)
+            for M, N, K in [(33, 1040, 1104), *_FP8_ROWWISE_OUT_AITER_SHAPES]
+            for backend in ("default", "mslk")
+        ]
+    )
+    def test_out(self, M: int, N: int, K: int, backend: str) -> None:
+        op = "f8f8bf16_rowwise_out"
+        xq, wq, x_scale, w_scale = self._quantized(M, K, n=N)
+        out = torch.full((M, N), float("nan"), dtype=torch.bfloat16, device=self.device)
+        with (
+            force_backend(op, backend)
+            if backend != "default"
+            else contextlib.nullcontext()
+        ):
+            torch.ops.mslk.f8f8bf16_rowwise_out(xq, wq, x_scale, w_scale, out)
         ref = self._reference(xq, wq, x_scale, w_scale)
         torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+        expected = _FP8_ROWWISE_OUT_AITER_SHAPES.get((M, N, K))
+        if (
+            backend == "default"
+            and expected
+            and gfx_arch_in(("gfx950",))
+            and is_aiter_available()
+        ):
+            self.assertEqual(
+                FP8_ROWWISE_ROUTINGS[op].backend_for(xq, wq, x_scale, w_scale, out),
+                expected,
+                "the tuning table no longer routes this shape to that aiter "
+                "backend; replace it in _FP8_ROWWISE_OUT_AITER_SHAPES with one it does",
+            )
 
     def test_out_flattened(self) -> None:
         # As CK, the output's leading dims only have to flatten to XQ's rows.
