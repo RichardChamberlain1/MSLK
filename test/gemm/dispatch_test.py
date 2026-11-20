@@ -20,7 +20,7 @@ import mslk.gemm  # noqa: F401
 import torch
 from mslk.aiter.common import is_aiter_available
 from mslk.aiter.routing import device_key, OpRouting
-from mslk.gemm.dispatch import f4f4bf16, fp8_rowwise
+from mslk.gemm.dispatch import f4f4bf16, fp8_rowwise, fp8_rowwise_batched
 from mslk.quantize.triton.fp4_quantize import triton_quantize_mx4_unpack
 from mslk.quantize.triton.fp8_quantize import quantize_fp8_row
 from mslk.testing.device import skipUnlessRocm
@@ -57,6 +57,18 @@ def _fp8_rowwise_out_args(row: Dict[str, str]) -> Args:
     return (xq, wq, x_scale, w_scale, out), {}
 
 
+def _fp8_rowwise_batched_args(row: Dict[str, str]) -> Args:
+    B, M = int(row["B"]), int(row["M_max"])
+    N, K = int(row["N"]), int(row["K"])
+    xq, x_scale = quantize_fp8_row(
+        torch.randn(B, M, K, device="cuda", dtype=torch.bfloat16)
+    )
+    wq, w_scale = quantize_fp8_row(
+        torch.randn(B, N, K, device="cuda", dtype=torch.bfloat16)
+    )
+    return (xq, wq, x_scale.view(B, M), w_scale.view(B, N)), {}
+
+
 # (name, routing, the registered op, arguments for a table row)
 CASES: List[Tuple[str, OpRouting, Callable[..., Any], Callable[..., Args]]] = [
     (
@@ -74,6 +86,12 @@ CASES: List[Tuple[str, OpRouting, Callable[..., Any], Callable[..., Args]]] = [
             _fp8_rowwise_out_args if op == fp8_rowwise.OUT_OP else _fp8_rowwise_args,
         )
         for op in fp8_rowwise.ROUTINGS
+    ),
+    (
+        fp8_rowwise_batched.OP,
+        fp8_rowwise_batched.ROUTING,
+        lambda *a, **kw: torch.ops.mslk.f8f8bf16_rowwise_batched(*a, **kw),
+        _fp8_rowwise_batched_args,
     ),
 ]
 
