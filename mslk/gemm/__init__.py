@@ -261,11 +261,30 @@ if torch.version.hip is not None:
                 return getattr(mod, f"matmul_{op}")
         return getattr(torch.ops.mslk, f"_{op}_ck")
 
+    @functools.lru_cache(maxsize=None)
     def _rowwise_rocm(module: str, op: str) -> Callable[..., Any]:
         def _impl(XQ: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
             device_index = XQ.get_device()
             with torch.cuda.device(device_index):
                 return _rowwise_impl(module, op, device_index)(XQ, *args, **kwargs)
+
+        return _impl
+
+    # The plain non-batched ops are routed per shape between the kernel above
+    # (the routing's MSLK backend) and aiter; see mslk/gemm/dispatch/fp8_rowwise.py.
+    _ROUTED_ROWWISE_OPS = (
+        "f8f8bf16_rowwise",
+        "f8f8bf16_rowwise_out",
+        "f8f8f16_rowwise",
+    )
+
+    def _rowwise_routed(op: str) -> Callable[..., Any]:
+        def _impl(XQ: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+            # Imported on first call, like the backends it chooses between.
+            from mslk.gemm.dispatch.fp8_rowwise import route
+
+            with torch.cuda.device(XQ.get_device()):
+                return route(op, XQ, *args, **kwargs)
 
         return _impl
 
@@ -292,7 +311,11 @@ if torch.version.hip is not None:
                     f"mslk::{_op}", "CUDA"
                 )
             ):
-                torch.library.impl(f"mslk::{_op}", "CUDA")(_rowwise_rocm(_module, _op))
+                torch.library.impl(f"mslk::{_op}", "CUDA")(
+                    _rowwise_routed(_op)
+                    if _op in _ROUTED_ROWWISE_OPS
+                    else _rowwise_rocm(_module, _op)
+                )
 
     if hasattr(torch.ops, "mslk") and hasattr(torch.ops.mslk, "f8f8bf16_blockwise"):
 
