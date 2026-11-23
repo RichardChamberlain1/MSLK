@@ -242,7 +242,8 @@ if torch.version.hip is not None:
     if hasattr(torch.ops, "mslk") and hasattr(
         torch.ops.mslk, "_f8f8bf16_rowwise_preshuffle_ck"
     ):
-
+        # MSLK's own kernel for the op; mslk/gemm/dispatch/<op>.py chooses per
+        # call between it and aiter.
         @functools.lru_cache(maxsize=None)
         def _rowwise_preshuffle_impl(
             op: str, device_index: int
@@ -252,6 +253,11 @@ if torch.version.hip is not None:
                 if mod is not None and mod.is_supported():
                     return getattr(mod, f"matmul_{op}")
             return getattr(torch.ops.mslk, f"_{op}_ck")
+
+        @functools.lru_cache(maxsize=None)
+        def _rowwise_preshuffle_routing(op: str) -> Callable[..., torch.Tensor]:
+            # Imported on first call, like the backends it chooses between.
+            return importlib.import_module(f"mslk.gemm.dispatch.{op}").ROUTING
 
         def _rowwise_preshuffle_rocm(op: str) -> Callable[..., torch.Tensor]:
             def _impl(
@@ -264,7 +270,7 @@ if torch.version.hip is not None:
             ) -> torch.Tensor:
                 device_index = XQ.get_device()
                 with torch.cuda.device(device_index):
-                    return _rowwise_preshuffle_impl(op, device_index)(
+                    return _rowwise_preshuffle_routing(op)(
                         XQ, WQ, x_scale, w_scale, bias, use_fast_accum
                     )
 

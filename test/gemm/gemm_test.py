@@ -9,19 +9,23 @@
 import contextlib
 import os
 import unittest
-from math import prod
+from math import prod, sqrt
 from typing import Optional, Union
 
 import mslk.gemm  # noqa: F401
 import mslk.quantize  # noqa: F401
 import torch
 import triton  # noqa: F401
-from mslk.aiter.common import is_aiter_available
-from mslk.aiter.routing import force_backend
+from mslk.aiter.common import is_aiter_available, is_aiter_enabled
+from mslk.aiter.routing import force_backend, OpRouting
 from mslk.flydsl.common import (
     flydsl_version,
     is_flydsl_version_at_least,
     MIN_FLYDSL_VERSION,
+)
+from mslk.gemm.dispatch import (
+    f8f8bf16_rowwise_preshuffle as f8f8bf16_rowwise_preshuffle_dispatch,
+    f8f8f16_rowwise_preshuffle as f8f8f16_rowwise_preshuffle_dispatch,
 )
 from mslk.gemm.dispatch.f4f4bf16 import OP as F4F4BF16_OP, ROUTING as F4F4BF16_ROUTING
 from mslk.quantize.triton.fp4_quantize import (
@@ -4245,6 +4249,22 @@ class FlyDSLPreshuffleBatchedGemmTest(unittest.TestCase):
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
 
 
+_ROWWISE_PRESHUFFLE_ROUTING: dict[str, OpRouting] = {
+    "f8f8bf16_rowwise_preshuffle": f8f8bf16_rowwise_preshuffle_dispatch.ROUTING,
+    "f8f8f16_rowwise_preshuffle": f8f8f16_rowwise_preshuffle_dispatch.ROUTING,
+}
+
+# Shapes that both rowwise preshuffle ops' tuning tables route to aiter on
+# gfx950, so that the ops' tests cover aiter's kernels as well as MSLK's: aiter
+# serves them with its FlyDSL, CK, CK and CK-tile kernels respectively.
+_ROWWISE_PRESHUFFLE_AITER_SHAPES: tuple[tuple[int, int, int], ...] = (
+    (1, 7168, 2048),  # decode
+    (100, 8192, 8192),
+    (1000, 64, 4096),  # narrow N
+    (5000, 2304, 16384),  # prefill, large K
+)
+
+
 @skipUnlessRocm()
 @skipUnlessGfxArch("gfx942", "gfx950")
 @unittest.skipUnless(
@@ -4253,7 +4273,8 @@ class FlyDSLPreshuffleBatchedGemmTest(unittest.TestCase):
 )
 class FlyDSLRowwisePreshuffleTest(unittest.TestCase):
     """Companion of the rowwise_preshuffle mode in ``test_gemm``: the f16 op,
-    shapes the wrapper zero-pads to the kernel's tiles, and the CK contract."""
+    shapes the wrapper zero-pads to the kernel's tiles, the CK contract, and
+    the shapes the ops' tuning tables route to aiter."""
 
     @classmethod
     def setUpClass(cls):
@@ -4274,25 +4295,65 @@ class FlyDSLRowwisePreshuffleTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            (M, N, K, op, dtype)
-            # The first shape fits the kernel's tiles; the others (N % 64 != 0
-            # and/or K % 128 != 0) are valid for the preshuffle layout and get
-            # zero-padded to them.
-            for M, N, K in [(1, 4096, 4096), (33, 1040, 4160), (16, 4096, 4160)]
+            (M, N, K, op, dtype, backend)
+            for M, N, K in (
+                # The first shape fits the kernel's tiles; the next two
+                # (N % 64 != 0 and/or K % 128 != 0) are valid for the preshuffle
+                # layout and get zero-padded to them.
+                (1, 4096, 4096),
+                (33, 1040, 4160),
+                (16, 4096, 4160),
+                (4096, 8192, 8192),  # large M
+                *_ROWWISE_PRESHUFFLE_AITER_SHAPES,
+                (64, 8192, 8192),  # in the tuning tables, routed to MSLK
+            )
             for op, dtype in [
                 ("f8f8bf16_rowwise_preshuffle", torch.bfloat16),
                 ("f8f8f16_rowwise_preshuffle", torch.float16),
             ]
+            # "default" uses the op's routing, which sends the shapes in its
+            # tuning table to aiter or MSLK's kernel; "mslk" forces MSLK's
+            # kernel, the fallback, on every shape.
+            for backend in ("default", "mslk")
         ]
     )
-    def test_gemm(self, M: int, N: int, K: int, op: str, dtype: torch.dtype) -> None:
+    def test_gemm(
+        self, M: int, N: int, K: int, op: str, dtype: torch.dtype, backend: str
+    ) -> None:
         from mslk.quantize.shuffle import preshuffle_b_mfma
 
-        xq, wq, x_scale, w_scale = self._quantized(M, N, K)
-        out = getattr(torch.ops.mslk, op)(xq, preshuffle_b_mfma(wq), x_scale, w_scale)
+        # Checked as the ops' tuning scripts check them. Scaling the weights by
+        # 1/sqrt(K) leaves their FP8 values unchanged (the factor goes into
+        # w_scale) and makes outputs unit-scale at every K, so atol = 1e-3 and
+        # an rtol of one to two output ulps fail a wrong or partial result.
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) / sqrt(K)
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w)
+        inputs = (xq, preshuffle_b_mfma(wq), x_scale, w_scale)
+
+        with (
+            force_backend(op, backend)
+            if backend != "default"
+            else contextlib.nullcontext()
+        ):
+            out = getattr(torch.ops.mslk, op)(*inputs)
+
         self.assertEqual(out.dtype, dtype)
         ref = self._reference(xq, wq, x_scale, w_scale)
-        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+        rtol = 1e-2 if dtype == torch.bfloat16 else 2e-3
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=rtol)
+        if (
+            backend == "default"
+            and (M, N, K) in _ROWWISE_PRESHUFFLE_AITER_SHAPES
+            and is_aiter_enabled(op)
+        ):
+            self.assertEqual(
+                _ROWWISE_PRESHUFFLE_ROUTING[op].backend_for(*inputs),
+                "aiter",
+                "the tuning table no longer routes this shape to aiter; replace "
+                "it in _ROWWISE_PRESHUFFLE_AITER_SHAPES with one it does",
+            )
 
     def test_padded_weight_follows_inplace_update(self) -> None:
         # The padded weight is cached per weight tensor; an in-place update
@@ -4340,8 +4401,14 @@ class FlyDSLRowwisePreshuffleTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            (leading_shape, op, dtype)
-            for leading_shape in [(), (2, 3, 5)]
+            (leading_shape, N, K, op, dtype)
+            for leading_shape, N, K in [
+                ((), 80, 192),
+                ((2, 3, 5), 80, 192),
+                # In the tuning tables and routed to aiter, which gets XQ's
+                # rows flattened.
+                ((2, 3, 5), 7168, 2048),
+            ]
             for op, dtype in [
                 ("f8f8bf16_rowwise_preshuffle", torch.bfloat16),
                 ("f8f8f16_rowwise_preshuffle", torch.float16),
@@ -4349,24 +4416,57 @@ class FlyDSLRowwisePreshuffleTest(unittest.TestCase):
         ]
     )
     def test_leading_dimensions(
-        self, leading_shape: tuple[int, ...], op: str, dtype: torch.dtype
+        self,
+        leading_shape: tuple[int, ...],
+        N: int,
+        K: int,
+        op: str,
+        dtype: torch.dtype,
     ) -> None:
         from mslk.quantize.shuffle import preshuffle_b_mfma
 
-        xq, wq, x_scale, w_scale = self._quantized(prod(leading_shape), 80, 192)
-        xq = xq.view(*leading_shape, 192)
+        xq, wq, x_scale, w_scale = self._quantized(prod(leading_shape), N, K)
+        xq = xq.view(*leading_shape, K)
         x_scale = x_scale.reshape(leading_shape)
         inputs = (xq, preshuffle_b_mfma(wq), x_scale, w_scale)
 
         out = getattr(torch.ops.mslk, op)(*inputs)
 
-        self.assertEqual(out.shape, (*leading_shape, 80))
+        self.assertEqual(out.shape, (*leading_shape, N))
         self.assertEqual(out.dtype, dtype)
         ref = self._reference(xq, wq, x_scale, w_scale)
         torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
         torch.library.opcheck(
             getattr(torch.ops.mslk, op), inputs, test_utils=("test_faketensor",)
         )
+        if N == 7168 and is_aiter_enabled(op):
+            self.assertEqual(
+                _ROWWISE_PRESHUFFLE_ROUTING[op].backend_for(*inputs), "aiter"
+            )
+
+    @parameterized.expand(
+        [("f8f8bf16_rowwise_preshuffle",), ("f8f8f16_rowwise_preshuffle",)]
+    )
+    @skipUnlessGfxArch("gfx950")
+    def test_aiter_declines_its_unreliable_kernels(self, op: str) -> None:
+        # For M, N, K = 16384, 3584, 7168, aiter's configs pick one of its 8-wave
+        # FlyDSL kernels, which return wrong elements on some runs: even forced,
+        # aiter does not get the call. It does get an ordinary one.
+        if not is_aiter_available():
+            self.skipTest("requires the pinned aiter")
+
+        def inputs(M: int, N: int, K: int) -> tuple[torch.Tensor, ...]:
+            return (
+                torch.zeros(M, K, dtype=fp8_e4m3, device=self.device),
+                torch.zeros(N, K, dtype=fp8_e4m3, device=self.device),
+                torch.ones(M, dtype=torch.float32, device=self.device),
+                torch.ones(N, dtype=torch.float32, device=self.device),
+            )
+
+        routing = _ROWWISE_PRESHUFFLE_ROUTING[op]
+        with force_backend(op, "aiter"):
+            self.assertEqual(routing.backend_for(*inputs(16384, 3584, 7168)), "mslk")
+            self.assertEqual(routing.backend_for(*inputs(1, 7168, 2048)), "aiter")
 
     @parameterized.expand(
         [("f8f8bf16_rowwise_preshuffle",), ("f8f8f16_rowwise_preshuffle",)]
