@@ -230,7 +230,8 @@ _lib.define(
     "int num_softmax_heads=0, "
     "Tensor? M=None, Tensor? Delta=None, "
     "int stride_mm=0, "
-    'str truncate_method="none", bool enable_tma=True'
+    'str truncate_method="none", bool enable_tma=True, '
+    "Tensor? Out=None"
     ") -> Tensor[]"
 )
 
@@ -309,6 +310,7 @@ def _hstu_cross_bwd(
     stride_mm: int = 0,
     truncate_method: str = "none",
     enable_tma: bool = True,
+    Out: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     args = dict(locals())
     validate_cross_bwd(**args)
@@ -336,6 +338,7 @@ def _hstu_cross_bwd_fake(
     stride_mm: int = 0,
     truncate_method: str = "none",
     enable_tma: bool = True,
+    Out: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     validate_cross_bwd(**dict(locals()))
     grads = [_new_out(q, q.shape), _new_out(k, k.shape)]

@@ -18,8 +18,9 @@ device, op-specific key and bucket::
 
 A call is served by the row for its device and key with the smallest bucket
 bound (``M_max`` here) at or above the call's value, e.g. M=100 by the row with
-M_max=128. Calls the table does not cover use MSLK's kernel, as do all calls
-when aiter is not enabled for the op (see :mod:`mslk.aiter.common`).
+M_max=128. Calls the table does not cover use the op's default backend (MSLK's
+kernel unless the op sets one), and all calls use MSLK's kernel when aiter is
+not enabled for the op (see :mod:`mslk.aiter.common`).
 """
 
 import bisect
@@ -147,8 +148,10 @@ def choose_backend(
     device_index: int,
     key: Sequence[object],
     value: int,
+    default: str = MSLK,
 ) -> str:
-    """The backend that should serve this call of ``op``.
+    """The backend that should serve this call of ``op``; ``default`` serves
+    calls the table does not cover.
 
     ``table`` is a zero-argument loader, so that an op whose aiter path is
     switched off never reads its table.
@@ -158,7 +161,7 @@ def choose_backend(
         return forced
     if not is_aiter_enabled(op):
         return MSLK
-    return table().lookup(device_key(device_index), key, value) or MSLK
+    return table().lookup(device_key(device_index), key, value) or default
 
 
 class OpRouting:
@@ -176,6 +179,8 @@ class OpRouting:
     - ``accepts`` optionally maps a backend's name to a predicate on the op's
       arguments; a call a backend cannot take goes to MSLK's kernel instead,
       even when the table or :func:`force_backend` chose that backend.
+    - ``default`` optionally names the backend for calls the table does not
+      cover (MSLK's kernel if unset).
     - The table is a CSV in a package, read on first use.
     """
 
@@ -189,10 +194,13 @@ class OpRouting:
         backends: Dict[str, Callable[..., Any]],
         key: Callable[..., Tuple[Sequence[object], int]],
         accepts: Optional[Dict[str, Callable[..., bool]]] = None,
+        default: str = MSLK,
     ) -> None:
         assert MSLK in backends, "MSLK's kernel must be one of the backends"
+        assert default in backends, f"default backend {default!r} is not a backend"
         self.op = op
         self.backends = backends
+        self.default = default
         self._key = key
         self._accepts: Dict[str, Callable[..., bool]] = accepts or {}
         self._table_args = (package, resource, tuple(key_columns), bucket_column)
@@ -205,7 +213,7 @@ class OpRouting:
         """The backend that serves a call with these arguments."""
         key, value = self._key(*args, **kwargs)
         name = choose_backend(
-            self.op, lambda: self.table, args[0].get_device(), key, value
+            self.op, lambda: self.table, args[0].get_device(), key, value, self.default
         )
         accepts = self._accepts.get(name)
         if accepts is not None and not accepts(*args, **kwargs):

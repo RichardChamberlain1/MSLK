@@ -10,6 +10,7 @@ The device and aiter's availability are mocked, so this needs neither aiter
 nor a GPU.
 """
 
+import functools
 import unittest
 from typing import Any, Dict
 from unittest import mock
@@ -132,6 +133,18 @@ class ChooseBackendTest(unittest.TestCase):
     def test_mslk_when_disabled(self) -> None:
         self.assertEqual(self._choose(16, enabled=False), MSLK)
 
+    def test_default_serves_uncovered_calls_only(self) -> None:
+        with (
+            mock.patch.object(routing, "is_aiter_enabled", return_value=True),
+            mock.patch.object(routing, "device_key", return_value=DEVICE),
+        ):
+            choose = functools.partial(choose_backend, "op", _table, 0, default="aiter")
+            self.assertEqual(choose((8192, 8192), 4096), "aiter")  # not covered
+            self.assertEqual(choose((1, 1), 16), "aiter")  # unknown key
+            self.assertEqual(choose((8192, 8192), 512), MSLK)  # the table's row
+        with mock.patch.object(routing, "is_aiter_enabled", return_value=False):
+            self.assertEqual(choose_backend("op", _table, 0, (1, 1), 16, "aiter"), MSLK)
+
     def test_forced_backend_wins_and_is_restored(self) -> None:
         with force_backend("op", MSLK):
             self.assertEqual(self._choose(16), MSLK)
@@ -171,6 +184,12 @@ class OpRoutingTest(unittest.TestCase):
         self.assertEqual(self.routing(x, 8192, 8192), "from aiter")
         self.backends["aiter"].assert_called_once_with(x, 8192, 8192)
         self.assertEqual(self.routing(torch.empty(512, 1), 8192, 8192), "from mslk")
+
+    def test_default_backend_still_needs_its_accepts(self) -> None:
+        self.routing.default = "aiter"
+        x = torch.empty(4096, 1)  # not covered by the table
+        self.assertEqual(self.routing(x, 8192, 8192), "from aiter")
+        self.assertEqual(self.routing(x, 8192, 8192, ok=False), "from mslk")
 
     def test_a_backend_that_cannot_take_the_call_falls_back_to_mslk(self) -> None:
         x = torch.empty(16, 1)

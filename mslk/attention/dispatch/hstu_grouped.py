@@ -7,7 +7,9 @@
 """Which backend serves grouped ragged HSTU self-attention
 (``mslk::hstu_grouped_fwd`` and ``mslk::hstu_grouped_bwd``) on ROCm.
 
-- ``mslk``: MSLK's own kernel, the default and the fallback.
+- ``mslk``: the only backend; the pure-PyTorch reference for now. aiter's HSTU
+  kernels need the per-group settings on the host and have no
+  ``full_attn_size``.
 
 Routings are called as ``ROUTING(q, **op_arguments_except_q)``: ``q`` comes
 first because :class:`~mslk.aiter.routing.OpRouting` takes the device from the
@@ -32,15 +34,15 @@ _TABLE = ("mslk.attention.dispatch", "tables/hstu_grouped.csv")
 
 
 def _mslk_fwd(q: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-    raise NotImplementedError(
-        "MSLK has no grouped HSTU forward kernel; no backend can serve this call"
-    )
+    from mslk.attention.hstu import _reference_backend
+
+    return _reference_backend.grouped_fwd(q, **kwargs)
 
 
 def _mslk_bwd(q: torch.Tensor, **kwargs: Any) -> None:
-    raise NotImplementedError(
-        "MSLK has no grouped HSTU backward kernel; no backend can serve this call"
-    )
+    from mslk.attention.hstu import _reference_backend
+
+    _reference_backend.grouped_bwd(q, **kwargs)
 
 
 def key(

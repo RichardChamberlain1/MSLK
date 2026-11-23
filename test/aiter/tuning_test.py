@@ -77,6 +77,15 @@ class ChooseTest(unittest.TestCase):
     def test_mslk_wins_when_faster(self) -> None:
         self.assertEqual(choose([_m(MSLK, 5.0), _m("aiter", 9.0)], 3.0), MSLK)
 
+    def test_untimed_mslk_loses_to_any_correct_timed_backend(self) -> None:
+        untimed = Measurement(MSLK, None, True, 0.0, 0.0)
+        self.assertEqual(
+            choose([untimed, Measurement("aiter", 9e9, True, 0, 0)], 3), "aiter"
+        )
+        self.assertEqual(
+            choose([untimed, Measurement("aiter", 1.0, False, 1, 1)], 3), MSLK
+        )
+
     def test_incorrect_or_failed_candidates_are_never_chosen(self) -> None:
         self.assertEqual(
             choose([_m(MSLK, 10.0), _m("aiter", 1.0, correct=False)], 3.0), MSLK
@@ -251,6 +260,29 @@ class TuneShapeTest(unittest.TestCase):
         self.assertEqual(result.backend, MSLK)
         self.assertFalse(result.measurements[1].correct)
         self.assertEqual(result.measurements[1].err_ratio, 1.0)
+
+    def test_untimed_backends_are_checked_but_not_timed(self) -> None:
+        tuner = _TensorTuner()
+        tuner.untimed_backends = (MSLK,)
+        with (
+            mock.patch("mslk.aiter.tuning.device_key", return_value=("gfx950", 256)),
+            mock.patch("torch.cuda.current_device", return_value=0),
+            mock.patch("torch.cuda.synchronize"),
+            mock.patch("mslk.aiter.tuning.time_us", return_value=5.0) as time_us,
+        ):
+            result = tune_shape(
+                tuner,
+                {"N": "8", "K": "512", "M_max": "4"},
+                Settings(64, 1, 1, 3.0),
+                order_flip=False,
+                lower_edge=1,
+            )
+        self.assertEqual(time_us.call_count, 1)  # aiter only
+        mslk = result.measurements[0]
+        self.assertTrue(mslk.correct)
+        self.assertIsNone(mslk.us)
+        self.assertEqual(result.backend, "aiter")
+        self.assertEqual(table_row(tuner, result)["mslk_us"], "")
 
     def test_mslk_failure_has_no_valid_backend(self) -> None:
         result = self._run(_TensorTuner("partial", MSLK))

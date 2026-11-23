@@ -27,7 +27,8 @@ Conventions shared by the HSTU ops:
   (``M``) coming from the same backend, as long as the routing state
   (``force_backend``, environment switches) does not change between them.
 - Saved forward outputs. ``M`` has the shape and dtype the fake
-  implementation declares, ``[T, H]`` float32, for every backend.
+  implementation declares, ``[T, H]`` float32, for every backend. Backwards
+  may also get the forward output ``Out``.
 - Shapes a table does not cover go to MSLK's backend, the
   :class:`~mslk.aiter.routing.OpRouting` fallback.
 - Architecture. Backends decline architectures they do not support through

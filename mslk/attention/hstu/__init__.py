@@ -329,11 +329,15 @@ def cross_hstu_attention_bwd(
     stride_mm: int = 0,
     truncate_method: str = "none",
     enable_tma: bool = True,
+    Out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """HSTU cross attention backward; returns ``(dq, dk, dv)``.
 
     With ``shared_kv``, ``dk`` holds dK+dV and ``dv`` is the same tensor as
     ``dk`` (as in the reference): add only one of them to K's gradient.
+
+    ``Out`` (the forward output, optional) is needed by backends that compute
+    ``Delta`` from it.
     """
     grads = torch.ops.mslk.hstu_cross_bwd(
         dout,
@@ -356,6 +360,7 @@ def cross_hstu_attention_bwd(
         stride_mm,
         truncate_method,
         enable_tma,
+        Out,
     )
     dq, dk = grads[0], grads[1]
     dv = dk if shared_kv else grads[2]
@@ -386,7 +391,7 @@ def _cross_setup_context(ctx, inputs, output) -> None:
     # With shared_kv, V is k (or None): the backward passes v=None.
     saved_v = None if shared_kv else v
     ctx.save_for_backward(
-        q, k, saved_v, seq_offsets, seq_offsets_q, attn_scale, num_targets, M
+        q, k, saved_v, seq_offsets, seq_offsets_q, attn_scale, num_targets, M, out
     )
     ctx.max_seq_len = max_seq_len
     ctx.alpha = alpha
@@ -400,7 +405,17 @@ def _cross_setup_context(ctx, inputs, output) -> None:
 
 
 def _cross_backward(ctx, grad_out, grad_M):
-    q, k, v, seq_offsets, seq_offsets_q, attn_scale, num_targets, M = ctx.saved_tensors
+    (
+        q,
+        k,
+        v,
+        seq_offsets,
+        seq_offsets_q,
+        attn_scale,
+        num_targets,
+        M,
+        out,
+    ) = ctx.saved_tensors
     dq, dk, dv = cross_hstu_attention_bwd(
         grad_out.contiguous(),
         q,
@@ -422,6 +437,7 @@ def _cross_backward(ctx, grad_out, grad_M):
         M.stride(0),
         ctx.truncate_method,
         ctx.enable_tma,
+        out,
     )
     # With shared_kv, dk holds dK+dV and dv aliases it: V (k itself or None)
     # gets no separate gradient, or K's would be counted twice.
