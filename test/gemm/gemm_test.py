@@ -25,6 +25,9 @@ from mslk.flydsl.common import (
 )
 from mslk.gemm.dispatch.f4f4bf16 import OP as F4F4BF16_OP, ROUTING as F4F4BF16_ROUTING
 from mslk.gemm.dispatch.fp8_rowwise import ROUTINGS as FP8_ROWWISE_ROUTINGS
+from mslk.gemm.dispatch.fp8_rowwise_batched import (
+    ROUTING as FP8_ROWWISE_BATCHED_ROUTING,
+)
 from mslk.quantize.triton.fp4_quantize import (
     _to_blocked,
     calculate_group_max,
@@ -4493,6 +4496,10 @@ _FP8_ROWWISE_OUT_AITER_SHAPES: dict[tuple[int, int, int], str] = {
     (1, 1280, 8192): "aiter_triton",
     (2, 2112, 7168): "aiter_triton",
 }
+# The same for f8f8bf16_rowwise_batched, as (B, M, N, K).
+_FP8_ROWWISE_BATCHED_AITER_SHAPES: dict[tuple[int, int, int, int], str] = {
+    (8, 8192, 96, 5120): "aiter_triton",
+}
 
 
 @skipUnlessRocm()
@@ -4626,18 +4633,50 @@ class FlyDSLRowwiseTest(unittest.TestCase):
             torch.ops.mslk.f8f8bf16_rowwise_out(xq, wq, x_scale, w_scale, out[:5])
 
     @parameterized.expand(
-        [(4, 64, 256, 512), (3, 1, 1024, 4096), (2, 300, 1040, 1104), (2, 37, 100, 520)]
+        [
+            (B, M, N, K, backend)
+            for B, M, N, K in [
+                (4, 64, 256, 512),
+                (3, 1, 1024, 4096),
+                (2, 300, 1040, 1104),
+                (2, 37, 100, 520),
+                *_FP8_ROWWISE_BATCHED_AITER_SHAPES,
+            ]
+            for backend in ("default", "mslk")
+        ]
     )
-    def test_batched(self, B: int, M: int, N: int, K: int) -> None:
+    def test_batched(self, B: int, M: int, N: int, K: int, backend: str) -> None:
+        op = "f8f8bf16_rowwise_batched"
         xq, wq, x_scale, w_scale = self._quantized(B, M, K, n=N)
         ref = self._reference(xq, wq, x_scale, w_scale)
-        out = torch.ops.mslk.f8f8bf16_rowwise_batched(xq, wq, x_scale, w_scale)
-        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
         buf = torch.full(
             (B, M, N), float("nan"), dtype=torch.bfloat16, device=self.device
         )
-        torch.ops.mslk.f8f8bf16_rowwise_batched(xq, wq, x_scale, w_scale, output=buf)
+        with (
+            force_backend(op, backend)
+            if backend != "default"
+            else contextlib.nullcontext()
+        ):
+            out = torch.ops.mslk.f8f8bf16_rowwise_batched(xq, wq, x_scale, w_scale)
+            torch.ops.mslk.f8f8bf16_rowwise_batched(
+                xq, wq, x_scale, w_scale, output=buf
+            )
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
         torch.testing.assert_close(buf.float(), ref, atol=1e-3, rtol=1e-2)
+        expected = _FP8_ROWWISE_BATCHED_AITER_SHAPES.get((B, M, N, K))
+        if (
+            backend == "default"
+            and expected
+            and gfx_arch_in(("gfx950",))
+            and is_aiter_available()
+        ):
+            self.assertEqual(
+                FP8_ROWWISE_BATCHED_ROUTING.backend_for(xq, wq, x_scale, w_scale),
+                expected,
+                "the tuning table no longer routes this shape to that aiter "
+                "backend; replace it in _FP8_ROWWISE_BATCHED_AITER_SHAPES with one "
+                "it does",
+            )
 
     @parameterized.expand(
         [

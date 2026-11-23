@@ -270,20 +270,26 @@ if torch.version.hip is not None:
 
         return _impl
 
-    # The plain non-batched ops are routed per shape between the kernel above
-    # (the routing's MSLK backend) and aiter; see mslk/gemm/dispatch/fp8_rowwise.py.
+    # The plain ops are routed per shape between the kernel above (the
+    # routing's MSLK backend) and aiter; see mslk/gemm/dispatch/fp8_rowwise.py
+    # and fp8_rowwise_batched.py.
     _ROUTED_ROWWISE_OPS = (
         "f8f8bf16_rowwise",
         "f8f8bf16_rowwise_out",
         "f8f8f16_rowwise",
+        "f8f8bf16_rowwise_batched",
     )
 
     def _rowwise_routed(op: str) -> Callable[..., Any]:
         def _impl(XQ: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
             # Imported on first call, like the backends it chooses between.
-            from mslk.gemm.dispatch.fp8_rowwise import route
-
             with torch.cuda.device(XQ.get_device()):
+                if op == "f8f8bf16_rowwise_batched":
+                    from mslk.gemm.dispatch.fp8_rowwise_batched import route
+
+                    return route(XQ, *args, **kwargs)
+                from mslk.gemm.dispatch.fp8_rowwise import route
+
                 return route(op, XQ, *args, **kwargs)
 
         return _impl
