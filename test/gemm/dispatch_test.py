@@ -20,8 +20,9 @@ import mslk.gemm  # noqa: F401
 import torch
 from mslk.aiter.common import is_aiter_available
 from mslk.aiter.routing import device_key, OpRouting
-from mslk.gemm.dispatch import f4f4bf16
+from mslk.gemm.dispatch import f4f4bf16, fp8_rowwise
 from mslk.quantize.triton.fp4_quantize import triton_quantize_mx4_unpack
+from mslk.quantize.triton.fp8_quantize import quantize_fp8_row
 from mslk.testing.device import skipUnlessRocm
 from parameterized import parameterized
 
@@ -39,6 +40,23 @@ def _f4f4bf16_args(row: Dict[str, str]) -> Args:
     return (aq, bq, a_scale, b_scale), {}
 
 
+def _fp8_rowwise_args(row: Dict[str, str]) -> Args:
+    M, N, K = int(row["M_max"]), int(row["N"]), int(row["K"])
+    xq, x_scale = quantize_fp8_row(
+        torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    )
+    wq, w_scale = quantize_fp8_row(
+        torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+    )
+    return (xq, wq, x_scale, w_scale), {}
+
+
+def _fp8_rowwise_out_args(row: Dict[str, str]) -> Args:
+    (xq, wq, x_scale, w_scale), _ = _fp8_rowwise_args(row)
+    out = torch.empty(xq.shape[0], wq.shape[0], device="cuda", dtype=torch.bfloat16)
+    return (xq, wq, x_scale, w_scale, out), {}
+
+
 # (name, routing, the registered op, arguments for a table row)
 CASES: List[Tuple[str, OpRouting, Callable[..., Any], Callable[..., Args]]] = [
     (
@@ -46,6 +64,16 @@ CASES: List[Tuple[str, OpRouting, Callable[..., Any], Callable[..., Args]]] = [
         f4f4bf16.ROUTING,
         lambda *a, **kw: torch.ops.mslk.f4f4bf16(*a, **kw),
         _f4f4bf16_args,
+    ),
+    *(
+        (
+            op,
+            fp8_rowwise.ROUTINGS[op],
+            # Looked up on call: f8f8f16_rowwise is only defined on ROCm.
+            lambda *a, _op=op, **kw: getattr(torch.ops.mslk, _op)(*a, **kw),
+            _fp8_rowwise_out_args if op == fp8_rowwise.OUT_OP else _fp8_rowwise_args,
+        )
+        for op in fp8_rowwise.ROUTINGS
     ),
 ]
 

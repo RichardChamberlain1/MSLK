@@ -25,6 +25,8 @@ class LazyAiterImportTest(unittest.TestCase):
             "mslk.aiter.routing",
             "mslk.gemm.aiter.f4f4bf16",
             "mslk.gemm.dispatch.f4f4bf16",
+            "mslk.gemm.aiter.fp8_rowwise",
+            "mslk.gemm.dispatch.fp8_rowwise",
         ):
             importlib.import_module(module)
 
