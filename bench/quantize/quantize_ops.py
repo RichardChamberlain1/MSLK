@@ -19,6 +19,7 @@ from mslk.quantize.triton.fp4_quantize import (
 )
 from mslk.quantize.triton.fp4_utils import (
     dequantize_mx4,
+    dequantize_mx4_unswizzled,
     dequantize_nvfp4,
     global_scale_nvfp4,
 )
@@ -364,11 +365,15 @@ class TritonMXFP4(QuantizeOpBase):
 
     def dequantize(self, *args: Any) -> torch.Tensor:
         xq, scales = args[0], args[1]
+        # quantize_mx4 returns plain [M, K/32] scales on ROCm and CUTLASS's
+        # swizzled layout on CUDA.
+        if is_rocm():
+            return dequantize_mx4_unswizzled(xq, scales)
         return dequantize_mx4(xq, scales)
 
     @property
     def hip(self) -> bool:
-        return False
+        return True
 
     @property
     def cuda(self) -> bool:
@@ -399,14 +404,17 @@ class TritonMXFP4Stacked(QuantizeOpBase):
         return xq, scales
 
     def dequantize(self, *args: Any) -> torch.Tensor:
-        # Grouped dequant is complex due to per-segment padding; return zeros.
+        # ROCm scales are plain [M, K/32] rows, so dequantizing is direct.
+        if is_rocm():
+            return dequantize_mx4_unswizzled(args[0], args[1])
+        # CUDA pads each segment's scales to 128 rows; return zeros.
         return torch.zeros(
             self.input_shape, dtype=torch.bfloat16, device=args[0].device
         )
 
     @property
     def hip(self) -> bool:
-        return False
+        return True
 
     @property
     def cuda(self) -> bool:

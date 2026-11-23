@@ -1407,7 +1407,13 @@ def _assert_m_sizes_min(m_sizes: torch.Tensor, op_name: str) -> None:
     Matches the host-side guard requested for the Triton ports: groups of size
     0 are allowed (and skipped inside the kernel), but any non-empty group
     smaller than _MIN_M_PER_GROUP would land on an MFMA-tile edge case.
+
+    Skipped while a CUDA graph is being captured: reading m_sizes is a
+    device-to-host sync, which capture forbids. Eager calls, including the
+    warm-up call made before capture, still check.
     """
+    if torch.cuda.is_current_stream_capturing():
+        return
     sizes = m_sizes.tolist()
     for g, s in enumerate(sizes):
         if 0 < s < _MIN_M_PER_GROUP:
