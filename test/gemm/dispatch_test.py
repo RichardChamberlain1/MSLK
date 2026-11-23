@@ -20,8 +20,14 @@ import mslk.gemm  # noqa: F401
 import torch
 from mslk.aiter.common import is_aiter_available
 from mslk.aiter.routing import device_key, OpRouting
-from mslk.gemm.dispatch import f4f4bf16
+from mslk.gemm.dispatch import (
+    f4f4bf16,
+    f8f8bf16_rowwise_preshuffle,
+    f8f8f16_rowwise_preshuffle,
+)
+from mslk.quantize.shuffle import preshuffle_b_mfma
 from mslk.quantize.triton.fp4_quantize import triton_quantize_mx4_unpack
+from mslk.quantize.triton.fp8_quantize import quantize_fp8_row
 from mslk.testing.device import skipUnlessRocm
 from parameterized import parameterized
 
@@ -39,6 +45,17 @@ def _f4f4bf16_args(row: Dict[str, str]) -> Args:
     return (aq, bq, a_scale, b_scale), {}
 
 
+def _rowwise_preshuffle_args(row: Dict[str, str]) -> Args:
+    M, N, K = int(row["M_max"]), int(row["N"]), int(row["K"])
+    xq, x_scale = quantize_fp8_row(
+        torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    )
+    wq, w_scale = quantize_fp8_row(
+        torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+    )
+    return (xq, preshuffle_b_mfma(wq), x_scale, w_scale), {}
+
+
 # (name, routing, the registered op, arguments for a table row)
 CASES: List[Tuple[str, OpRouting, Callable[..., Any], Callable[..., Args]]] = [
     (
@@ -46,6 +63,18 @@ CASES: List[Tuple[str, OpRouting, Callable[..., Any], Callable[..., Args]]] = [
         f4f4bf16.ROUTING,
         lambda *a, **kw: torch.ops.mslk.f4f4bf16(*a, **kw),
         _f4f4bf16_args,
+    ),
+    (
+        "f8f8bf16_rowwise_preshuffle",
+        f8f8bf16_rowwise_preshuffle.ROUTING,
+        lambda *a, **kw: torch.ops.mslk.f8f8bf16_rowwise_preshuffle(*a, **kw),
+        _rowwise_preshuffle_args,
+    ),
+    (
+        "f8f8f16_rowwise_preshuffle",
+        f8f8f16_rowwise_preshuffle.ROUTING,
+        lambda *a, **kw: torch.ops.mslk.f8f8f16_rowwise_preshuffle(*a, **kw),
+        _rowwise_preshuffle_args,
     ),
 ]
 

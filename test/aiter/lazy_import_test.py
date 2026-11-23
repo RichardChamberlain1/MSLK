@@ -25,6 +25,10 @@ class LazyAiterImportTest(unittest.TestCase):
             "mslk.aiter.routing",
             "mslk.gemm.aiter.f4f4bf16",
             "mslk.gemm.dispatch.f4f4bf16",
+            "mslk.gemm.aiter.f8f8bf16_rowwise_preshuffle",
+            "mslk.gemm.dispatch.f8f8bf16_rowwise_preshuffle",
+            "mslk.gemm.aiter.f8f8f16_rowwise_preshuffle",
+            "mslk.gemm.dispatch.f8f8f16_rowwise_preshuffle",
         ):
             importlib.import_module(module)
 
