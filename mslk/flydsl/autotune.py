@@ -88,10 +88,13 @@ def prune_by_divisibility(
     return prune
 
 
+DefaultConfig = Mapping[str, Any] | Callable[[Mapping[str, Any]], Mapping[str, Any]]
+
+
 def tunable(
     *,
     configs: Sequence[Mapping[str, Any]],
-    default: Mapping[str, Any],
+    default: DefaultConfig,
     key: Sequence[str],
     prune: Callable[..., list] | None = None,
     returns: str = "out",
@@ -100,6 +103,10 @@ def tunable(
 
     The wrapped function takes the tuning parameters as keyword-only arguments
     and everything the cache key needs as ordinary arguments.
+
+    ``default`` is either one config for every call, or a function from the
+    call's arguments (by parameter name, defaults applied) to a config, for a
+    kernel whose best untuned tile depends on the shape, such as on M.
 
     ``returns`` names the output argument. FlyDSL's autotuner discards the tuned
     function's return value, so on the tuned path the wrapper hands back that
@@ -110,6 +117,13 @@ def tunable(
     def decorate(launch_fn):
         signature = inspect.signature(launch_fn)
         state: dict = {}
+
+        def _default_config(args, kwargs) -> Mapping[str, Any]:
+            if not callable(default):
+                return default
+            bound = signature.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            return default(bound.arguments)
 
         def _tuner():
             tuner = state.get("tuner")
@@ -127,7 +141,7 @@ def tunable(
         @functools.wraps(launch_fn)
         def call(*args, **kwargs):
             if not autotune_enabled():
-                return launch_fn(*args, **kwargs, **dict(default))
+                return launch_fn(*args, **kwargs, **dict(_default_config(args, kwargs)))
             _tuner()(*args, **kwargs)
             bound = signature.bind_partial(*args, **kwargs)
             bound.apply_defaults()

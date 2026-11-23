@@ -19,6 +19,11 @@ from mslk.flydsl.common import is_flydsl_available
 from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row, to_mxfp8
 
 if is_flydsl_available():
+    from mslk.gemm.flydsl.bf16i4bf16_dispatch import (
+        bf16i4bf16_rowwise_flydsl,
+        is_supported as bf16i4bf16_flydsl_is_supported,
+    )
+    from mslk.gemm.flydsl.bf16i4bf16_gemm import reordered_weight
     from mslk.gemm.flydsl.preshuffle_gemm import (
         flydsl_preshuffle,
         flydsl_preshuffle_batched_gemm,
@@ -2190,6 +2195,49 @@ class TritonBF16Int4Rowwise(CutlassBF16Int4Rowwise):
 @register_gemm_op
 class TritonBF16Int4Shuffled(TritonBF16Int4Rowwise):
     """ROCm Triton BF16xINT4 shuffled GEMM (routes to rowwise on AMD)."""
+
+    pass
+
+
+@register_gemm_op
+class BF16Int4RowwiseFlyDSL(CutlassBF16Int4Rowwise):
+    """ROCm FlyDSL BF16xINT4 rowwise GEMM, called directly rather than through
+    torch.ops.mslk.bf16i4bf16_rowwise so that a shape the kernel does not
+    support cannot be timed as Triton under this name."""
+
+    def quantize(self, x, w):
+        x, wq, w_scale, w_zp = super().quantize(x, w)
+        group_size = x.shape[-1] // w_scale.shape[0]
+        # Checked once here rather than in compute: compute always receives the
+        # tensors returned below, and keeping it free of host-side checks keeps
+        # them out of the timed calls when CUDA graphs are off.
+        if not bf16i4bf16_flydsl_is_supported(x, wq, w_scale, w_zp, group_size):
+            raise ValueError(
+                f"FlyDSL BF16xINT4 does not support x {tuple(x.shape)}, "
+                f"w {tuple(wq.shape)}, group_size {group_size}"
+            )
+        # Build the kernel's reordered weight now, outside the timed region.
+        reordered_weight(wq)
+        return x, wq, w_scale, w_zp
+
+    def compute(self, x, wq, w_scale, w_zp):
+        group_size = x.shape[-1] // w_scale.shape[0]
+        return bf16i4bf16_rowwise_flydsl(x, wq, w_scale, w_zp, group_size)
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.AMD_GFX942, Accelerator.AMD_GFX950}
+
+    @property
+    def supported(self) -> bool:
+        if not super().supported:
+            return False
+        return is_flydsl_available()
+
+
+@register_gemm_op
+class BF16Int4ShuffledFlyDSL(BF16Int4RowwiseFlyDSL):
+    """ROCm FlyDSL BF16xINT4 shuffled GEMM (the rowwise path on AMD)."""
 
     pass
 
