@@ -998,6 +998,8 @@ def _flydsl_bwd(
     window_left: int = -1,
     dropout_mask: Optional[torch.Tensor] = None,
     dropout_p: float = 0.0,
+    max_seqlen_q: int = -1,
+    max_seqlen_k: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # pyre-ignore[21]: FlyDSL is available only in AMD builds.
     import flydsl.compiler as flyc
@@ -1027,8 +1029,15 @@ def _flydsl_bwd(
     if varlen:
         assert seqstart_k is not None
         B = seqstart_q.shape[0] - 1
-        M = int(seqstart_q.diff().max().item())  # max_seqlen_q -- grid/loop sizing only
-        N = int(seqstart_k.diff().max().item())  # max_seqlen_k -- grid/loop sizing only
+        # Grid/loop sizing only: upper bounds of the per-sequence lengths, from the
+        # mask on the host. Reading them from the device would sync with the host
+        # and prevent CUDA-graph capture.
+        if max_seqlen_q < 0 or max_seqlen_k < 0:
+            raise ValueError(
+                "mslk_flydsl::fmha_bwd: varlen inputs (seqstart_q/seqstart_k) need "
+                "max_seqlen_q and max_seqlen_k"
+            )
+        M, N = max_seqlen_q, max_seqlen_k
     else:
         B, M = query.shape[0], query.shape[1]
         N = total_n
@@ -1774,6 +1783,8 @@ def _flydsl_bwd_abstract(
     window_left: int = -1,
     dropout_mask: Optional[torch.Tensor] = None,
     dropout_p: float = 0.0,
+    max_seqlen_q: int = -1,
+    max_seqlen_k: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # db is empty (not None) when no bias gradient was requested: the schema's
     # return arity is fixed, so `apply` keys off numel() rather than None.
@@ -1926,10 +1937,13 @@ class BwOp(AttentionBwOpBase):
         else:
             causal_mode = CAUSAL_NONE
         seqstart_q = seqstart_k = None
+        max_seqlen_q = max_seqlen_k = -1
         if isinstance(inp.attn_bias, BlockDiagonalMask):
             # Mirrors ck.py's _get_seqlen_info.
             seqstart_q = inp.attn_bias.q_seqinfo.seqstart.to(inp.query.device)
             seqstart_k = inp.attn_bias.k_seqinfo.seqstart.to(inp.query.device)
+            max_seqlen_q = inp.attn_bias.q_seqinfo.max_seqlen
+            max_seqlen_k = inp.attn_bias.k_seqinfo.max_seqlen
         bias_t = (
             inp.attn_bias._bias
             if isinstance(inp.attn_bias, LowerTriangularMaskWithTensorBias)
@@ -2007,6 +2021,8 @@ class BwOp(AttentionBwOpBase):
             window_left,
             dropout_mask,
             inp.p,
+            max_seqlen_q,
+            max_seqlen_k,
         )
         # GQA-via-broadcast (`key`/`value` genuinely Hkv-headed, exposed to
         # the caller as an H-headed stride-0 `.expand()` view -- see
