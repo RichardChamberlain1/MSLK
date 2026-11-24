@@ -25,6 +25,10 @@ class LazyAiterImportTest(unittest.TestCase):
             "mslk.aiter.routing",
             "mslk.gemm.aiter.f4f4bf16",
             "mslk.gemm.dispatch.f4f4bf16",
+            "mslk.quantize",
+            "mslk.quantize.triton.fp8_quantize",
+            "mslk.quantize.aiter.quantize_fp8_tensor",
+            "mslk.quantize.dispatch.quantize_fp8_tensor",
         ):
             importlib.import_module(module)
 

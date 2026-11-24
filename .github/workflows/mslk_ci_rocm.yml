@@ -54,8 +54,14 @@ on:
       # aiter backends, their tuning tables and tuning scripts
       - 'mslk/gemm/aiter/**'
       - 'mslk/gemm/dispatch/**'
+      - 'mslk/quantize/aiter/**'
+      - 'mslk/quantize/dispatch/**'
       - 'test/aiter/**'
       - 'bench/aiter/**'
+      # Quantization ops routed to aiter, and their tests
+      - 'mslk/quantize/triton/fp8_quantize.py'
+      - 'test/quantize/fp8_quantize_correctness_test.py'
+      - 'test/quantize/dispatch_test.py'
       # GEMM tests
       - 'test/gemm/gemm_test.py'
       - 'test/gemm/dispatch_test.py'
