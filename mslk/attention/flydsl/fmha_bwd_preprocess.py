@@ -81,8 +81,11 @@ def compile_fmha_bwd_preprocess(*, D: int, dtype_str: str = "bf16"):
         row = fx.Index(bid) * ROWS_PER_BLOCK + row_in_block
 
         if row < fx.Index(n_rows):
-            dO_rsrc = _bops.create_buffer_resource(dO)
-            O_rsrc = _bops.create_buffer_resource(O)
+            # Rebase dO/O to this block's first row (64-bit), so the in-block
+            # offsets stay 32-bit for tensors of 2^31 or more elements.
+            block_bytes = fx.Index(bid) * fx.Index(ROWS_PER_BLOCK * D * 2)
+            dO_rsrc = _bops.create_buffer_resource(dO, base_byte_offset=block_bytes)
+            O_rsrc = _bops.create_buffer_resource(O, base_byte_offset=block_bytes)
             D_rsrc = _bops.create_buffer_resource(D_out)
 
             full = THREADS_PER_ROW * VEC_WIDTH == D
@@ -93,7 +96,7 @@ def compile_fmha_bwd_preprocess(*, D: int, dtype_str: str = "bf16"):
                     # Masked-off pieces re-read the row start and are dropped.
                     ok = col < fx.Index(D)
                     col = ok.select(col, fx.Index(0))
-                flat_elem = row * D + col
+                flat_elem = row_in_block * D + col
                 do_vec = _bops.buffer_load(
                     dO_rsrc, flat_elem, vec_width=PIECE, dtype=elem_dtype
                 )

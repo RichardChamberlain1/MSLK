@@ -927,6 +927,67 @@ _BWD_GFX950_HEAD_DIMS = (32, 64, 128, 160, 256, 512)
 _small_attn_bwd_cache: dict = {}
 
 
+# Elements per dQ convert launch: the count is int32, and a chunk's fp32 bytes
+# must stay below one buffer descriptor's 0xFFFFFFFF-byte reach.
+_CONVERT_DQ_CHUNK = 1 << 29
+# Bytes one buffer descriptor addresses from its (per-sequence) base.
+_DESCRIPTOR_BYTES = 1 << 32
+
+
+def _gfx950_addressing_reasons(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    max_q: int,
+    max_k: int,
+    d_pad: int,
+    lse_rows: int,
+) -> List[str]:
+    """The gfx950 backward kernel addresses each sequence from a 64-bit base, so
+    one sequence's inputs and fp32 gradients must each fit a buffer descriptor
+    (4 GiB), whatever the total size."""
+    heads = q.shape[2]
+    per_sequence = (
+        max_q * q.stride(1) * q.element_size(),
+        max_k * k.stride(1) * k.element_size(),
+        max_k * v.stride(1) * v.element_size(),
+        max_q * heads * d_pad * 4,  # dQ accumulator
+        max_k * heads * d_pad * 4,  # dK/dV accumulators (per query head)
+    )
+    reasons = []
+    if max(per_sequence) >= _DESCRIPTOR_BYTES:
+        reasons.append(
+            "one sequence's Q/K/V or fp32 gradients exceed 4 GiB (the backward "
+            "kernel addresses each sequence with one buffer descriptor)"
+        )
+    if lse_rows * 4 >= _DESCRIPTOR_BYTES:
+        reasons.append("LSE of 2^30 or more rows is not supported")
+    return reasons
+
+
+def _large_input_reasons(d: Inputs) -> List[str]:
+    """Addressing limits of the backward kernels: per sequence for the gfx950
+    kernel (head dims <= 256), whole tensors (32-bit offsets) otherwise."""
+    q, k, v = d.query, d.key, d.value
+    dqk, dv = q.shape[-1], v.shape[-1]
+    if not is_gfx950() or max(dqk, dv) > 256:
+        if max(q.numel(), k.numel(), v.numel()) >= 1 << 31:
+            return [
+                "inputs of 2^31 or more elements are supported by the gfx950 "
+                "backward kernel only (head dims <= 256)"
+            ]
+        return []
+    d_pad = next(x for x in _BWD_GFX950_HEAD_DIMS if x >= max(dqk, dv))
+    if isinstance(d.attn_bias, _VARLEN_BIAS_TYPES):
+        max_q = int(d.attn_bias.q_seqinfo.max_seqlen)
+        max_k = int(d.attn_bias.k_seqinfo.max_seqlen)
+        lse_rows = q.shape[2] * q.shape[1]
+    else:
+        max_q, max_k = q.shape[1], k.shape[1]
+        lse_rows = q.shape[2] * q.shape[0] * q.shape[1]
+    return _gfx950_addressing_reasons(q, k, v, max_q, max_k, d_pad, lse_rows)
+
+
 def _is_small_attn(D: int, Lq: int, Lkv: int) -> bool:
     """Whether padded Q/K/V/dO with bank padding fit in gfx950 LDS."""
     if not (256 < D <= 512 and D % 32 == 0 and Lq > 0 and Lkv > 0):
@@ -1289,6 +1350,13 @@ def _flydsl_bwd(
             gfx950_tile_defaults,
         )
 
+        # Forced ops skip BwOp.not_supported_reasons: refuse here as well rather
+        # than address past a descriptor and return wrong gradients.
+        addressing = _gfx950_addressing_reasons(
+            query, key, value, M, N, D, _lse_dvec_rows
+        )
+        if addressing:
+            raise NotImplementedError("mslk_flydsl::fmha_bwd: " + "; ".join(addressing))
         BLOCK_M_CK, BLOCK_N_CK = gfx950_tile_defaults(D, N, gpu_arch)
         n_M_tiles = (M + BLOCK_M_CK - 1) // BLOCK_M_CK
         # Under torch.use_deterministic_algorithms the kernel stores each N-tile's
@@ -1297,14 +1365,18 @@ def _flydsl_bwd(
         # a fixed order. dK/dV have a single writer per element either way.
         deterministic = torch.are_deterministic_algorithms_enabled()
         num_dq_splits = (N + BLOCK_N_CK - 1) // BLOCK_N_CK if deterministic else 1
+        # Shaped [rows * H, D] rather than flat [rows * H * D, 1]: FlyDSL passes
+        # tensor dims as int32, and the kernel addresses them per sequence.
         if deterministic:
             dQ_out = torch.zeros(
-                num_dq_splits * alloc_m * H * D, 1, device=device, dtype=torch.float32
+                num_dq_splits * alloc_m * H, D, device=device, dtype=torch.float32
             )
+        else:
+            dQ_out = dQ_out.view(alloc_m * H, D)
         # dV/dK per-query-head (uncompacted [B,N,H,D]) under ck_scope_dvdk --
         # see compile_fmha_bwd_dqdkdv_mfma_gfx950's own docstring/kwarg doc.
-        dV_out = torch.zeros(alloc_n * H * D, 1, device=device, dtype=torch.float32)
-        dK_out = torch.zeros(alloc_n * H * D, 1, device=device, dtype=torch.float32)
+        dV_out = torch.zeros(alloc_n * H, D, device=device, dtype=torch.float32)
+        dK_out = torch.zeros(alloc_n * H, D, device=device, dtype=torch.float32)
         args_gfx950 = (
             Q_4d,
             K_4d,
@@ -1326,6 +1398,7 @@ def _flydsl_bwd(
             _seqstart_q_arg,
             _seqstart_k_arg,
             total_m,
+            total_n,
             _bias_arg,
             bias_stride_b,
             bias_stride_h,
@@ -1408,6 +1481,7 @@ def _flydsl_bwd(
                 _seqstart_q_arg,
                 _seqstart_k_arg,
                 total_m,
+                total_n,
                 _bias_arg,
                 bias_stride_b,
                 bias_stride_h,
@@ -1429,7 +1503,7 @@ def _flydsl_bwd(
         out_n = total_n if varlen else N
         dq_n_elems = alloc_m * H * D
         if deterministic:
-            dQ_acc = dQ_out.view(num_dq_splits, dq_n_elems).sum(0).view(-1, 1)
+            dQ_acc = dQ_out.view(num_dq_splits, dq_n_elems).sum(0)
         else:
             dQ_acc = dQ_out
         if Dqk != D:
@@ -1440,16 +1514,26 @@ def _flydsl_bwd(
             )
 
             dq_converted = torch.empty(dq_n_elems, 1, device=device, dtype=dtype)
+            dq_src = dQ_acc.view(dq_n_elems, 1)
             convert_key = dtype_str
             compiled_convert = _convert_dq_kernel_cache.get(convert_key)
             if compiled_convert is None:
                 launch_convert = compile_fmha_bwd_convert_dq(dtype_str=dtype_str)
-                tmp_dq_conv = torch.empty_like(dq_converted)
+                n_tmp = min(dq_n_elems, _CONVERT_DQ_CHUNK)
                 compiled_convert = flyc.compile(
-                    launch_convert, dQ_acc, tmp_dq_conv, dq_n_elems, stream
+                    launch_convert,
+                    dq_src[:n_tmp],
+                    torch.empty_like(dq_converted[:n_tmp]),
+                    n_tmp,
+                    stream,
                 )
                 _convert_dq_kernel_cache[convert_key] = compiled_convert
-            compiled_convert(dQ_acc, dq_converted, dq_n_elems, stream)
+            # The kernel takes an int32 element count: convert in chunks.
+            for start in range(0, dq_n_elems, _CONVERT_DQ_CHUNK):
+                end = min(start + _CONVERT_DQ_CHUNK, dq_n_elems)
+                compiled_convert(
+                    dq_src[start:end], dq_converted[start:end], end - start, stream
+                )
             dq = dq_converted.view(out_b, out_m, H, D)
         # GQA-combine: dV/dK came back per-query-head ([B,N,H,D], H not Hkv).
         # Reduce across the heads_per_kv group and convert to output dtype.
@@ -1865,6 +1949,7 @@ class BwOp(AttentionBwOpBase):
         K = d.query.shape[-1]
         if max(K, d.value.shape[-1]) > 256:
             reasons.extend(_small_attn_input_reasons(d))
+        reasons.extend(_large_input_reasons(d))
         if not _is_flydsl_available():
             reasons.append("FlyDSL unavailable on this device/arch")
         if torch.are_deterministic_algorithms_enabled() and not is_gfx950():
