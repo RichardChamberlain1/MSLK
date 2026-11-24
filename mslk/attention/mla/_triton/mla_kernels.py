@@ -84,7 +84,7 @@ def _tanh(x):
 # ===================================================================
 
 _MIN_BLOCK_KV = 32
-_is_hip = True
+_is_hip = torch.version.hip is not None
 
 
 @triton.jit

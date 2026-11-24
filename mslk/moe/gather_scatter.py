@@ -726,7 +726,7 @@ def _mslk_scatter_add_padded_tokens(
 
         d_ptr = tl.arange(0, BLOCK_D)
         input_global_ptr = (
-            in_tokens_ptr + rank * T_K * D + input_local_offset * D + d_ptr
+            in_tokens_ptr + rank.to(tl.int64) * T_K * D + input_local_offset * D + d_ptr
         )
         output_global_ptr = out_tokens_ptr + output_global_offset + d_ptr
 

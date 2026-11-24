@@ -45,6 +45,7 @@ if torch.version.hip is not None:
         grouped_gemm as _grouped_gemm,
         int4_gemm as _int4_gemm,
         int4_grouped_gemm as _int4_grouped_gemm,
+        int8_gemm as _int8_gemm,
         mx8mx4_gemm,
         mx8mx8_gemm,
     )

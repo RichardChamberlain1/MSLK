@@ -27,9 +27,13 @@ from typing import Any, Callable, Optional
 
 import click
 import torch
-import triton  # @manual=//triton:triton
 from mslk.bench.attn.decoder_ops import DecodeOpBase, get_decode_ops
-from mslk.bench.common.utils import BenchOptions, common_bench_options, profiler
+from mslk.bench.common.utils import (
+    BenchOptions,
+    common_bench_options,
+    hbm_bandwidth_gbps,
+    profiler,
+)
 
 ShapeList = list[tuple[int, int, int, int, int]]
 
@@ -240,7 +244,7 @@ def invoke_main(
         trace=trace,
     )
 
-    mem_bw_gbps = triton.testing.get_dram_gbps()
+    mem_bw_gbps = hbm_bandwidth_gbps()
     results: list[Metrics] = []
     for B, Hq, Hkv, kv_seqlen, D in shape_list:
         results.extend(

@@ -11,14 +11,21 @@ from typing import Optional
 import click
 import torch
 import triton  # noqa: F401
+from mslk.bench.common.utils import BenchOptions, do_bench as cold_do_bench
 from mslk.moe import (
     combine_shuffling,
     gather_scale_dense_tokens,
     gather_scale_quant_dense_tokens,
     scatter_add_dense_tokens,
+    scatter_add_padded_tokens,
+    silu_mul,
+    silu_mul_quant,
     split_shuffling,
 )
 from triton.testing import do_bench, do_bench_cudagraph
+
+# CUDA-graph timing over enough input copies that every call reads HBM.
+_COLD_OPTS = BenchOptions(cuda_graph=True, rotating_buffer=True)
 
 
 index_shuffling = None
@@ -256,6 +263,80 @@ def bench_combine_or_split_shuffling(
     )
 
 
+def _rel_err(out: torch.Tensor, ref: torch.Tensor) -> float:
+    return float(
+        (out.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-12)
+    )
+
+
+def bench_silu_mul(T: int, D: int, quantize: bool) -> None:
+    torch.manual_seed(0)
+    x0 = torch.randn(T, D, device=_ACCELERATOR_TAG, dtype=torch.bfloat16)
+    x1 = torch.randn(T, D, device=_ACCELERATOR_TAG, dtype=torch.bfloat16)
+    ref = torch.nn.functional.silu(x0.float()) * x1.float()
+
+    if quantize:
+        out, inv_scale = silu_mul_quant(x0, x1)
+        err = _rel_err(out.float() * inv_scale[:, None], ref)
+        time_ms = cold_do_bench(silu_mul_quant, (x0, x1), _COLD_OPTS)
+        # Reads x0 and x1, writes FP8 values and one fp32 scale per row.
+        mem_bytes = T * D * 2 * 2 + T * D + T * 4
+    else:
+        err = _rel_err(silu_mul(x0, x1), ref)
+        time_ms = cold_do_bench(silu_mul, (x0, x1), _COLD_OPTS)
+        mem_bytes = T * D * 2 * 3
+
+    name = "silu_mul_quant" if quantize else "silu_mul"
+    time_us = time_ms * 1e3
+    bw = mem_bytes * 1e-9 / (time_us * 1e-6)
+    print(
+        f"Benchmark {name}, num_tokens={T:5d}, dim={D:5d}, "
+        f"mslk_time={time_us:9.3f}us, mslk_bw={bw:9.3f}GBytes/s, rel_err={err:.2e}"
+    )
+
+
+def bench_scatter_add_padded_tokens(T: int, E: int, EP: int, D: int, K: int) -> None:
+    torch.manual_seed(0)
+    T_K = T * K
+    if T_K < E:
+        return
+    in_tokens = torch.randn(EP, T_K, D, device=_ACCELERATOR_TAG, dtype=torch.bfloat16)
+    out_tokens = torch.randn(T, D, device=_ACCELERATOR_TAG, dtype=torch.bfloat16)
+    # Balanced routing: every expert receives the same number of tokens.
+    token_counts = torch.full(
+        (E,), T_K // E, device=_ACCELERATOR_TAG, dtype=torch.int32
+    )
+    token_indices = (torch.randperm(T_K, device=_ACCELERATOR_TAG) % T).to(torch.int32)
+
+    test_out = out_tokens.clone()
+    scatter_add_padded_tokens(in_tokens, token_counts, token_indices, test_out)
+    ref_out = out_tokens.float().clone()
+    cumsums = [0] + torch.cumsum(token_counts, 0).tolist()
+    experts_per_rank = E // EP
+    idx = token_indices.long()
+    for rank in range(EP):
+        start = cumsums[experts_per_rank * rank]
+        end = cumsums[experts_per_rank * (rank + 1)]
+        ref_out.index_add_(0, idx[start:end], in_tokens[rank, start:end].float())
+    err = _rel_err(test_out, ref_out)
+
+    time_ms = cold_do_bench(
+        scatter_add_padded_tokens,
+        (in_tokens, token_counts, token_indices, out_tokens.clone()),
+        _COLD_OPTS,
+    )
+    # Each routed token is read once and added into its output row.
+    num_routed = cumsums[experts_per_rank * EP]
+    mem_bytes = num_routed * D * 2 * 3
+    time_us = time_ms * 1e3
+    bw = mem_bytes * 1e-9 / (time_us * 1e-6)
+    print(
+        f"Benchmark scatter_add_padded_tokens, num_tokens={T:5d}, "
+        f"num_experts={E:4d}, expert_parallelism={EP:3d}, top_k={K}, dim={D:5d}, "
+        f"mslk_time={time_us:9.3f}us, mslk_bw={bw:9.3f}GBytes/s, rel_err={err:.2e}"
+    )
+
+
 @click.command()
 @click.option(
     "--kernels",
@@ -313,6 +394,20 @@ def main(kernels: Optional[str]):
             bench_combine_or_split_shuffling(
                 T, D, E, EP, p, b, is_combine_shuffling=False
             )
+
+    # Activations
+    Ts = [1, 128, 2048, 4096, 8192, 16384]
+    if should_bench_kernel(silu_mul):
+        for T, D in itertools.product(Ts, Ds):
+            bench_silu_mul(T, D, quantize=False)
+
+    if should_bench_kernel(silu_mul_quant):
+        for T, D in itertools.product(Ts, Ds):
+            bench_silu_mul(T, D, quantize=True)
+
+    if should_bench_kernel(scatter_add_padded_tokens):
+        for T, D, EP in itertools.product(Ts, Ds, [2, 16]):
+            bench_scatter_add_padded_tokens(T, 128, EP, D, K=4)
 
 
 if __name__ == "__main__":

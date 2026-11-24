@@ -117,6 +117,7 @@ class ComputeDtype(Enum):
     TF32 = auto()
     BF16 = auto()
     FP8 = auto()
+    INT8 = auto()
     FP4 = auto()
 
 
@@ -251,6 +252,7 @@ _COMPUTE_DTYPE_TO_BYTES: dict[ComputeDtype, float] = {
     ComputeDtype.TF32: 4.0,
     ComputeDtype.BF16: 2.0,
     ComputeDtype.FP8: 1.0,
+    ComputeDtype.INT8: 1.0,
     ComputeDtype.FP4: 0.5,
 }
 
@@ -754,6 +756,97 @@ class FP8RowwisePreshuffleFlyDSL(FP8Rowwise):
     @property
     def compute_dtype(self) -> ComputeDtype:
         return ComputeDtype.FP8
+
+
+@register_gemm_op
+class FP8RowwiseOut(FP8Rowwise):
+    """
+    FP8 matmul with rowwise scaling into a caller-provided output.
+    """
+
+    def quantize(self, x, wq, w_scale):
+        xq, wq, x_scale, w_scale = super().quantize(x, wq, w_scale)
+        out = torch.empty(
+            (xq.shape[0], wq.shape[0]), device=xq.device, dtype=torch.bfloat16
+        )
+        return xq, wq, x_scale, w_scale, out
+
+    def compute(self, xq, wq, x_scale, w_scale, out):
+        torch.ops.mslk.f8f8bf16_rowwise_out(
+            xq, wq, x_scale, w_scale, out, use_fast_accum=self.fast_accum
+        )
+        return out
+
+
+def _quantize_int8_tensorwise(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric INT8 quantization with one scale for the whole tensor."""
+    scale = t.abs().amax().float().clamp(min=1e-12) / 127.0
+    tq = torch.round(t.float() / scale).clamp(-127, 127).to(torch.int8)
+    return tq, scale
+
+
+@register_gemm_op
+class Int8Tensorwise(GemmOpBase):
+    """
+    INT8 matmul with a single global scale passed as a host float (i8i8bf16).
+    """
+
+    op_name = "i8i8bf16"
+
+    @property
+    def name(self) -> str:
+        prefix = "Cutlass" if is_cuda() else "Triton"
+        return f"{prefix}{self.__class__.__name__}"
+
+    def preprocess(self, x, w):
+        wq, w_scale = _quantize_int8_tensorwise(w)
+        return x, wq, w_scale
+
+    def quantize(self, x, wq, w_scale):
+        xq, x_scale = _quantize_int8_tensorwise(x)
+        return xq, wq, (x_scale * w_scale).item()
+
+    def compute(self, xq, wq, scale):
+        return torch.ops.mslk.i8i8bf16(xq, wq, scale)
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {
+            Accelerator.NVIDIA_SM90,
+            Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
+            Accelerator.AMD_GFX942,
+            Accelerator.AMD_GFX950,
+        }
+
+    @property
+    def supported(self) -> bool:
+        return super().supported and hasattr(torch.ops.mslk, self.op_name)
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.INT8
+
+
+@register_gemm_op
+class Int8TensorwiseDynamic(Int8Tensorwise):
+    """
+    INT8 matmul with a single global scale passed as a device tensor
+    (i8i8bf16_dynamic).
+    """
+
+    op_name = "i8i8bf16_dynamic"
+
+    def quantize(self, x, wq, w_scale):
+        xq, x_scale = _quantize_int8_tensorwise(x)
+        return xq, wq, (x_scale * w_scale).reshape(1)
+
+    def compute(self, xq, wq, scale):
+        return torch.ops.mslk.i8i8bf16_dynamic(xq, wq, scale)
 
 
 @register_gemm_op
