@@ -1275,6 +1275,31 @@ def triton_quantize_fp8_tensor(
     a: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
+    Quantize a tensor to fp8 with a single scale.
+
+    On ROCm, mslk/quantize/dispatch/quantize_fp8_tensor.py picks the backend
+    per call: the Triton kernel below, or aiter for the shapes its tuning table
+    assigns to aiter.
+
+    Args:
+        a (Tensor): Input tensor to be quantized.
+
+    Returns:
+        torch.Tensor: fp8 quantized tensor.
+        torch.Tensor: scalar reciprocal scale tensor (fp32).
+    """
+    if torch.version.hip is not None and a.is_cuda:
+        # Imported on first call, like the backends it chooses between.
+        from mslk.quantize.dispatch.quantize_fp8_tensor import ROUTING
+
+        return ROUTING(a)
+    return _triton_quantize_fp8_tensor(a)
+
+
+def _triton_quantize_fp8_tensor(
+    a: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
     Triton implementation to quantize a tensor to fp8 with a single scale.
 
     Uses a fused persistent kernel with atomic operations for inter-block
