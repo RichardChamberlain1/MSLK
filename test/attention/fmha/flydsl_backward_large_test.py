@@ -230,3 +230,37 @@ def test_dq_convert_in_chunks_matches_one_launch(monkeypatch) -> None:
     finally:
         torch.use_deterministic_algorithms(False)
     assert torch.equal(whole, chunked)
+
+
+def test_tensor_bias_backward_beyond_2_31_elements() -> None:
+    # 9 x 16 x 4096 x 4096 bias: 1.12 x 2^31 elements. Planes past 2^31 were
+    # read at wrapped offsets (silently wrong gradients) before per-plane rebasing.
+    _require_gfx950()
+    b, h, m, d = 9, 16, 4096, 64
+    if b * h * m * m * (2 + 4 + 2) * 1.25 > torch.cuda.mem_get_info()[0]:
+        pytest.skip("not enough GPU memory")
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(b, m, h, d, **BF16).requires_grad_(True) for _ in range(3))
+    bias = torch.randn(b, h, m, m, **BF16).requires_grad_(True)
+    assert bias.numel() > 1 << 31
+    out = fmha.memory_efficient_attention(q, k, v, attn_bias=bias, op=OPS)
+    dout = torch.randn_like(out)
+    dq, dk, dv, db = torch.autograd.grad(out, (q, k, v, bias), dout)
+    for i in (0, b - 1):  # the last planes lie past 2^31 elements
+        qf, kf, vf = (t[i].detach().float().requires_grad_(True) for t in (q, k, v))
+        bf = bias[i].detach().float().requires_grad_(True)
+        s = torch.einsum("mhd,nhd->hmn", qf, kf) / math.sqrt(d) + bf
+        o = torch.einsum("hmn,nhd->mhd", s.softmax(-1), vf)
+        refs = torch.autograd.grad(o, (qf, kf, vf, bf), dout[i].float())
+        for name, got, ref in zip(("dq", "dk", "dv", "db"), (dq, dk, dv, db), refs):
+            _assert_close(f"batch {i} {name}", got[i], ref)
+
+
+def test_declines_a_bias_plane_whose_fp32_gradient_exceeds_4_gib() -> None:
+    _require_gfx950()
+    q = torch.randn(1, 32768, 1, 64, **BF16)
+    bias = torch.empty(1, 1, 32768, 32768, **BF16)  # fp32 dBias plane: 4 GiB
+    reasons = flydsl.BwOp.not_supported_reasons(
+        fmha.common.Inputs(query=q, key=q, value=q, attn_bias=bias)
+    )
+    assert any("plane of the bias" in r for r in reasons), reasons

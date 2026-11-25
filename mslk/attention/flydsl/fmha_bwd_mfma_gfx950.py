@@ -400,7 +400,6 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         bias_stride_h: fx.Int32,
         bias_stride_q: fx.Int32,
         dBias: fx.Tensor,
-        dbias_sink: fx.Int32,
         Dropout: fx.Tensor,
         drop_stride_b: fx.Int32,
         drop_stride_h: fx.Int32,
@@ -661,10 +660,19 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
 
         # The forward folded Bias into LSE, so P cannot be recomputed without it.
         # Dense [B, H, Mq, Mk]; broadcast shapes are rejected host-side.
+        # Rebased to this (batch, head) plane and sized to it, so in-plane offsets
+        # stay 32-bit however large the whole bias is.
         if const_expr(has_bias):
-            bias_rsrc = _bops.create_buffer_resource(Bias)
-            bias_plane_base = batch_idx * fx.Index(bias_stride_b) + head_idx * fx.Index(
-                bias_stride_h
+            bias_rsrc = _bops.create_buffer_resource(
+                Bias,
+                base_byte_offset=(
+                    batch_idx * fx.Index(bias_stride_b)
+                    + head_idx * fx.Index(bias_stride_h)
+                )
+                * fx.Index(_ELEM_BYTES),
+                num_records_bytes=_bytes_left(
+                    seq_M_idx, fx.Index(bias_stride_q) * fx.Index(_ELEM_BYTES)
+                ),
             )
         # Dropout keep-mask: dense uint8 [B, H, Mq, Mk] (1 = kept) regenerated from the
         # forward's philox state. The resource is rebased to this (batch, head) plane
@@ -679,12 +687,18 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             )
         # dL/dBias is dL/dS_total, i.e. the UNSCALED dS below -- scale belongs only to
         # the dQ/dK GEMMs. One writer per element, so no atomics and no reduction.
+        # Rebased and sized to this plane, like Bias. Masked lanes store one past
+        # the plane's end, which the descriptor drops.
         if const_expr(emit_dbias):
-            dbias_rsrc = _bops.create_buffer_resource(dBias)
             # dBias is host-allocated contiguous, so its pitches come from the kernel's
             # own dims, not the input strides, which may be non-contiguous in B/H.
-            dbias_plane_base = (
-                (batch_idx * n_heads_idx + head_idx) * seq_M_idx * seq_N_idx
+            dbias_plane_elems = seq_M_idx * seq_N_idx
+            dbias_rsrc = _bops.create_buffer_resource(
+                dBias,
+                base_byte_offset=(batch_idx * n_heads_idx + head_idx)
+                * dbias_plane_elems
+                * fx.Index(4),
+                num_records_bytes=_bytes_left(dbias_plane_elems, fx.Index(4)),
             )
 
         from flydsl._mlir import ir as _ir_d
@@ -1672,20 +1686,13 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                             lse_val = Vec(lse_grp)[r]
                                             s_val = Vec(s_accs[ai])[r]
                                             if const_expr(has_bias):
-                                                b_off = (
-                                                    bias_plane_base
-                                                    + fx.Index(m_row_abs)
-                                                    * fx.Index(bias_stride_q)
-                                                    + fx.Index(n_row_abs)
-                                                )
-                                                # buffer_load(mask=...) redirects a
-                                                # masked lane to byte offset
-                                                # 0x7fffffff. This resource uses the
-                                                # default 0xffffffff-byte descriptor,
-                                                # so that sentinel is still in bounds
-                                                # and can fault. Redirect invalid
-                                                # lanes to bias[0]; valid_mn below
-                                                # suppresses the loaded value.
+                                                b_off = fx.Index(m_row_abs) * fx.Index(
+                                                    bias_stride_q
+                                                ) + fx.Index(n_row_abs)
+                                                # Redirect invalid lanes to the
+                                                # plane's first element (always in
+                                                # bounds); valid_mn below suppresses
+                                                # the loaded value.
                                                 safe_b_off = bias_load_valid.select(
                                                     fx.Index(b_off), fx.Index(0)
                                                 )
@@ -1842,19 +1849,15 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                             if const_expr(emit_dbias):
                                                 # Bound only on the P pass;
                                                 # recompute, don't reuse.
-                                                db_off_ok = fx.Int32(
-                                                    dbias_plane_base
-                                                    + (m_local + m_start) * seq_N_idx
-                                                    + (n_local + n_start)
-                                                )
+                                                db_off_ok = (
+                                                    m_local + m_start
+                                                ) * seq_N_idx + (n_local + n_start)
                                                 _bops.buffer_store(
                                                     _raw(ds_val),
                                                     dbias_rsrc,
-                                                    fx.Index(
-                                                        valid_mn.select(
-                                                            db_off_ok,
-                                                            fx.Int32(dbias_sink),
-                                                        )
+                                                    valid_mn.select(
+                                                        fx.Index(db_off_ok),
+                                                        dbias_plane_elems,
                                                     ),
                                                 )
                                             # Default [n,m] m-contiguous store, UNLESS _use_ds_tr
@@ -2284,7 +2287,6 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         bias_stride_h: fx.Int32,
         bias_stride_q: fx.Int32,
         dBias: fx.Tensor,
-        dbias_sink: fx.Int32,
         Dropout: fx.Tensor,
         drop_stride_b: fx.Int32,
         drop_stride_h: fx.Int32,
@@ -2333,7 +2335,6 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             bias_stride_h,
             bias_stride_q,
             dBias,
-            dbias_sink,
             Dropout,
             drop_stride_b,
             drop_stride_h,

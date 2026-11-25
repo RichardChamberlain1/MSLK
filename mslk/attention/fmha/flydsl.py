@@ -942,10 +942,12 @@ def _gfx950_addressing_reasons(
     max_k: int,
     d_pad: int,
     lse_rows: int,
+    bias: Optional[torch.Tensor] = None,
 ) -> List[str]:
-    """The gfx950 backward kernel addresses each sequence from a 64-bit base, so
-    one sequence's inputs and fp32 gradients must each fit a buffer descriptor
-    (4 GiB), whatever the total size."""
+    """The gfx950 backward kernel addresses each sequence (and each bias plane)
+    from a 64-bit base, so one sequence's inputs and fp32 gradients, and one
+    [Mq, Mk] plane of the bias and of its fp32 gradient, must each fit a buffer
+    descriptor (4 GiB), whatever the total size."""
     heads = q.shape[2]
     per_sequence = (
         max_q * q.stride(1) * q.element_size(),
@@ -962,6 +964,17 @@ def _gfx950_addressing_reasons(
         )
     if lse_rows * 4 >= _DESCRIPTOR_BYTES:
         reasons.append("LSE of 2^30 or more rows is not supported")
+    if (
+        bias is not None
+        and max(
+            bias.shape[-2] * bias.stride(-2) * bias.element_size(),
+            bias.shape[-2] * bias.shape[-1] * 4,  # fp32 dBias plane
+        )
+        >= _DESCRIPTOR_BYTES
+    ):
+        reasons.append("one [Mq, Mk] plane of the bias or its gradient exceeds 4 GiB")
+    if bias is not None and max(bias.stride(0), bias.stride(1)) >= 1 << 31:
+        reasons.append("bias batch/head strides of 2^31 or more elements")
     return reasons
 
 
@@ -985,7 +998,19 @@ def _large_input_reasons(d: Inputs) -> List[str]:
     else:
         max_q, max_k = q.shape[1], k.shape[1]
         lse_rows = q.shape[2] * q.shape[0] * q.shape[1]
-    return _gfx950_addressing_reasons(q, k, v, max_q, max_k, d_pad, lse_rows)
+    bias = d.attn_bias
+    if isinstance(bias, LowerTriangularMaskWithTensorBias):
+        bias = bias._bias
+    return _gfx950_addressing_reasons(
+        q,
+        k,
+        v,
+        max_q,
+        max_k,
+        d_pad,
+        lse_rows,
+        bias if isinstance(bias, torch.Tensor) else None,
+    )
 
 
 def _is_small_attn(D: int, Lq: int, Lkv: int) -> bool:
@@ -1248,14 +1273,13 @@ def _flydsl_bwd(
     else:
         bias_stride_b = bias_stride_h = bias_stride_q = 0
 
-    # Contiguous [B, H, M, N] f32 plus a trailing sink for masked-off tail lanes;
-    # f32 because the kernel produces dS in f32, cast back once below.
+    # Contiguous [B, H, M, N] f32 (the kernel drops masked-off tail lanes); f32
+    # because the kernel produces dS in f32, cast back once below.
     emit_dbias = has_bias and needs_dbias
     if emit_dbias:
-        dbias_sink = B * H * M * N
-        dBias_out = torch.zeros(dbias_sink + 1, device=device, dtype=torch.float32)
+        # [B*H*M, N]: FlyDSL passes tensor dims as int32.
+        dBias_out = torch.zeros(B * H * M, N, device=device, dtype=torch.float32)
     else:
-        dbias_sink = 0
         dBias_out = torch.zeros(1, device=device, dtype=torch.float32)
 
     # gfx950 production path (mslk.attention.flydsl.fmha_bwd_mfma_gfx950),
@@ -1353,7 +1377,7 @@ def _flydsl_bwd(
         # Forced ops skip BwOp.not_supported_reasons: refuse here as well rather
         # than address past a descriptor and return wrong gradients.
         addressing = _gfx950_addressing_reasons(
-            query, key, value, M, N, D, _lse_dvec_rows
+            query, key, value, M, N, D, _lse_dvec_rows, attn_bias
         )
         if addressing:
             raise NotImplementedError("mslk_flydsl::fmha_bwd: " + "; ".join(addressing))
@@ -1404,7 +1428,6 @@ def _flydsl_bwd(
             bias_stride_h,
             bias_stride_q,
             dBias_out,
-            dbias_sink,
             _dropout_arg,
             drop_stride_b,
             drop_stride_h,
@@ -1487,7 +1510,6 @@ def _flydsl_bwd(
                 bias_stride_h,
                 bias_stride_q,
                 torch.zeros_like(dBias_out),
-                dbias_sink,
                 _dropout_arg,
                 drop_stride_b,
                 drop_stride_h,
@@ -1553,7 +1575,7 @@ def _flydsl_bwd(
         # Drop the trailing sink element before reshaping; it absorbed the
         # stores from masked-off tail lanes and is not part of the gradient.
         if emit_dbias:
-            db = dBias_out[:-1].view(B, H, M, N).to(dtype)
+            db = dBias_out.view(B, H, M, N).to(dtype)
         else:
             db = dQ_out.new_empty((0,))
         return dq, dk, dv, db
@@ -1835,7 +1857,7 @@ def _flydsl_bwd(
     # Drop the trailing sink element before reshaping; it absorbed the stores
     # from masked-off tail lanes and is not part of the gradient.
     if emit_dbias:
-        db = dBias_out[:-1].view(B, H, M, N).to(dtype)
+        db = dBias_out.view(B, H, M, N).to(dtype)
     else:
         db = dQ_out.new_empty((0,))
     return dq, dk, dv, db
