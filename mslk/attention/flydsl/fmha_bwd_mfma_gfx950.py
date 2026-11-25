@@ -110,6 +110,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     D_V: int | None = None,
     has_dropout: bool = False,
     dropout_p: float = 0.0,
+    wide_addressing: bool = False,
 ):
     """FUSED dQ + dV + dK in one N-tile-gridded kernel (gfx950/CDNA4 only),
     using the trload pipeline: Q/K/V/dO are loaded once and S/dP/P/dS are
@@ -539,24 +540,30 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # per-block query head. K/V (_kv_row) stay indexed by kv_head_idx, derived
         # from head_idx // heads_per_kv.
         #
-        # Large tensors: the buffer descriptors of Q/dO/dQ and K/V/dK/dV are
-        # rebased to this CTA's sequence (64-bit base, see the *_rsrc setup
-        # below), so these row helpers return rows RELATIVE to q_start/k_start
-        # and only in-sequence offsets are 32-bit.
+        # wide_addressing (chosen by the host for tensors of 2 GiB or more): the
+        # buffer descriptors of Q/dO/dQ and K/V/dK/dV are rebased to this CTA's
+        # sequence (64-bit base, see the *_rsrc setup below), so the row helpers
+        # return rows RELATIVE to q_start/k_start and only in-sequence offsets are
+        # 32-bit. Otherwise rows are global, from each tensor's start.
+        if const_expr(wide_addressing):
+            q_row0 = k_row0 = fx.Index(0)
+        else:
+            q_row0, k_row0 = q_start, k_start
+
         def _q_row(q_pos, head_idx):
-            return fx.Int32(q_pos * q_stride_m_idx + head_idx)
+            return fx.Int32((q_row0 + q_pos) * q_stride_m_idx + head_idx)
 
         def _do_row(q_pos, head_idx):
-            return fx.Int32(q_pos * do_stride_m_idx + head_idx)
+            return fx.Int32((q_row0 + q_pos) * do_stride_m_idx + head_idx)
 
         def _kv_row(kv_pos):
-            return fx.Int32(kv_pos * kv_stride_n_idx + kv_head_idx)
+            return fx.Int32((k_row0 + kv_pos) * kv_stride_n_idx + kv_head_idx)
 
         # dV/dK are freshly-allocated contiguous outputs, shaped [B,N,Hkv,D] --
         # row pitch n_kv_heads_idx (NOT kv_stride_n_idx), indexed by kv_head_idx.
         # Packed the SAME way as K/V's own N axis (varlen: k_start-relative).
         def _kv_row_out(kv_pos):
-            return fx.Int32(kv_pos * n_kv_heads_idx + kv_head_idx)
+            return fx.Int32((k_row0 + kv_pos) * n_kv_heads_idx + kv_head_idx)
 
         # ck_scope_dvdk-only: per-query-head scope, writing dV/dK per QUERY
         # head, uncompacted, into a [B,N,H,D]-sized buffer (row pitch
@@ -564,27 +571,33 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # _kv_row_out performs). The GQA reduction across the heads_per_kv
         # query heads sharing a KV head must happen OUTSIDE this kernel.
         def _kv_row_out_per_qhead(kv_pos):
-            return fx.Int32(kv_pos * n_heads_idx + head_idx)
+            return fx.Int32((k_row0 + kv_pos) * n_heads_idx + head_idx)
 
         # dQ is a freshly-allocated contiguous output -- always row pitch
         # n_heads_idx (NOT q_stride_m_idx), indexed by the per-q-head head_idx.
         def _q_row_out(q_pos, head_idx):
-            return fx.Int32(q_pos * n_heads_idx + head_idx)
+            return fx.Int32((q_row0 + q_pos) * n_heads_idx + head_idx)
 
         # LSE layout is [B,H,M] (batch-major, non-varlen) vs packed [1,H,sum_M]
         # under varlen (B collapses to 1 -- packed LSE convention).
         # NOT unifiable via a single q_start-relative formula since the head-axis
         # stride differs: seq_M_idx (non-varlen) vs total_m_idx (varlen).
-        # LSE and D_vec are not rebased (global rows). A masked position of an
-        # empty sequence is clamped to row -1 of it; for the FIRST sequence that
-        # is before the tensor, so read row 0 instead (the value is masked off).
-        _empty_first_q = (this_seqlen_q == fx.Index(0)) & (q_start == fx.Index(0))
-
-        def _safe_q_pos(q_pos):
-            return _empty_first_q.select(fx.Index(0), q_pos)
+        # Masked positions read the sequence's last row. Under varlen a sequence
+        # can be empty: its row -1 lies before the tensor for the FIRST sequence,
+        # so that one reads row 0 instead (the value is masked off). One scalar
+        # per CTA; dense inputs keep the plain clamp, so their code is unchanged.
+        if const_expr(varlen):
+            q_last = ((this_seqlen_q == fx.Index(0)) & (q_start == fx.Index(0))).select(
+                fx.Index(0), this_seqlen_q - fx.Index(1)
+            )
+            k_last = ((this_seqlen_k == fx.Index(0)) & (k_start == fx.Index(0))).select(
+                fx.Index(0), this_seqlen_k - fx.Index(1)
+            )
+        else:
+            q_last = this_seqlen_q - fx.Index(1)
+            k_last = this_seqlen_k - fx.Index(1)
 
         def _lse_row(q_pos, head_idx):
-            q_pos = _safe_q_pos(q_pos)
             if const_expr(varlen):
                 return fx.Int32(head_idx * total_m_idx + q_start + q_pos)
             return fx.Int32((batch_idx * n_heads_idx + head_idx) * seq_M_idx + q_pos)
@@ -593,17 +606,11 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # n_heads_idx regardless of Q's own stride. Unlike _q_row_out it is NOT
         # rebased, so it stays a global row (q_start + q_pos).
         def _dvec_row(q_pos, head_idx):
-            return fx.Int32((q_start + _safe_q_pos(q_pos)) * n_heads_idx + head_idx)
+            return fx.Int32((q_start + q_pos) * n_heads_idx + head_idx)
 
         from mslk.flydsl import buffer_ops as _bops
 
-        # Rows in the whole Q-side / K-side tensors (B collapses to 1 under varlen).
-        if const_expr(varlen):
-            q_rows_total = total_m_idx
-            k_rows_total = fx.Index(total_n)
-        else:
-            q_rows_total = fx.Index(batch_size) * seq_M_idx
-            k_rows_total = fx.Index(batch_size) * seq_N_idx
+        _ELEM_BYTES = 2  # bf16 / f16
 
         def _bytes_left(rows_left, row_bytes):
             # Descriptor size from the rebased base to the end of the tensor,
@@ -614,49 +621,62 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             big = nbytes > fx.Index(0xFFFFFFFF)
             return big.select(fx.Index(0xFFFFFFFF), nbytes)
 
-        q_rows_left = q_rows_total - q_start
-        k_rows_left = k_rows_total - k_start
+        if const_expr(wide_addressing):
+            # Rows in the whole Q-side / K-side tensors (B collapses to 1 under varlen).
+            if const_expr(varlen):
+                q_rows_total = total_m_idx
+                k_rows_total = fx.Index(total_n)
+            else:
+                q_rows_total = fx.Index(batch_size) * seq_M_idx
+                k_rows_total = fx.Index(batch_size) * seq_N_idx
 
-        # Byte offsets of this CTA's sequence, in 64-bit index arithmetic.
-        _ELEM_BYTES = 2  # bf16 / f16
-        _dkv_out_heads = (
-            n_heads_idx if const_expr(_use_ck_scope_dvdk) else n_kv_heads_idx
-        )
-        q_seq_bytes = q_start * q_stride_m_idx * fx.Index(D_QK * _ELEM_BYTES)
-        do_seq_bytes = q_start * do_stride_m_idx * fx.Index(D_V * _ELEM_BYTES)
-        k_seq_bytes = k_start * kv_stride_n_idx * fx.Index(D_QK * _ELEM_BYTES)
-        v_seq_bytes = k_start * kv_stride_n_idx * fx.Index(D_V * _ELEM_BYTES)
-        dq_seq_bytes = q_start * n_heads_idx * fx.Index(D * 4)
-        dkv_seq_bytes = k_start * _dkv_out_heads * fx.Index(D * 4)
+            q_rows_left = q_rows_total - q_start
+            k_rows_left = k_rows_total - k_start
 
-        q_rsrc = _bops.create_buffer_resource(
-            Q,
-            base_byte_offset=q_seq_bytes,
-            num_records_bytes=_bytes_left(
-                q_rows_left, q_stride_m_idx * fx.Index(D_QK * _ELEM_BYTES)
-            ),
-        )
-        k_rsrc = _bops.create_buffer_resource(
-            K,
-            base_byte_offset=k_seq_bytes,
-            num_records_bytes=_bytes_left(
-                k_rows_left, kv_stride_n_idx * fx.Index(D_QK * _ELEM_BYTES)
-            ),
-        )
-        v_rsrc = _bops.create_buffer_resource(
-            V,
-            base_byte_offset=v_seq_bytes,
-            num_records_bytes=_bytes_left(
-                k_rows_left, kv_stride_n_idx * fx.Index(D_V * _ELEM_BYTES)
-            ),
-        )
-        do_rsrc = _bops.create_buffer_resource(
-            dO,
-            base_byte_offset=do_seq_bytes,
-            num_records_bytes=_bytes_left(
-                q_rows_left, do_stride_m_idx * fx.Index(D_V * _ELEM_BYTES)
-            ),
-        )
+            # Byte offsets of this CTA's sequence, in 64-bit index arithmetic.
+            _dkv_out_heads = (
+                n_heads_idx if const_expr(_use_ck_scope_dvdk) else n_kv_heads_idx
+            )
+            q_seq_bytes = q_start * q_stride_m_idx * fx.Index(D_QK * _ELEM_BYTES)
+            do_seq_bytes = q_start * do_stride_m_idx * fx.Index(D_V * _ELEM_BYTES)
+            k_seq_bytes = k_start * kv_stride_n_idx * fx.Index(D_QK * _ELEM_BYTES)
+            v_seq_bytes = k_start * kv_stride_n_idx * fx.Index(D_V * _ELEM_BYTES)
+            dq_seq_bytes = q_start * n_heads_idx * fx.Index(D * 4)
+            dkv_seq_bytes = k_start * _dkv_out_heads * fx.Index(D * 4)
+
+            q_rsrc = _bops.create_buffer_resource(
+                Q,
+                base_byte_offset=q_seq_bytes,
+                num_records_bytes=_bytes_left(
+                    q_rows_left, q_stride_m_idx * fx.Index(D_QK * _ELEM_BYTES)
+                ),
+            )
+            k_rsrc = _bops.create_buffer_resource(
+                K,
+                base_byte_offset=k_seq_bytes,
+                num_records_bytes=_bytes_left(
+                    k_rows_left, kv_stride_n_idx * fx.Index(D_QK * _ELEM_BYTES)
+                ),
+            )
+            v_rsrc = _bops.create_buffer_resource(
+                V,
+                base_byte_offset=v_seq_bytes,
+                num_records_bytes=_bytes_left(
+                    k_rows_left, kv_stride_n_idx * fx.Index(D_V * _ELEM_BYTES)
+                ),
+            )
+            do_rsrc = _bops.create_buffer_resource(
+                dO,
+                base_byte_offset=do_seq_bytes,
+                num_records_bytes=_bytes_left(
+                    q_rows_left, do_stride_m_idx * fx.Index(D_V * _ELEM_BYTES)
+                ),
+            )
+        else:
+            q_rsrc = _bops.create_buffer_resource(Q)
+            k_rsrc = _bops.create_buffer_resource(K)
+            v_rsrc = _bops.create_buffer_resource(V)
+            do_rsrc = _bops.create_buffer_resource(dO)
 
         # The forward folded Bias into LSE, so P cannot be recomputed without it.
         # Dense [B, H, Mq, Mk]; broadcast shapes are rejected host-side.
@@ -742,46 +762,57 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                 fx.Int32,
             ).ir_value()
 
-        dq_bytes_left = _bytes_left(q_rows_left, n_heads_idx * fx.Index(D * 4))
-        dkv_bytes_left = _bytes_left(k_rows_left, _dkv_out_heads * fx.Index(D * 4))
-        dq_rsrc = _make_raw_f32_rsrc(
-            dQ_f32,
-            num_records_bytes=fx.Int32(dq_bytes_left),
-            base_byte_offset=dq_seq_bytes,
-        )
-        # Deterministic dQ uses plain buffer_store (collision-free per-n_tile slot),
-        # which needs the ptr<8> descriptor rather than the raw <4xi32> atomic rsrc.
-        if const_expr(deterministic):
-            dq_store_rsrc = _bops.create_buffer_resource(
+        if const_expr(wide_addressing):
+            dq_bytes_left = _bytes_left(q_rows_left, n_heads_idx * fx.Index(D * 4))
+            dkv_bytes_left = _bytes_left(k_rows_left, _dkv_out_heads * fx.Index(D * 4))
+            dq_rsrc = _make_raw_f32_rsrc(
                 dQ_f32,
-                base_byte_offset=n_tile * dq_total_elems_idx * fx.Index(4)
-                + dq_seq_bytes,
-                num_records_bytes=dq_bytes_left,
+                num_records_bytes=fx.Int32(dq_bytes_left),
+                base_byte_offset=dq_seq_bytes,
             )
-        # dV/dK's final store is an atomic-add whenever multiple blocks contribute a
-        # partial sum for the same KV-head N-tile: GQA (heads_per_kv>1, per-query-head
-        # grid). MHA keeps the plain deterministic store.
-        if const_expr(_dvdk_atomic):
-            dv_rsrc = _make_raw_f32_rsrc(
-                dV,
-                num_records_bytes=fx.Int32(dkv_bytes_left),
-                base_byte_offset=dkv_seq_bytes,
-            )
-            dk_rsrc = _make_raw_f32_rsrc(
-                dK,
-                num_records_bytes=fx.Int32(dkv_bytes_left),
-                base_byte_offset=dkv_seq_bytes,
-            )
-        # Wide plain-store path (see above): needs the
-        # ptr<8> ordinary buffer_store descriptor (buffer_ops.buffer_store), distinct
-        # from the raw <4xi32> atomic rsrc built above for the GQA-combine path.
-        if const_expr(not (_dvdk_atomic and not _use_ck_scope_dvdk)):
-            dv_store_rsrc = _bops.create_buffer_resource(
-                dV, base_byte_offset=dkv_seq_bytes, num_records_bytes=dkv_bytes_left
-            )
-            dk_store_rsrc = _bops.create_buffer_resource(
-                dK, base_byte_offset=dkv_seq_bytes, num_records_bytes=dkv_bytes_left
-            )
+            # Deterministic dQ uses plain buffer_store (collision-free per-n_tile slot),
+            # which needs the ptr<8> descriptor rather than the raw <4xi32> atomic rsrc.
+            if const_expr(deterministic):
+                dq_store_rsrc = _bops.create_buffer_resource(
+                    dQ_f32,
+                    base_byte_offset=n_tile * dq_total_elems_idx * fx.Index(4)
+                    + dq_seq_bytes,
+                    num_records_bytes=dq_bytes_left,
+                )
+            # dV/dK's final store is an atomic-add whenever multiple blocks contribute a
+            # partial sum for the same KV-head N-tile: GQA (heads_per_kv>1, per-query-head
+            # grid). MHA keeps the plain deterministic store.
+            if const_expr(_dvdk_atomic):
+                dv_rsrc = _make_raw_f32_rsrc(
+                    dV,
+                    num_records_bytes=fx.Int32(dkv_bytes_left),
+                    base_byte_offset=dkv_seq_bytes,
+                )
+                dk_rsrc = _make_raw_f32_rsrc(
+                    dK,
+                    num_records_bytes=fx.Int32(dkv_bytes_left),
+                    base_byte_offset=dkv_seq_bytes,
+                )
+            # Wide plain-store path (see above): needs the
+            # ptr<8> ordinary buffer_store descriptor (buffer_ops.buffer_store), distinct
+            # from the raw <4xi32> atomic rsrc built above for the GQA-combine path.
+            if const_expr(not (_dvdk_atomic and not _use_ck_scope_dvdk)):
+                dv_store_rsrc = _bops.create_buffer_resource(
+                    dV, base_byte_offset=dkv_seq_bytes, num_records_bytes=dkv_bytes_left
+                )
+                dk_store_rsrc = _bops.create_buffer_resource(
+                    dK, base_byte_offset=dkv_seq_bytes, num_records_bytes=dkv_bytes_left
+                )
+        else:
+            dq_rsrc = _make_raw_f32_rsrc(dQ_f32)
+            if const_expr(deterministic):
+                dq_store_rsrc = _bops.create_buffer_resource(dQ_f32)
+            if const_expr(_dvdk_atomic):
+                dv_rsrc = _make_raw_f32_rsrc(dV)
+                dk_rsrc = _make_raw_f32_rsrc(dK)
+            if const_expr(not (_dvdk_atomic and not _use_ck_scope_dvdk)):
+                dv_store_rsrc = _bops.create_buffer_resource(dV)
+                dk_store_rsrc = _bops.create_buffer_resource(dK)
 
         def _load_global_vec_cv(rsrc, row_i32, col_offset_idx, dim):
             flat_elem = fx.Index(row_i32) * fx.Index(dim) + col_offset_idx
@@ -851,9 +882,12 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # workspace (causal leaves some slots unwritten) and reduces
         # dq_acc.view(num_N_tiles, B*M*H*D).sum(0) to recover dQ.
         def _store_dq(flat_elem, val_f32, is_valid=None):
-            if const_expr(deterministic):
+            if const_expr(deterministic and wide_addressing):
                 # dq_store_rsrc is rebased to this n_tile's slot and sequence.
                 _bops.buffer_store(val_f32, dq_store_rsrc, flat_elem)
+            elif const_expr(deterministic):
+                row_idx = fx.Int32(n_tile * dq_total_elems_idx + fx.Index(flat_elem))
+                _bops.buffer_store(val_f32, dq_store_rsrc, row_idx)
             else:
                 _atomic_add_dq(flat_elem, val_f32)
 
@@ -933,7 +967,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             n_global_band_base = n_start + band_safe * 32
             n_row_abs_kv = n_global_band_base + lane_mod_32
             n_valid_kv = band_in_range & (n_row_abs_kv < this_seqlen_k)
-            n_safe_kv = n_valid_kv.select(n_row_abs_kv, this_seqlen_k - fx.Index(1))
+            n_safe_kv = n_valid_kv.select(n_row_abs_kv, k_last)
             kv_row_g_pre = _kv_row(n_safe_kv)
             n_local_k_row_band = band_safe * 32 + lane_mod_32
 
@@ -1261,7 +1295,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             row_in_tile = wave * ROWS_PER_WAVE_LD + row_off_i
             m_global_ld = m_start_p + row_in_tile
             m_valid_ld = m_global_ld < this_seqlen_q
-            m_safe_ld = m_valid_ld.select(m_global_ld, this_seqlen_q - fx.Index(1))
+            m_safe_ld = m_valid_ld.select(m_global_ld, q_last)
             q_row_g = _q_row(m_safe_ld, head_idx_p)
             do_row_g = _do_row(m_safe_ld, head_idx_p)
             col_off_ld = cv_i * fx.Index(MFMA_LK)
@@ -1289,7 +1323,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             tid_idx = fx.Index(tid)
             m_g_ls = m_start_p + tid_idx
             m_ok_ls = m_g_ls < this_seqlen_q
-            m_sf_ls = m_ok_ls.select(m_g_ls, this_seqlen_q - fx.Index(1))
+            m_sf_ls = m_ok_ls.select(m_g_ls, q_last)
             return (
                 _load_f32_row(LSE_buf, _lse_row(m_sf_ls, head_idx_p)),
                 _load_f32_row(Dvec_buf, _dvec_row(m_sf_ls, head_idx_p)),

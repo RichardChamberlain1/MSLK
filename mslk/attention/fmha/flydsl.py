@@ -932,6 +932,10 @@ _small_attn_bwd_cache: dict = {}
 _CONVERT_DQ_CHUNK = 1 << 29
 # Bytes one buffer descriptor addresses from its (per-sequence) base.
 _DESCRIPTOR_BYTES = 1 << 32
+# Tensors at least this large switch the gfx950 backward kernel to per-sequence
+# (64-bit based) addressing; smaller inputs keep whole-tensor 32-bit offsets,
+# which compile to faster code.
+_WIDE_ADDRESSING_BYTES = 1 << 31
 
 
 def _gfx950_addressing_reasons(
@@ -1434,7 +1438,15 @@ def _flydsl_bwd(
             drop_stride_q,
             stream,
         )
+        wide_addressing = (
+            max(
+                t.numel() * t.element_size()
+                for t in (query, key, value, grad, dQ_out, dK_out, dV_out)
+            )
+            >= _WIDE_ADDRESSING_BYTES
+        )
         gfx950_key = (
+            wide_addressing,
             D,
             dtype_str,
             BLOCK_M_CK,
@@ -1474,6 +1486,7 @@ def _flydsl_bwd(
                 emit_dbias=emit_dbias,
                 D_QK=Dqk,
                 D_V=Dv,
+                wide_addressing=wide_addressing,
             )
             # flyc.compile executes the kernel once (JIT warm run) -- dQ (and
             # dV/dK, always atomic-add under ck_scope_dvdk's per-query-head

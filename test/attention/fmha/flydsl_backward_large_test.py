@@ -144,8 +144,15 @@ def test_padded_head_dim_backward_beyond_2_31_kv_elements() -> None:
         ([64, 64, 0], [128, 128, 128]),
     ],
 )
-def test_varlen_backward_empty_sequences(q_lens: List[int], kv_lens: List[int]) -> None:
+@pytest.mark.parametrize("wide", [False, True], ids=["narrow", "wide"])
+def test_varlen_backward_empty_sequences(
+    q_lens: List[int], kv_lens: List[int], wide: bool, monkeypatch
+) -> None:
+    # Both addressing modes: whole-tensor offsets (default for these sizes) and
+    # per-sequence rebased descriptors (forced with a zero threshold).
     _require_gfx950()
+    if wide:
+        monkeypatch.setattr(flydsl, "_WIDE_ADDRESSING_BYTES", 0)
     torch.manual_seed(0)
     bias = BlockDiagonalMask.from_seqlens(
         q_seqlen=q_lens, kv_seqlen=kv_lens, device="cuda"
