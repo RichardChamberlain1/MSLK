@@ -576,7 +576,16 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # under varlen (B collapses to 1 -- packed LSE convention).
         # NOT unifiable via a single q_start-relative formula since the head-axis
         # stride differs: seq_M_idx (non-varlen) vs total_m_idx (varlen).
+        # LSE and D_vec are not rebased (global rows). A masked position of an
+        # empty sequence is clamped to row -1 of it; for the FIRST sequence that
+        # is before the tensor, so read row 0 instead (the value is masked off).
+        _empty_first_q = (this_seqlen_q == fx.Index(0)) & (q_start == fx.Index(0))
+
+        def _safe_q_pos(q_pos):
+            return _empty_first_q.select(fx.Index(0), q_pos)
+
         def _lse_row(q_pos, head_idx):
+            q_pos = _safe_q_pos(q_pos)
             if const_expr(varlen):
                 return fx.Int32(head_idx * total_m_idx + q_start + q_pos)
             return fx.Int32((batch_idx * n_heads_idx + head_idx) * seq_M_idx + q_pos)
@@ -585,7 +594,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # n_heads_idx regardless of Q's own stride. Unlike _q_row_out it is NOT
         # rebased, so it stays a global row (q_start + q_pos).
         def _dvec_row(q_pos, head_idx):
-            return fx.Int32((q_start + q_pos) * n_heads_idx + head_idx)
+            return fx.Int32((q_start + _safe_q_pos(q_pos)) * n_heads_idx + head_idx)
 
         from mslk.flydsl import buffer_ops as _bops
 
