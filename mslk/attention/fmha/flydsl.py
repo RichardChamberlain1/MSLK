@@ -982,11 +982,43 @@ def _gfx950_addressing_reasons(
     return reasons
 
 
+def _may_exceed_addressing(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    head_dim: int,
+    bias: Optional[torch.Tensor],
+) -> bool:
+    """Cheap bound: False when every input (by row pitch), fp32 accumulator and
+    bias plane is under _WIDE_ADDRESSING_BYTES, so no addressing limit can be
+    reached. Keeps the size checks off the per-call path for normal inputs."""
+    qs, ks = q.shape, k.shape
+    rows = max(qs[0] * qs[1], ks[0] * ks[1])
+    elems = rows * max(q.stride(1), k.stride(1), v.stride(1), qs[2] * head_dim)
+    if bias is not None:
+        bs = bias.shape
+        elems = max(
+            elems,
+            bs[-2] * max(bias.stride(-2), bs[-1]),
+            bias.stride(0),
+            bias.stride(1),
+        )
+    # 4 bytes per element bounds the inputs and the fp32 gradients.
+    return elems * 4 >= _WIDE_ADDRESSING_BYTES
+
+
 def _large_input_reasons(d: Inputs) -> List[str]:
     """Addressing limits of the backward kernels: per sequence for the gfx950
     kernel (head dims <= 256), whole tensors (32-bit offsets) otherwise."""
     q, k, v = d.query, d.key, d.value
     dqk, dv = q.shape[-1], v.shape[-1]
+    bias = d.attn_bias
+    if isinstance(bias, LowerTriangularMaskWithTensorBias):
+        bias = bias._bias
+    bias = bias if isinstance(bias, torch.Tensor) else None
+    # The padded head dim is at most max(2 * D, 32).
+    if not _may_exceed_addressing(q, k, v, max(2 * dqk, 2 * dv, 32), bias):
+        return []
     if not is_gfx950() or max(dqk, dv) > 256:
         if max(q.numel(), k.numel(), v.numel()) >= 1 << 31:
             return [
@@ -1002,19 +1034,7 @@ def _large_input_reasons(d: Inputs) -> List[str]:
     else:
         max_q, max_k = q.shape[1], k.shape[1]
         lse_rows = q.shape[2] * q.shape[0] * q.shape[1]
-    bias = d.attn_bias
-    if isinstance(bias, LowerTriangularMaskWithTensorBias):
-        bias = bias._bias
-    return _gfx950_addressing_reasons(
-        q,
-        k,
-        v,
-        max_q,
-        max_k,
-        d_pad,
-        lse_rows,
-        bias if isinstance(bias, torch.Tensor) else None,
-    )
+    return _gfx950_addressing_reasons(q, k, v, max_q, max_k, d_pad, lse_rows, bias)
 
 
 def _is_small_attn(D: int, Lq: int, Lkv: int) -> bool:
@@ -1380,8 +1400,12 @@ def _flydsl_bwd(
 
         # Forced ops skip BwOp.not_supported_reasons: refuse here as well rather
         # than address past a descriptor and return wrong gradients.
-        addressing = _gfx950_addressing_reasons(
-            query, key, value, M, N, D, _lse_dvec_rows, attn_bias
+        addressing = (
+            _gfx950_addressing_reasons(
+                query, key, value, M, N, D, _lse_dvec_rows, attn_bias
+            )
+            if _may_exceed_addressing(query, key, value, D, attn_bias)
+            else []
         )
         if addressing:
             raise NotImplementedError("mslk_flydsl::fmha_bwd: " + "; ".join(addressing))
