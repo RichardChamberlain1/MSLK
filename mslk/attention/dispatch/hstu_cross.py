@@ -7,7 +7,8 @@
 """Which backend serves HSTU cross attention (``mslk::hstu_cross_fwd`` and
 ``mslk::hstu_cross_bwd``) on ROCm.
 
-- ``mslk``: the default and fallback; the pure-PyTorch reference for now.
+- ``mslk``: the pure-PyTorch reference for now. It serves calls ``aiter``
+  declines and empty calls (``max_seq_len == 0``).
 - ``aiter``: aiter's varlen flash attention, for the shapes in
   ``tables/hstu_cross.csv`` (written by ``bench/aiter/tune_hstu_cross.py``) and
   for calls the table does not cover. Every KV sequence must fit in

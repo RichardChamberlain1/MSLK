@@ -178,6 +178,26 @@ class RaggedAiterTest(unittest.TestCase):
             self._routed(hstu_ragged.AITER_TRITON, self._call_args(odd)), MSLK
         )
 
+    def test_empty_call_goes_to_mslk(self) -> None:
+        """N == 0 is never tuned; aiter's kernels reject it, so the call
+        goes to MSLK whatever the default backend is."""
+        q = torch.empty(0, 2, 64, dtype=torch.bfloat16, device="cuda")
+        offsets = torch.zeros(2, dtype=torch.int64, device="cuda")
+        inputs = {
+            "N": 0,
+            "alpha": 1.0,
+            "q": q,
+            "k": q,
+            "v": q,
+            "seq_offsets": offsets,
+            "shared_kv": False,
+        }
+        args = self._call_args(inputs)
+        args.pop("q")
+        self.assertEqual(hstu_ragged.FWD_ROUTING.backend_for(q, **args), MSLK)
+        out, _ = hstu.ragged_hstu_attention(**self._call_args(inputs))
+        self.assertEqual(out.shape, (0, 2, 64))
+
 
 class FlydslOffsetsDtypeTest(unittest.TestCase):
     """aiter's FlyDSL kernel cache ignores the offsets dtype: always pass int32."""

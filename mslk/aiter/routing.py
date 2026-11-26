@@ -101,7 +101,8 @@ class ShapeTable:
         ``None`` when the table does not cover it."""
         full_key = tuple(str(k) for k in tuple(device) + tuple(key))
         bounds = self._bounds.get(full_key)
-        # Empty calls (e.g. M=0) are never tuned; MSLK's kernel handles them.
+        # Empty calls (e.g. M=0) are never tuned (choose_backend sends them to
+        # MSLK's kernel).
         if bounds is None or value < 1:
             return None
         i = bisect.bisect_left(bounds, value)
@@ -151,7 +152,8 @@ def choose_backend(
     default: str = MSLK,
 ) -> str:
     """The backend that should serve this call of ``op``; ``default`` serves
-    calls the table does not cover.
+    calls the table does not cover. Empty calls (``value < 1``, never tuned)
+    go to MSLK's kernel, whatever the default.
 
     ``table`` is a zero-argument loader, so that an op whose aiter path is
     switched off never reads its table.
@@ -159,7 +161,7 @@ def choose_backend(
     forced = _forced.get(op)
     if forced is not None:
         return forced
-    if not is_aiter_enabled(op):
+    if not is_aiter_enabled(op) or value < 1:
         return MSLK
     return table().lookup(device_key(device_index), key, value) or default
 
@@ -173,14 +175,15 @@ class OpRouting:
     op:
 
     - ``backends`` maps each backend's name to a callable taking the op's
-      arguments; MSLK's kernel (:data:`MSLK`) is the default and fallback.
+      arguments. MSLK's kernel (:data:`MSLK`) is the fallback, and the default
+      unless ``default`` names another backend.
     - ``key`` maps the op's arguments to the table key and bucket value, e.g.
       ``((N, K), M)``. The first argument must be a tensor on the call's device.
     - ``accepts`` optionally maps a backend's name to a predicate on the op's
       arguments; a call a backend cannot take goes to MSLK's kernel instead,
       even when the table or :func:`force_backend` chose that backend.
     - ``default`` optionally names the backend for calls the table does not
-      cover (MSLK's kernel if unset).
+      cover (MSLK's kernel if unset). Empty calls always go to MSLK's kernel.
     - The table is a CSV in a package, read on first use.
     """
 

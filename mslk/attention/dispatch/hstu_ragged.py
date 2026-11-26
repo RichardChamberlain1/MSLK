@@ -7,7 +7,9 @@
 """Which backend serves ragged HSTU self-attention (``mslk::hstu_ragged_fwd``
 and ``mslk::hstu_ragged_bwd``) on ROCm.
 
-- ``mslk``: the default and fallback; the pure-PyTorch reference for now.
+- ``mslk``: the pure-PyTorch reference for now. It serves calls the aiter
+  backends decline and empty calls (``N == 0``), and the shapes the table gives
+  it.
 - ``aiter_triton``, ``aiter_flydsl``: aiter's HSTU kernels, for the shapes in
   ``tables/hstu_ragged.csv`` (written by ``bench/aiter/tune_hstu_ragged.py``).
   ``aiter_flydsl`` also serves calls the table does not cover (``aiter_triton``
@@ -19,7 +21,8 @@ first argument, and every other argument is passed by its schema name.
 
 Table key: head count, head dims, mask type, window (``max_attn_len``, 0 = no
 window), softmax (1) or SiLU (0), shared K/V; bucket: ``max_seq_len`` (``N``).
-Window values are matched exactly; windows the table does not list use MSLK.
+Window values are matched exactly; windows the table does not list go to the
+default backend, like any other call the table does not cover.
 """
 
 from typing import Any, List, Optional, Sequence, Tuple

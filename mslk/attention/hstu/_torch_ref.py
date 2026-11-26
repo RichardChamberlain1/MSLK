@@ -369,7 +369,8 @@ def ragged_hstu_attention_ref(
     seq_options = []
     for start, end in zip(offsets[:-1], offsets[1:]):
         if attn_scale is None:
-            scale: Scale = 1.0 / N
+            # N == 0 leaves only empty sequences, which never use the scale.
+            scale: Scale = 1.0 / N if N > 0 else 0.0
         elif attn_scale.ndim == 0:
             scale = attn_scale.to(_compute_dtype(q))
         else:

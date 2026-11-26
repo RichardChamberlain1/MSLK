@@ -142,6 +142,7 @@ class ChooseBackendTest(unittest.TestCase):
             self.assertEqual(choose((8192, 8192), 4096), "aiter")  # not covered
             self.assertEqual(choose((1, 1), 16), "aiter")  # unknown key
             self.assertEqual(choose((8192, 8192), 512), MSLK)  # the table's row
+            self.assertEqual(choose((8192, 8192), 0), MSLK)  # empty: never tuned
         with mock.patch.object(routing, "is_aiter_enabled", return_value=False):
             self.assertEqual(choose_backend("op", _table, 0, (1, 1), 16, "aiter"), MSLK)
 
