@@ -131,10 +131,18 @@ def aiter_triton_accepts(q: torch.Tensor, *, v: torch.Tensor, **kwargs: Any) -> 
 
 
 def aiter_flydsl_accepts(q: torch.Tensor, *, v: torch.Tensor, **kwargs: Any) -> bool:
-    """Also needs head dims that are multiples of 32, up to 256."""
-    return aiter_accepts(q, v=v, **kwargs) and all(
-        d % 32 == 0 and 0 < d <= 256 for d in (q.shape[2], v.shape[2])
-    )
+    """Also needs head dims that are multiples of 32, up to 256, whose tiles
+    aiter's FlyDSL kernels can build on this GPU (see
+    :func:`mslk.attention.aiter.hstu.flydsl_supports_head_dims`; asking imports
+    aiter, so it comes last)."""
+    if not (
+        aiter_accepts(q, v=v, **kwargs)
+        and all(d % 32 == 0 and 0 < d <= 256 for d in (q.shape[2], v.shape[2]))
+    ):
+        return False
+    from mslk.attention.aiter import hstu
+
+    return hstu.flydsl_supports_head_dims(q.shape[2], v.shape[2])
 
 
 def key(

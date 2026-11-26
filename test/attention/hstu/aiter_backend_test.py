@@ -104,7 +104,13 @@ class RaggedAiterTest(unittest.TestCase):
         with force_backend(hstu_ragged.OP, backend):
             return hstu_ragged.FWD_ROUTING.backend_for(q, **args)
 
-    def _check(self, backend: str, head_dim: int, **case: Any) -> None:
+    def _check(
+        self,
+        backend: str,
+        head_dim: int,
+        hidden_dim: Optional[int] = None,
+        **case: Any,
+    ) -> None:
         shared_kv = case.pop("shared_kv", False)
         max_targets = case.pop("max_targets", 0)
         base = make_ragged_inputs(
@@ -112,7 +118,7 @@ class RaggedAiterTest(unittest.TestCase):
             case.pop("max_seq_len", 256),
             2,
             head_dim,
-            head_dim,
+            head_dim if hidden_dim is None else hidden_dim,
             0.5,
             device=torch.device("cuda"),
             seed=head_dim,
@@ -177,6 +183,25 @@ class RaggedAiterTest(unittest.TestCase):
         self.assertEqual(
             self._routed(hstu_ragged.AITER_TRITON, self._call_args(odd)), MSLK
         )
+
+    def test_flydsl_takes_only_head_dims_it_builds(self) -> None:
+        """aiter's FlyDSL kernels reject tiles that do not divide their DMA
+        pass. Such head dims must be declined (served by MSLK), never raise;
+        the ones taken must match the reference."""
+        gfx950_declined = {(32, 32), (64, 224), (224, 224), (160, 160), (160, 64)}
+        pairs = sorted(gfx950_declined | {(128, 32), (96, 96), (192, 192)})
+        gfx950 = device_key(torch.cuda.current_device())[0] == "gfx950"
+        for head_dim, hidden_dim in pairs:
+            with self.subTest(head_dim=head_dim, hidden_dim=hidden_dim):
+                base = make_ragged_inputs(
+                    4, 64, 2, head_dim, hidden_dim, 0.5, device=torch.device("cuda")
+                )
+                routed = self._routed(hstu_ragged.AITER_FLYDSL, self._call_args(base))
+                if gfx950:
+                    declined = (head_dim, hidden_dim) in gfx950_declined
+                    self.assertEqual(routed == MSLK, declined)
+                if routed == hstu_ragged.AITER_FLYDSL:
+                    self._check(hstu_ragged.AITER_FLYDSL, head_dim, hidden_dim)
 
     def test_empty_call_goes_to_mslk(self) -> None:
         """N == 0 is never tuned; aiter's kernels reject it, so the call

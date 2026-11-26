@@ -15,6 +15,7 @@ and assume the dispatch module's ``accepts`` predicate took the call.
   needs ``Out``.
 """
 
+import functools
 import math
 from typing import Any, List, Optional, Tuple
 
@@ -30,6 +31,45 @@ def _triton_hstu() -> Any:
 
 def _flydsl_hstu() -> Any:
     return import_aiter_module("aiter.ops.flydsl.hstu_attention")
+
+
+@functools.lru_cache(maxsize=None)
+def flydsl_supports_head_dims(head_dim: int, hidden_dim: int) -> bool:
+    """Whether aiter's FlyDSL HSTU kernels build for these Q/K and V head dims
+    on this GPU, forward and backward.
+
+    aiter picks its default tile from the head dims and rejects tiles that do
+    not divide its DMA pass, some in its validator and some in its kernel
+    builder (e.g. on gfx950: DV=32 except with D=96/128, DV=224, D=160).
+    Rather than mirror those rules, ask aiter: validate and build the forward
+    with its default tile (no compilation, ~30 ms) and run its backward tile
+    search. Cached per head-dim pair. Tuned aiter tiles for specific shapes are
+    not consulted; aiter validates those when it tunes them.
+    """
+    flydsl = _flydsl_hstu()
+    fwd = import_aiter_module("aiter.ops.flydsl.kernels.hstu.hstu_attention_fwd")
+    kwargs = dict(
+        num_heads=1,
+        head_dim=head_dim,
+        hidden_dim=hidden_dim,
+        causal=True,
+        max_attn_len=0,
+        contextual_seq_len=0,
+        has_targets=False,
+        alpha=1.0,
+        dtype_str="bf16",
+        **flydsl._get_default_config(head_dim=head_dim, hidden_dim=hidden_dim),
+    )
+    try:
+        fwd.validate_hstu_attention_fwd(**kwargs)
+        fwd.build_hstu_attention_fwd(**kwargs)
+        for kernel in flydsl._BWD_KERNELS:
+            flydsl._get_bwd_default_config(
+                kernel, head_dim=head_dim, hidden_dim=hidden_dim
+            )
+    except (ValueError, AssertionError):
+        return False
+    return True
 
 
 def _mha() -> Any:
