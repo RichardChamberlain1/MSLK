@@ -680,6 +680,7 @@ class FP8Rowwise(GemmOpBase):
             Accelerator.NVIDIA_SM100,
             Accelerator.NVIDIA_SM103,
             Accelerator.AMD_GFX942,
+            Accelerator.AMD_GFX950,
         }
 
     @property
@@ -1262,6 +1263,23 @@ class FP8RowwiseGroupedDynamic(_FlyDSLRowwiseGroupedBase):
     op_name = "f8f8bf16_rowwise_grouped_dynamic"
     preshuffled = False
 
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        # CUTLASS serves the plain op on CUDA; FlyDSL serves it on ROCm.
+        return _ROCM_GROUPED | {
+            Accelerator.NVIDIA_SM90,
+            Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
+        }
+
+    @property
+    def supported(self) -> bool:
+        if is_cuda():
+            return get_current_accelerator() in self.supported_accelerators and hasattr(
+                torch.ops.mslk, self.op_name
+            )
+        return super().supported
+
     def preprocess(self, x, w):
         m_values = [i.shape[0] for i in x]
         expected_m = max(m_values)
@@ -1292,6 +1310,10 @@ class FP8RowwiseGroupedDynamicPreshuffle(FP8RowwiseGroupedDynamic):
 
     op_name = "f8f8bf16_rowwise_grouped_dynamic_preshuffle"
     preshuffled = True
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return _ROCM_GROUPED
 
 
 @register_gemm_op
@@ -1545,6 +1567,7 @@ class FP8RowwiseBatched(GemmOpBase):
             Accelerator.NVIDIA_SM100,
             Accelerator.NVIDIA_SM103,
             Accelerator.AMD_GFX942,
+            Accelerator.AMD_GFX950,
         }
 
     @property
@@ -2028,6 +2051,8 @@ class CutlassBF16DGrad(GemmOpBase):
             Accelerator.NVIDIA_SM90,
             Accelerator.NVIDIA_SM100,
             Accelerator.NVIDIA_SM103,
+            Accelerator.AMD_GFX942,
+            Accelerator.AMD_GFX950,
         }
 
     @property
@@ -2074,6 +2099,8 @@ class CutlassBF16WGrad(GemmOpBase):
             Accelerator.NVIDIA_SM90,
             Accelerator.NVIDIA_SM100,
             Accelerator.NVIDIA_SM103,
+            Accelerator.AMD_GFX942,
+            Accelerator.AMD_GFX950,
         }
 
     @property
@@ -2120,6 +2147,7 @@ class BF16Grouped(GemmOpBase):
             Accelerator.NVIDIA_SM100,
             Accelerator.NVIDIA_SM103,
             Accelerator.AMD_GFX942,
+            Accelerator.AMD_GFX950,
         }
 
     @property

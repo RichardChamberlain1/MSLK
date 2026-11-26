@@ -34,8 +34,9 @@ class BenchOptions:
             reduce kernel launch overhead and provide more accurate measurements
             for GPU-bound workloads.
         rotating_buffer: Whether to use a rotating buffer during benchmarking.
-            This helps flush L2/L3 cache between iterations to get more realistic
-            memory-bound performance measurements.
+            Each call reads a different copy of the inputs, cycling through
+            enough copies to sweep twice the device's last-level cache, so
+            every call reads its inputs from HBM.
         rep_ms: Repetition time in milliseconds for triton.testing.do_bench.
             Controls how long each benchmark runs before measuring.
         trace: Whether to produce a performance trace of the benchmark using
@@ -64,6 +65,71 @@ def _do_bench(
         return triton.testing.do_bench(fn, rep=opts.rep_ms)
 
 
+# Last-level cache per ROCm arch. torch reports only the per-XCD L2 there, not
+# the Infinity Cache that sits in front of HBM.
+_ROCM_LAST_LEVEL_CACHE_BYTES = {
+    "gfx942": 256 * 1024 * 1024,
+    "gfx950": 256 * 1024 * 1024,
+}
+
+# A cyclic sweep over exactly the cache's capacity still leaves hits, since the
+# replacement policy is not strict LRU; twice the capacity evicts each set
+# before it comes around again.
+_ROTATING_BUFFER_CACHE_MULTIPLE = 2
+
+# Bounds the graph a tiny problem would otherwise need: below this many sets,
+# small problems fall short of the target and run partly warm.
+_MAX_ROTATING_BUFFER_SETS = 10000
+
+
+def last_level_cache_bytes() -> int:
+    """Size of the cache closest to HBM on the current device."""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if torch.version.hip is not None:
+        arch = props.gcnArchName.split(":")[0]
+        if arch in _ROCM_LAST_LEVEL_CACHE_BYTES:
+            return _ROCM_LAST_LEVEL_CACHE_BYTES[arch]
+    return props.L2_cache_size
+
+
+def rotating_buffer_target_bytes() -> int:
+    """Bytes the rotating buffer sweeps per pass, so every pass reads HBM.
+
+    ``MSLK_BENCH_ROTATING_BUFFER_MB`` overrides the default of twice the
+    device's last-level cache.
+    """
+    override_mb = os.environ.get("MSLK_BENCH_ROTATING_BUFFER_MB")
+    if override_mb:
+        return int(override_mb) * 1024 * 1024
+    return _ROTATING_BUFFER_CACHE_MULTIPLE * last_level_cache_bytes()
+
+
+def _tensor_bytes(obj: Any, seen: set[int]) -> int:
+    """Bytes of the distinct tensor storages in obj, searching lists, tuples
+    and dicts, so grouped ops' per-group tensors and in-place outputs count
+    once each."""
+    if isinstance(obj, torch.Tensor):
+        storage = obj.untyped_storage()
+        if storage.data_ptr() in seen:
+            return 0
+        seen.add(storage.data_ptr())
+        return storage.nbytes()
+    if isinstance(obj, (list, tuple)):
+        return sum(_tensor_bytes(o, seen) for o in obj)
+    if isinstance(obj, dict):
+        return sum(_tensor_bytes(o, seen) for o in obj.values())
+    return 0
+
+
+def rotating_buffer_sets(footprint_bytes: int) -> int:
+    """Number of input sets to cycle through for a call touching
+    footprint_bytes of memory."""
+    if footprint_bytes <= 0:
+        return 1
+    sets = -(-rotating_buffer_target_bytes() // footprint_bytes)
+    return min(max(sets, 2), _MAX_ROTATING_BUFFER_SETS)
+
+
 def do_bench(
     fn: Callable[..., Any],
     args: tuple[Any, ...],
@@ -83,18 +149,16 @@ def do_bench(
     if not opts.rotating_buffer:
         return _do_bench(lambda: fn(*args), opts)
 
-    # Calculate input size to determine how many copies we need.
-    input_size_bytes = sum(
-        t.element_size() * t.numel() for t in args if isinstance(t, torch.Tensor)
-    )
-
-    # Use a 50MB buffer, this may need to be variable in the future.
-    rotating_buffer_size_bytes = 50 * 1024 * 1024
-    # Make at least one copy of the inputs.
-    copy_cnt = max(rotating_buffer_size_bytes // input_size_bytes, 1)
+    # A call touches its inputs and writes its outputs; both pass through the
+    # cache, so both count towards the sweep.
+    seen: set[int] = set()
+    input_bytes = _tensor_bytes(args, seen)
+    if input_bytes == 0:
+        return _do_bench(lambda: fn(*args), opts)
+    footprint_bytes = input_bytes + _tensor_bytes(fn(*args), seen)
 
     args_list = [args]
-    for _ in range(copy_cnt):
+    for _ in range(rotating_buffer_sets(footprint_bytes) - 1):
         args_list.append(copy.deepcopy(args))
 
     # We benchmark on a different stream, so a sync is required.

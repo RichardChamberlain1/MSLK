@@ -2668,6 +2668,52 @@ class BF16Tests(unittest.TestCase):
             )
 
 
+@skipUnlessGfxArch("gfx942", "gfx950")
+@skipUnlessCudaCapability(9)
+class BF16GroupedGradGraphCaptureTests(unittest.TestCase):
+    """The grouped grad/wgrad ops must be capturable in a CUDA graph, which is
+    how gemm_bench times them."""
+
+    G, M, N, K = 8, 2048, 1024, 512
+
+    def _m_sizes(self) -> torch.Tensor:
+        return BF16Tests.generate_random_splits(
+            self.G, self.M, min_group_size=8
+        ).to(torch.int64)
+
+    def _check_replay(self, fn) -> None:
+        expected = fn()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = fn()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, expected)
+
+    def test_grad(self) -> None:
+        torch.manual_seed(0)
+        device = torch.accelerator.current_accelerator()
+        dy = torch.randn((self.M, self.N), dtype=torch.bfloat16, device=device)
+        w = torch.randn((self.G, self.N, self.K), dtype=torch.bfloat16, device=device)
+        m_sizes = self._m_sizes()
+        self._check_replay(
+            lambda: torch.ops.mslk.bf16bf16bf16_grouped_grad(
+                dy, w.permute(0, 2, 1), m_sizes
+            )
+        )
+
+    def test_wgrad(self) -> None:
+        torch.manual_seed(0)
+        device = torch.accelerator.current_accelerator()
+        dy = torch.randn((self.M, self.N), dtype=torch.bfloat16, device=device)
+        x = torch.randn((self.M, self.K), dtype=torch.bfloat16, device=device)
+        m_sizes = self._m_sizes()
+        self._check_replay(
+            lambda: torch.ops.mslk.bf16bf16bf16_grouped_wgrad(dy, x, m_sizes)
+        )
+
+
 @skipUnlessCuda()
 @skipUnlessCudaCapability(10)
 class NVFP4Tests(unittest.TestCase):
