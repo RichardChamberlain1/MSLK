@@ -20,6 +20,12 @@ sequences). The table has gfx950 rows with 256 CUs only, so on gfx942 and on
 devices with another CU count (e.g. a CPX partition) every call takes
 ``aiter_flydsl`` untuned.
 
+aiter compiles its FlyDSL kernels per ``max_seq_len`` (``N``) and ``alpha``,
+not per batch size: the first call with a new ``N`` compiles the forward and
+backward (measured on gfx950, D=128: ~1.9 s, then ~0.1 s in later processes
+from the disk cache). Callers should keep ``N`` fixed (e.g. the model's
+maximum length) rather than pass each batch's longest sequence.
+
 Routings are called as ``ROUTING(q, **op_arguments_except_q)``: ``q`` comes
 first because :class:`~mslk.aiter.routing.OpRouting` takes the device from the
 first argument, and every other argument is passed by its schema name.
