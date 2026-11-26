@@ -24,6 +24,11 @@ and ``[dq, dk, dv]`` otherwise.
 Table key: head count, head dims, causal, softmax (1) or SiLU (0), shared K/V,
 and the query length rounded up to a power of two (``max_q_len_p2``); bucket:
 ``max_kv_len`` (``max_seq_len``).
+
+The table does not change routing today: every row picks ``aiter``, which is
+also the default, and the MSLK backend is the reference, which the tuner only
+checks. It records the shapes where aiter was checked against the reference
+and timed, and starts routing once MSLK has a cross kernel to compare.
 """
 
 from typing import Any, List, Optional, Sequence, Tuple
