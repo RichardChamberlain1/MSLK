@@ -12,7 +12,9 @@
 - ``aiter``: aiter's varlen flash attention, for the shapes in
   ``tables/hstu_cross.csv`` (written by ``bench/aiter/tune_hstu_cross.py``) and
   for calls the table does not cover. Every KV sequence must fit in
-  ``max_seq_len``.
+  ``max_seq_len`` and every query sequence in ``max_q_len``; that is not
+  checked (it needs a host sync), and smaller values give wrong outputs or
+  gradients.
 
 Routings are called as ``ROUTING(q, **op_arguments_except_q)``: ``q`` comes
 first because :class:`~mslk.aiter.routing.OpRouting` takes the device from the

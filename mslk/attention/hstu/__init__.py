@@ -284,9 +284,16 @@ def cross_hstu_attention_fwd(
     """HSTU cross attention forward.
 
     ``q``: ``[Tq, H, Dqk]`` packed by ``seq_offsets_q``; ``k``, ``v``:
-    ``[Tkv, H, D]`` packed by ``seq_offsets``; ``max_seq_len`` is the maximum
-    KV length. ``enable_tma`` is accepted and ignored. Returns ``(out, M)``:
-    ``out`` ``[Tq, H, Dv]`` and ``M`` ``[Tq, H]`` float32.
+    ``[Tkv, H, D]`` packed by ``seq_offsets``. ``enable_tma`` is accepted and
+    ignored. Returns ``(out, M)``: ``out`` ``[Tq, H, Dv]`` and ``M``
+    ``[Tq, H]`` float32.
+
+    ``max_seq_len`` must be at least every KV sequence's length and
+    ``max_q_len`` at least every query sequence's length, also with
+    ``truncate_method="none"``. Neither is checked (that would need a host
+    sync): on ROCm the aiter backend sizes its work from them, so a smaller
+    ``max_q_len`` gives wrong outputs and a smaller ``max_seq_len`` wrong
+    gradients in the backward.
     """
     return torch.ops.mslk.hstu_cross_fwd(
         max_seq_len,
@@ -338,6 +345,10 @@ def cross_hstu_attention_bwd(
 
     ``Out`` (the forward output, optional) is needed by backends that compute
     ``Delta`` from it.
+
+    ``max_seq_len`` and ``max_q_len`` must bound the KV and query sequence
+    lengths, as in :func:`cross_hstu_attention_fwd`; with smaller values the
+    aiter backend leaves parts of the gradients unwritten.
     """
     grads = torch.ops.mslk.hstu_cross_bwd(
         dout,
