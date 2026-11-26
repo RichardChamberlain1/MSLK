@@ -156,10 +156,35 @@ class HstuDispatchTest(unittest.TestCase):
             (hstu_cross, _cross_call, cross),
         ):
             with self.subTest(op=module.OP):
+                expected = getattr(module, "UNTUNED_DEFAULT", None)
                 spies = self._spied(module, call, row)
                 for direction, by_backend in spies.items():
                     self.assertEqual(
-                        by_backend[module.FWD_ROUTING.default].call_count, 1, direction
+                        by_backend[expected or module.FWD_ROUTING.default].call_count,
+                        1,
+                        direction,
+                    )
+
+    def test_untuned_head_counts_take_the_nearest_tuned_ones_choice(self) -> None:
+        """A ragged call with a head count the table does not list takes the
+        backend of the same shape at the nearest tuned head count."""
+        gfx, cu_num = device_key(torch.cuda.current_device())
+        table = hstu_ragged.FWD_ROUTING.table
+        rows = [r for r in table.rows if (r["gfx"], r["cu_num"]) == (gfx, str(cu_num))]
+        h1 = [r for r in rows if r["H"] == "1" and r["backend"] != MSLK]
+        if not h1:
+            self.skipTest(f"no tuning-table rows for {gfx} with {cu_num} CUs")
+        # The cheapest H=1 row of each backend, called with H=2 (nearest: H=1).
+        for backend in sorted({r["backend"] for r in h1}):
+            row = min(
+                (r for r in h1 if r["backend"] == backend),
+                key=lambda r: int(r["max_seq_len"]) * int(r["D"]),
+            )
+            with self.subTest(backend=backend):
+                spies = self._spied(hstu_ragged, _ragged_call, {**row, "H": "2"})
+                for direction, by_backend in spies.items():
+                    self.assertEqual(
+                        by_backend[backend].call_count, 1, f"{direction} {row}"
                     )
 
     def test_disable_switch_sends_the_op_back_to_mslk(self) -> None:

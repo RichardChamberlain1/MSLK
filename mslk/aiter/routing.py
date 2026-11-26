@@ -28,12 +28,15 @@ import csv
 import functools
 import importlib.resources
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
 from mslk.aiter.common import is_aiter_enabled
 
 MSLK: str = "mslk"
+# choose_backend's answer for calls the table does not cover, when the op's
+# default backend depends on the call (OpRouting resolves it).
+_UNCOVERED: str = "<uncovered>"
 
 _DeviceKey = Tuple[str, int]
 
@@ -183,7 +186,9 @@ class OpRouting:
       arguments; a call a backend cannot take goes to MSLK's kernel instead,
       even when the table or :func:`force_backend` chose that backend.
     - ``default`` optionally names the backend for calls the table does not
-      cover (MSLK's kernel if unset). Empty calls always go to MSLK's kernel.
+      cover (MSLK's kernel if unset), or is a callable taking the op's
+      arguments and returning that name. Empty calls always go to MSLK's
+      kernel.
     - The table is a CSV in a package, read on first use.
     """
 
@@ -197,10 +202,12 @@ class OpRouting:
         backends: Dict[str, Callable[..., Any]],
         key: Callable[..., Tuple[Sequence[object], int]],
         accepts: Optional[Dict[str, Callable[..., bool]]] = None,
-        default: str = MSLK,
+        default: Union[str, Callable[..., str]] = MSLK,
     ) -> None:
         assert MSLK in backends, "MSLK's kernel must be one of the backends"
-        assert default in backends, f"default backend {default!r} is not a backend"
+        assert callable(default) or default in backends, (
+            f"default backend {default!r} is not a backend"
+        )
         self.op = op
         self.backends = backends
         self.default = default
@@ -216,8 +223,11 @@ class OpRouting:
         """The backend that serves a call with these arguments."""
         key, value = self._key(*args, **kwargs)
         name = choose_backend(
-            self.op, lambda: self.table, args[0].get_device(), key, value, self.default
+            self.op, lambda: self.table, args[0].get_device(), key, value, _UNCOVERED
         )
+        if name == _UNCOVERED:
+            default = self.default
+            name = default(*args, **kwargs) if callable(default) else default
         accepts = self._accepts.get(name)
         if accepts is not None and not accepts(*args, **kwargs):
             return MSLK

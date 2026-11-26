@@ -192,6 +192,18 @@ class OpRoutingTest(unittest.TestCase):
         self.assertEqual(self.routing(x, 8192, 8192), "from aiter")
         self.assertEqual(self.routing(x, 8192, 8192, ok=False), "from mslk")
 
+    def test_default_can_depend_on_the_call(self) -> None:
+        default = mock.Mock(return_value="aiter")
+        self.routing.default = default
+        x = torch.empty(4096, 1)  # not covered by the table
+        self.assertEqual(self.routing(x, 8192, 8192), "from aiter")
+        default.assert_called_once_with(x, 8192, 8192)
+        self.assertEqual(self.routing(x, 8192, 8192, ok=False), "from mslk")
+        default.reset_mock()
+        self.routing(torch.empty(512, 1), 8192, 8192)  # covered: no default
+        self.routing(torch.empty(0, 1), 8192, 8192)  # empty: MSLK
+        default.assert_not_called()
+
     def test_a_backend_that_cannot_take_the_call_falls_back_to_mslk(self) -> None:
         x = torch.empty(16, 1)
         self.assertEqual(self.routing(x, 8192, 8192, ok=False), "from mslk")

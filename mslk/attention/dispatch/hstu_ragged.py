@@ -12,8 +12,13 @@ and ``mslk::hstu_ragged_bwd``) on ROCm.
   it.
 - ``aiter_triton``, ``aiter_flydsl``: aiter's HSTU kernels, for the shapes in
   ``tables/hstu_ragged.csv`` (written by ``bench/aiter/tune_hstu_ragged.py``).
-  ``aiter_flydsl`` also serves calls the table does not cover (``aiter_triton``
-  misses the tolerance on long full-causal sequences).
+
+Calls the table does not cover go to :func:`default_backend`: the table's
+choice for the same shape at the nearest tuned head count, else
+``aiter_flydsl`` (``aiter_triton`` misses the tolerance on long full-causal
+sequences). The table has gfx950 rows with 256 CUs only, so on gfx942 and on
+devices with another CU count (e.g. a CPX partition) every call takes
+``aiter_flydsl`` untuned.
 
 Routings are called as ``ROUTING(q, **op_arguments_except_q)``: ``q`` comes
 first because :class:`~mslk.aiter.routing.OpRouting` takes the device from the
@@ -25,6 +30,7 @@ Window values are matched exactly; windows the table does not list go to the
 default backend, like any other call the table does not cover.
 """
 
+import functools
 from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
@@ -171,6 +177,32 @@ def key(
     return key_values, N
 
 
+#: Backend for calls whose shape is not tuned at any head count.
+UNTUNED_DEFAULT: str = AITER_FLYDSL
+
+
+@functools.lru_cache(maxsize=None)
+def _tuned_heads() -> Tuple[int, ...]:
+    return tuple(sorted({int(row["H"]) for row in FWD_ROUTING.table.rows}))
+
+
+def default_backend(q: torch.Tensor, **kwargs: Any) -> str:
+    """Backend for calls the table does not cover. The head count changes
+    which backend is faster (H=1 and H=4 differ on 36 of 90 tuned shapes), but
+    the kernels compute each head the same way, so the table's choice for the
+    same shape at the nearest tuned head count (the larger one on a tie: its
+    check covered more elements) beats always taking one backend: aiter_flydsl
+    at D=256 takes a median 2x the time of the backend the table picks."""
+    (heads, *rest), N = key(q, **kwargs)
+    device = device_key(q.get_device())
+    for h in sorted(_tuned_heads(), key=lambda h: (abs(h - heads), -h)):
+        if h != heads:
+            backend = FWD_ROUTING.table.lookup(device, [h, *rest], N)
+            if backend is not None:
+                return backend
+    return UNTUNED_DEFAULT
+
+
 _ACCEPTS = {AITER_TRITON: aiter_triton_accepts, AITER_FLYDSL: aiter_flydsl_accepts}
 
 FWD_ROUTING: OpRouting = OpRouting(
@@ -185,7 +217,7 @@ FWD_ROUTING: OpRouting = OpRouting(
     },
     key=key,
     accepts=_ACCEPTS,
-    default=AITER_FLYDSL,
+    default=default_backend,
 )
 
 BWD_ROUTING: OpRouting = OpRouting(
@@ -200,7 +232,7 @@ BWD_ROUTING: OpRouting = OpRouting(
     },
     key=key,
     accepts=_ACCEPTS,
-    default=AITER_FLYDSL,
+    default=default_backend,
 )
 
 BACKENDS: Tuple[str, ...] = tuple(FWD_ROUTING.backends)
