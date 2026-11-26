@@ -498,7 +498,6 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         Dvec_buf = fx.rocdl.make_buffer_tensor(D_vec)
 
         copy_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-        store_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
 
         v8elem_type = Vec.make_type(MFMA_LK, elem_dtype)
         v4f32_type = Vec.make_type(4, fx.Float32)
