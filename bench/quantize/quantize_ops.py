@@ -27,6 +27,7 @@ from mslk.quantize.triton.fp8_quantize import (
     dequantize_fp8_block,
     dequantize_fp8_row,
     quantize_fp8_row,
+    scale_fp8_row,
     triton_quantize_fp8_block,
     triton_quantize_fp8_group,
     triton_quantize_fp8_tensor,
@@ -92,6 +93,11 @@ class QuantizeOpBase(metaclass=abc.ABCMeta):
             (input, *args),
             opts,
         )
+
+    def io_bytes(self, input: torch.Tensor, args: Any, outputs: Any) -> int:
+        """Bytes the timed call reads and writes, for the bandwidth column."""
+        input_bytes = input.numel() * input.element_size()
+        return input_bytes + sum(t.numel() * t.element_size() for t in outputs)
 
 
 op_registry: dict[str, QuantizeOpBase] = {}
@@ -206,6 +212,104 @@ class TritonFP8Groupwise(QuantizeOpBase):
     @property
     def cuda(self) -> bool:
         return True
+
+
+@register_op
+class TritonFP8RowwiseScale(QuantizeOpBase):
+    """scale_fp8_row: applies row and column scales to a GEMM output."""
+
+    def preprocess(self, input: torch.Tensor, num_groups: int = 1) -> Any:
+        M, K = input.shape
+        x_scale = torch.rand(M, device=input.device, dtype=torch.float32) + 0.5
+        w_scale = torch.rand(K, device=input.device, dtype=torch.float32) + 0.5
+        return (x_scale, w_scale)
+
+    def quantize(self, input: torch.Tensor, *args: Any) -> Any:
+        x_scale, w_scale = args
+        return (scale_fp8_row(input, x_scale, w_scale), x_scale, w_scale)
+
+    def dequantize(self, *args: Any) -> torch.Tensor:
+        scaled, x_scale, w_scale = args
+        return scaled.float() / (x_scale[:, None] * w_scale[None, :])
+
+    def io_bytes(self, input: torch.Tensor, args: Any, outputs: Any) -> int:
+        # Reads the input and both scale vectors, writes one output.
+        scale_bytes = sum(t.numel() * t.element_size() for t in args)
+        return 2 * input.numel() * input.element_size() + scale_bytes
+
+    @property
+    def hip(self) -> bool:
+        return True
+
+    @property
+    def cuda(self) -> bool:
+        return True
+
+
+class _DequantizeOpBase(QuantizeOpBase):
+    """Times a dequantize kernel; the quantized operands are prepared untimed.
+
+    Only the quantized operands are timed and rotated: the bf16 input is not
+    read by the kernel.
+    """
+
+    def benchmark(
+        self,
+        input: torch.Tensor,
+        args: Any,
+        opts: BenchOptions,
+    ) -> float:
+        return do_bench(lambda *a: self._dequantize(*a), tuple(args), opts)
+
+    def _dequantize(self, xq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def quantize(self, input: torch.Tensor, *args: Any) -> Any:
+        return (self._dequantize(*args),)
+
+    def dequantize(self, *args: Any) -> torch.Tensor:
+        return args[0]
+
+    def io_bytes(self, input: torch.Tensor, args: Any, outputs: Any) -> int:
+        operand_bytes = sum(t.numel() * t.element_size() for t in args)
+        return operand_bytes + sum(t.numel() * t.element_size() for t in outputs)
+
+    @property
+    def hip(self) -> bool:
+        return True
+
+    @property
+    def cuda(self) -> bool:
+        return True
+
+
+@register_op
+class TritonFP8RowwiseDequant(_DequantizeOpBase):
+    """dequantize_fp8_row."""
+
+    def preprocess(self, input: torch.Tensor, num_groups: int = 1) -> Any:
+        return quantize_fp8_row(input)
+
+    def _dequantize(self, xq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        return dequantize_fp8_row(xq, scale)
+
+
+@register_op
+class TritonFP8BlockwiseDequant(_DequantizeOpBase):
+    """dequantize_fp8_block."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_m = 128
+        self.block_k = 128
+
+    def preprocess(self, input: torch.Tensor, num_groups: int = 1) -> Any:
+        return triton_quantize_fp8_block(
+            input, block_m=self.block_m, block_k=self.block_k
+        )
+
+    def _dequantize(self, xq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        return dequantize_fp8_block(xq, scale, self.block_m, self.block_k)
 
 
 @register_op

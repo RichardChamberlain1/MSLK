@@ -19,9 +19,13 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
-import triton  # @manual=//triton:triton
 from mslk.bench.common.telemetry import export_benchmark_to_scuba, is_scuba_available
-from mslk.bench.common.utils import BenchOptions, common_bench_options, profiler
+from mslk.bench.common.utils import (
+    BenchOptions,
+    common_bench_options,
+    hbm_bandwidth_gbps,
+    profiler,
+)
 from mslk.bench.gemm.gemm_ops import ComputeDtype, GemmOpBase, GemmType, get_gemm_ops
 from mslk.bench.roofline.capture import EmpiricalRoofline, load_empirical_roofline
 from mslk.bench.roofline.regime import CeilingType, classify_regime
@@ -36,6 +40,7 @@ COMPUTE_ROOFLINE_TFLOPS: dict[str, dict[ComputeDtype, float]] = {
     # NVIDIA
     "NVIDIA H100": {
         ComputeDtype.FP8: 1979.0,
+        ComputeDtype.INT8: 1979.0,
         ComputeDtype.BF16: 989.0,
         ComputeDtype.TF32: 494.5,
         ComputeDtype.FP32: 67.0,  # non-tensorcore
@@ -43,6 +48,7 @@ COMPUTE_ROOFLINE_TFLOPS: dict[str, dict[ComputeDtype, float]] = {
     "NVIDIA B200": {
         ComputeDtype.FP4: 9000.0,
         ComputeDtype.FP8: 4500.0,
+        ComputeDtype.INT8: 4500.0,
         ComputeDtype.BF16: 2250.0,
         ComputeDtype.TF32: 1100.0,
         ComputeDtype.FP32: 75.0,  # non-tensorcore
@@ -58,6 +64,7 @@ COMPUTE_ROOFLINE_TFLOPS: dict[str, dict[ComputeDtype, float]] = {
     # Source: AMD Instinct MI300X data sheet
     "gfx942": {
         ComputeDtype.FP8: 2614.9,
+        ComputeDtype.INT8: 2614.9,
         ComputeDtype.BF16: 1307.4,
         ComputeDtype.TF32: 653.7,
         ComputeDtype.FP32: 163.4,
@@ -67,6 +74,7 @@ COMPUTE_ROOFLINE_TFLOPS: dict[str, dict[ComputeDtype, float]] = {
     "gfx950": {
         ComputeDtype.FP4: 9200.0,
         ComputeDtype.FP8: 4600.0,
+        ComputeDtype.INT8: 4600.0,
         ComputeDtype.BF16: 2300.0,
         ComputeDtype.FP32: 144.2,
     },
@@ -130,7 +138,7 @@ def get_compute_roofline_tflops(compute_dtype: ComputeDtype) -> float | None:
 def get_hbm_bw_gbps() -> float:
     if _empirical_roofline is not None and _empirical_roofline.hbm_bw_gbps > 0:
         return _empirical_roofline.hbm_bw_gbps
-    return triton.testing.get_dram_gbps()
+    return hbm_bandwidth_gbps()
 
 
 shape_registry = {}

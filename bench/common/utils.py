@@ -82,6 +82,25 @@ _ROTATING_BUFFER_CACHE_MULTIPLE = 2
 _MAX_ROTATING_BUFFER_SETS = 10000
 
 
+# Peak HBM bandwidth per ROCm arch, from AMD's data sheets (MI300X, MI350X/MI355X).
+# triton.testing.get_dram_gbps() derives it as memory clock x bus width x 2,
+# which gives half the HBM3E figure on gfx950 (3.9 TB/s against 8 TB/s).
+_ROCM_HBM_BANDWIDTH_GBPS = {
+    "gfx942": 5300.0,
+    "gfx950": 8000.0,
+}
+
+
+def hbm_bandwidth_gbps() -> float:
+    """Peak HBM bandwidth of the current device in GB/s."""
+    if torch.version.hip is not None:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        arch = props.gcnArchName.split(":")[0]
+        if arch in _ROCM_HBM_BANDWIDTH_GBPS:
+            return _ROCM_HBM_BANDWIDTH_GBPS[arch]
+    return triton.testing.get_dram_gbps()
+
+
 def last_level_cache_bytes() -> int:
     """Size of the cache closest to HBM on the current device."""
     props = torch.cuda.get_device_properties(torch.cuda.current_device())

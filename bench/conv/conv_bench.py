@@ -16,8 +16,12 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 import torch
-import triton  # @manual=//triton:triton
-from mslk.bench.common.utils import BenchOptions, common_bench_options, profiler
+from mslk.bench.common.utils import (
+    BenchOptions,
+    common_bench_options,
+    hbm_bandwidth_gbps,
+    profiler,
+)
 from mslk.bench.conv.conv_ops import ConvOpBase, get_conv_ops
 from tabulate import tabulate
 
@@ -484,7 +488,7 @@ def invoke_main(
     for metric in benchmark_results:
         print(metric)
 
-    mem_bw_roofline_gbps = triton.testing.get_dram_gbps()
+    mem_bw_roofline_gbps = hbm_bandwidth_gbps()
 
     print("")
     print(f"Hardware: {torch.cuda.get_device_name()}")

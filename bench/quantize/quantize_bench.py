@@ -16,8 +16,12 @@ from typing import Callable, Optional
 import click
 import pandas as pd
 import torch
-import triton  # @manual=//triton:triton
-from mslk.bench.common.utils import BenchOptions, common_bench_options, profiler
+from mslk.bench.common.utils import (
+    BenchOptions,
+    common_bench_options,
+    hbm_bandwidth_gbps,
+    profiler,
+)
 from mslk.bench.quantize.quantize_ops import get_ops, QuantizeOpBase
 from tabulate import tabulate
 
@@ -263,9 +267,7 @@ def benchmark(
                 opts=opts,
             )
 
-        input_bytes = input.numel() * input.element_size()
-        output_bytes = sum(t.numel() * t.element_size() for t in quantized)
-        total_size_bytes = input_bytes + output_bytes
+        total_size_bytes = quantize_op.io_bytes(input, args, quantized)
         metrics.gbps = (total_size_bytes / 1e9) / (ms_runtime / 1e3)
         metrics.us = ms_runtime * 1000
         metrics.memory_bw_util = (metrics.gbps / mem_bw_roofline_gbps) * 100
@@ -342,7 +344,7 @@ def invoke_main(
         print_kernels(all_kernels)
         sys.exit(1)
 
-    mem_bw_roofline_gbps = triton.testing.get_dram_gbps()
+    mem_bw_roofline_gbps = hbm_bandwidth_gbps()
     MK = get_problem_shapes(shapes, m, k, pair_mk)
 
     opts = BenchOptions(
