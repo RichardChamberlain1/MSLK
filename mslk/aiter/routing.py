@@ -18,8 +18,9 @@ device, op-specific key and bucket::
 
 A call is served by the row for its device and key with the smallest bucket
 bound (``M_max`` here) at or above the call's value, e.g. M=100 by the row with
-M_max=128. Calls the table does not cover use MSLK's kernel, as do all calls
-when aiter is not enabled for the op (see :mod:`mslk.aiter.common`).
+M_max=128. Calls the table does not cover use the op's default backend (MSLK's
+kernel unless the op sets one), and all calls use MSLK's kernel when aiter is
+not enabled for the op (see :mod:`mslk.aiter.common`).
 """
 
 import bisect
@@ -27,12 +28,15 @@ import csv
 import functools
 import importlib.resources
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
 from mslk.aiter.common import is_aiter_enabled
 
 MSLK: str = "mslk"
+# choose_backend's answer for calls the table does not cover, when the op's
+# default backend depends on the call (OpRouting resolves it).
+_UNCOVERED: str = "<uncovered>"
 
 _DeviceKey = Tuple[str, int]
 
@@ -100,7 +104,8 @@ class ShapeTable:
         ``None`` when the table does not cover it."""
         full_key = tuple(str(k) for k in tuple(device) + tuple(key))
         bounds = self._bounds.get(full_key)
-        # Empty calls (e.g. M=0) are never tuned; MSLK's kernel handles them.
+        # Empty calls (e.g. M=0) are never tuned (choose_backend sends them to
+        # MSLK's kernel).
         if bounds is None or value < 1:
             return None
         i = bisect.bisect_left(bounds, value)
@@ -147,8 +152,11 @@ def choose_backend(
     device_index: int,
     key: Sequence[object],
     value: int,
+    default: str = MSLK,
 ) -> str:
-    """The backend that should serve this call of ``op``.
+    """The backend that should serve this call of ``op``; ``default`` serves
+    calls the table does not cover. Empty calls (``value < 1``, never tuned)
+    go to MSLK's kernel, whatever the default.
 
     ``table`` is a zero-argument loader, so that an op whose aiter path is
     switched off never reads its table.
@@ -156,9 +164,9 @@ def choose_backend(
     forced = _forced.get(op)
     if forced is not None:
         return forced
-    if not is_aiter_enabled(op):
+    if not is_aiter_enabled(op) or value < 1:
         return MSLK
-    return table().lookup(device_key(device_index), key, value) or MSLK
+    return table().lookup(device_key(device_index), key, value) or default
 
 
 class OpRouting:
@@ -170,12 +178,17 @@ class OpRouting:
     op:
 
     - ``backends`` maps each backend's name to a callable taking the op's
-      arguments; MSLK's kernel (:data:`MSLK`) is the default and fallback.
+      arguments. MSLK's kernel (:data:`MSLK`) is the fallback, and the default
+      unless ``default`` names another backend.
     - ``key`` maps the op's arguments to the table key and bucket value, e.g.
       ``((N, K), M)``. The first argument must be a tensor on the call's device.
     - ``accepts`` optionally maps a backend's name to a predicate on the op's
       arguments; a call a backend cannot take goes to MSLK's kernel instead,
       even when the table or :func:`force_backend` chose that backend.
+    - ``default`` optionally names the backend for calls the table does not
+      cover (MSLK's kernel if unset), or is a callable taking the op's
+      arguments and returning that name. Empty calls always go to MSLK's
+      kernel.
     - The table is a CSV in a package, read on first use.
     """
 
@@ -189,10 +202,15 @@ class OpRouting:
         backends: Dict[str, Callable[..., Any]],
         key: Callable[..., Tuple[Sequence[object], int]],
         accepts: Optional[Dict[str, Callable[..., bool]]] = None,
+        default: Union[str, Callable[..., str]] = MSLK,
     ) -> None:
         assert MSLK in backends, "MSLK's kernel must be one of the backends"
+        assert callable(default) or default in backends, (
+            f"default backend {default!r} is not a backend"
+        )
         self.op = op
         self.backends = backends
+        self.default = default
         self._key = key
         self._accepts: Dict[str, Callable[..., bool]] = accepts or {}
         self._table_args = (package, resource, tuple(key_columns), bucket_column)
@@ -205,8 +223,11 @@ class OpRouting:
         """The backend that serves a call with these arguments."""
         key, value = self._key(*args, **kwargs)
         name = choose_backend(
-            self.op, lambda: self.table, args[0].get_device(), key, value
+            self.op, lambda: self.table, args[0].get_device(), key, value, _UNCOVERED
         )
+        if name == _UNCOVERED:
+            default = self.default
+            name = default(*args, **kwargs) if callable(default) else default
         accepts = self._accepts.get(name)
         if accepts is not None and not accepts(*args, **kwargs):
             return MSLK

@@ -27,7 +27,9 @@ tuners (``aiter/utility/base_tuner.py``):
   the inputs in turn, together larger than the last-level cache
   (``--rotate_mb``), so that every call reads its operands from memory, as in
   a model where other layers evict them; aiter's ``perftest`` does the same.
-  Backends are timed in alternating order from shape to shape.
+  Backends are timed in alternating order from shape to shape. Backends in
+  :attr:`OpTuner.untimed_backends` (e.g. a slow reference) are only checked
+  for correctness and never chosen while a timed backend is correct.
 - **Correctness** is checked through the op itself (backend forced), against
   the op's reference and tolerance, which should be tight enough that a wrong
   or partial result cannot pass at any shape in the list. Every element must
@@ -76,7 +78,7 @@ DEVICE_COLUMNS: Tuple[str, ...] = ("gfx", "cu_num")
 @dataclass
 class Measurement:
     backend: str
-    # GPU time per call in microseconds, or None if the candidate raised.
+    # GPU time per call in microseconds; None if the candidate raised or is untimed.
     us: Optional[float]
     correct: bool
     err_ratio: float
@@ -119,6 +121,8 @@ class OpTuner(abc.ABC):
     #: Keys of :meth:`make_inputs` the op writes; filled with NaN before each
     #: backend's check.
     outputs: Tuple[str, ...] = ()
+    #: Backends checked for correctness but not timed.
+    untimed_backends: Tuple[str, ...] = ()
 
     @abc.abstractmethod
     def make_inputs(self, shape: Row) -> Dict[str, Any]:
@@ -170,14 +174,17 @@ def choose(measurements: Sequence[Measurement], min_improvement_pct: float) -> s
     """
     by_backend = {m.backend: m for m in measurements}
     mslk_us = by_backend[MSLK].us
-    assert mslk_us is not None
-    best = min(
-        (m for m in measurements if m.correct and m.us is not None),
-        key=lambda m: m.us if m.us is not None else math.inf,
-    )
+    timed = [m for m in measurements if m.correct and m.us is not None]
+    if not timed:
+        return MSLK
+    best = min(timed, key=lambda m: m.us if m.us is not None else math.inf)
     best_us = best.us
     assert best_us is not None
-    if best.backend != MSLK and mslk_us < best_us * (1 + min_improvement_pct / 100):
+    if (
+        best.backend != MSLK
+        and mslk_us is not None
+        and mslk_us < best_us * (1 + min_improvement_pct / 100)
+    ):
         return MSLK
     return best.backend
 
@@ -274,13 +281,14 @@ def table_row(tuner: OpTuner, result: ShapeResult) -> Row:
     by_backend = {m.backend: m for m in result.measurements}
     chosen = by_backend[result.backend]
     us = chosen.us
-    assert us is not None
     row = {**result.device, **result.shape, "backend": result.backend}
-    row["us"] = f"{us:.2f}"
+    row["us"] = "" if us is None else f"{us:.2f}"
     row["err_ratio"] = f"{chosen.err_ratio:.4g}"
     row["max_abs_err"] = f"{chosen.max_abs_err:.4g}"
-    row["tflops"] = f"{result.flops / us / 1e6:.2f}" if result.flops else ""
-    row["bw"] = f"{result.bytes_moved / us / 1e3:.2f}" if result.bytes_moved else ""
+    row["tflops"] = f"{result.flops / us / 1e6:.2f}" if result.flops and us else ""
+    row["bw"] = (
+        f"{result.bytes_moved / us / 1e3:.2f}" if result.bytes_moved and us else ""
+    )
     for b in tuner.backends:
         t = by_backend[b].us if b in by_backend else None
         row[f"{b}_us"] = "" if t is None else f"{t:.2f}"
@@ -416,7 +424,11 @@ def tune_shape(
                 err_ratio = max(e[0] for e in errors)
                 max_err = max(e[1] for e in errors)
                 correct = err_ratio == 0.0
-                us = time_us(tuner, copies, settings.warmup, settings.iters)
+                us = (
+                    None
+                    if backend in tuner.untimed_backends
+                    else time_us(tuner, copies, settings.warmup, settings.iters)
+                )
                 measurements.append(
                     Measurement(backend, us, correct, err_ratio, max_err)
                 )
@@ -452,7 +464,10 @@ def _describe(tuner: OpTuner, result: ShapeResult) -> str:
     shape = " ".join(f"{k}={v}" for k, v in result.shape.items())
     parts = []
     for m in result.measurements:
-        if m.us is None:
+        if m.us is None and m.error is None:
+            ok = "correct" if m.correct else f"INCORRECT (err_ratio {m.err_ratio:.3g})"
+            parts.append(f"{m.backend} untimed, {ok}")
+        elif m.us is None:
             parts.append(f"{m.backend} failed ({m.error})")
         else:
             flag = "" if m.correct else f" INCORRECT (err_ratio {m.err_ratio:.3g})"

@@ -340,6 +340,7 @@ def validate_cross_bwd(
     stride_mm: int,
     truncate_method: str,
     enable_tma: bool,
+    Out: Optional[torch.Tensor] = None,
 ) -> None:
     _check_qkv(q, k, v, self_attention=False)
     value = _cross_v(k, v, shared_kv)
@@ -355,6 +356,8 @@ def validate_cross_bwd(
     if G < 1:
         _fail(f"G must be >= 1, got {G}")
     _check_dout(dout, q, (q.shape[0], q.shape[1], value.shape[2]))
+    if Out is not None:
+        _check_dout(Out, q, dout.shape, "Out")
     for name, t in (("M", M), ("Delta", Delta)):
         if t is not None:
             _check_same_device(t, q, name)

@@ -234,7 +234,7 @@ class SignatureTest(unittest.TestCase):
             "dout, q, k, v, seq_offsets, attn_scale, max_seq_len, alpha, max_q_len, "
             "seq_offsets_q, num_targets, causal, shared_kv, G, num_softmax_heads=0, "
             "M=None, Delta=None, stride_mm=0, truncate_method='none', "
-            "enable_tma=True"
+            "enable_tma=True, Out=None"
         ),
         "grouped_ragged_hstu_attention_fwd": (
             "Z, group_q, group_k, group_v, seq_offsets, group_offsets, "
@@ -637,16 +637,24 @@ class RoutingTest(unittest.TestCase):
                     .read_text()
                 )
                 header = text.splitlines()[0].split(",")
-                self.assertEqual(
-                    header,
-                    [
-                        "gfx",
-                        "cu_num",
-                        *module.KEY_COLUMNS,
-                        module.BUCKET_COLUMN,
-                        "backend",
-                    ],
-                )
+                required = [
+                    "gfx",
+                    "cu_num",
+                    *module.KEY_COLUMNS,
+                    module.BUCKET_COLUMN,
+                    "backend",
+                ]
+                # Tuned tables add columns after "backend".
+                self.assertEqual(header[: len(required)], required)
+                for name in header[len(required) :]:
+                    self.assertTrue(
+                        name in ("us", "err_ratio", "max_abs_err", "tflops", "bw")
+                        or (
+                            name.endswith("_us")
+                            and name[: -len("_us")] in module.BACKENDS
+                        ),
+                        name,
+                    )
 
 
 if __name__ == "__main__":
